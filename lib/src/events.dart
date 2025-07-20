@@ -1,6 +1,7 @@
 import 'dart:async';
 
-import '../udx.dart';
+import 'stream.dart';
+
 
 /// Base class for all UDX events
 class UDXEvent {

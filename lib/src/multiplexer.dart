@@ -6,8 +6,8 @@ import 'package:dart_udx/src/cid.dart';
 import 'package:dart_udx/src/packet.dart';
 import 'package:dart_udx/src/socket.dart';
 import 'package:meta/meta.dart';
-import 'package:dart_udx/src/stream.dart';
-import 'package:dart_udx/udx.dart';
+
+import 'udx.dart';
 
 /// A class that demultiplexes incoming UDX packets to the correct `UDPSocket`.
 ///

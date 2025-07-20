@@ -9,7 +9,7 @@ import 'dart:typed_data' as _i6;
 
 import 'package:dart_udx/src/cid.dart' as _i7;
 import 'package:dart_udx/src/socket.dart' as _i3;
-import 'package:dart_udx/udx.dart' as _i4;
+import 'package:dart_udx/dart_udx.dart' as _i4;
 import 'package:mockito/mockito.dart' as _i1;
 
 // ignore_for_file: type=lint

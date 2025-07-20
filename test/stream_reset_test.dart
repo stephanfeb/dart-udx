@@ -4,7 +4,7 @@ import 'dart:io';
 import 'package:dart_udx/src/packet.dart';
 import 'package:dart_udx/src/socket.dart';
 import 'package:dart_udx/src/stream.dart';
-import 'package:dart_udx/udx.dart';
+import 'package:dart_udx/dart_udx.dart';
 import 'package:test/test.dart';
 import 'dart:async';
 import 'package:dart_udx/src/multiplexer.dart';
