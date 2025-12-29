@@ -38,6 +38,12 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
   bool get connected => _connected;
   bool _connected = false;
 
+  /// Whether the local write side has been closed (FIN sent)
+  bool _localWriteClosed = false;
+  
+  /// Whether the remote write side has been closed (FIN received)
+  bool _remoteWriteClosed = false;
+
   /// Whether this stream was created by this endpoint.
   final bool isInitiator;
 
@@ -412,7 +418,13 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
           }
           if (frame.isFin) {
             ////print('[DEBUG] UDXStream ${this.id} closing _dataController due to FIN flag');
+            _remoteWriteClosed = true;
             _dataController.close();
+            emit('end');
+            // If we've also closed our write side, do full close
+            if (_localWriteClosed) {
+              _close();
+            }
           }
         } else if (frame is PingFrame) {
           ////print('[UDXStream ${this.id}.internalHandleSocketEvent] Sequential PingFrame.');
@@ -489,7 +501,13 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
           }
           if (frame.isFin) {
             ////print('[DEBUG] UDXStream ${this.id} _processReceiveBuffer closing _dataController due to FIN flag');
+            _remoteWriteClosed = true;
             _dataController.close();
+            emit('end');
+            // If we've also closed our write side, do full close
+            if (_localWriteClosed) {
+              _close();
+            }
           }
         }
       }
@@ -612,6 +630,7 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
   Future<void> add(Uint8List data) async {
     if (!_connected) throw StateError('UDXStream ($id): Stream is not connected');
     if (_socket == null) throw StateError('UDXStream ($id): Stream is not connected to a socket');
+    if (_localWriteClosed) throw StateError('UDXStream ($id): Cannot write after closeWrite() has been called');
 
     // DEBUG: Log window states at the beginning of add
     if (_socket != null) {
@@ -877,6 +896,50 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
     await _close(isReset: true);
   }
 
+  /// Close the write side of the stream by sending a FIN packet.
+  /// The read side remains open until the remote peer sends FIN or close() is called.
+  /// This enables half-close semantics for bidirectional communication.
+  Future<void> closeWrite() async {
+    if (_localWriteClosed) return;
+    _localWriteClosed = true;
+    
+    if (!_connected || remoteId == null || remoteHost == null || remotePort == null) {
+      // If not connected, just mark as closed
+      return;
+    }
+    
+    final socket = _socket;
+    if (socket == null || socket.closing) {
+      // Can't send FIN, but state is marked
+      return;
+    }
+    
+    // Send FIN packet
+    final finPacket = UDXPacket(
+      destinationCid: socket.cids.remoteCid,
+      sourceCid: socket.cids.localCid,
+      destinationStreamId: remoteId!,
+      sourceStreamId: id,
+      sequence: packetManager.nextSequence,
+      frames: [StreamFrame(data: Uint8List(0), isFin: true)],
+    );
+    
+    try {
+      _sentPackets[finPacket.sequence] = (DateTime.now(), 0);
+      socket.send(finPacket.toBytes());
+      packetManager.sendPacket(finPacket);
+      // Small delay to ensure FIN is sent
+      await Future.delayed(Duration(milliseconds: 50));
+    } catch (e) {
+      // Ignore errors during FIN send
+    }
+    
+    // If remote has also closed their write side (we received FIN), do full close
+    if (_remoteWriteClosed) {
+      await _close();
+    }
+  }
+
   @override
   Future<void> close() async {
     await _close();
@@ -885,6 +948,10 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
   /// Internal close logic, handling both graceful (FIN) and abrupt (reset) closures.
   Future<void> _close({bool isReset = false}) async {
     if (!_connected) return;
+
+    // Mark both sides as closed for full closure
+    _localWriteClosed = true;
+    _remoteWriteClosed = true;
 
     if (!isReset && remoteId != null && remoteHost != null && remotePort != null) {
       // Use a local variable to avoid multiple null checks
