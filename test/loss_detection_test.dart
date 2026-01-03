@@ -100,7 +100,7 @@ void main() {
     });
 
     test('retransmits lost packet and completes data transfer', () async {
-      final setup = await setupTestEnvironment(dropSequences: {2});
+      final setup = await setupTestEnvironment(dropSequences: {1});
       final clientStream = setup.clientStream;
       final serverStream = setup.serverStream;
 
@@ -126,7 +126,7 @@ void main() {
     });
 
     test('triggers fast retransmit on 3 duplicate ACKs', () async {
-      final setup = await setupTestEnvironment(dropSequences: {0});
+      final setup = await setupTestEnvironment(dropSequences: {1});
       final clientStream = setup.clientStream;
       
       final fastRetransmitCompleter = Completer<void>();
@@ -136,8 +136,8 @@ void main() {
         }
       };
 
-      // Send 4 packets. The first one (seq 0) will be dropped.
-      // The next 3 (seq 1, 2, 3) will trigger duplicate ACKs for seq -1.
+      // Send 4 packets. The first data packet (seq 1) will be dropped.
+      // The next 3 (seq 2, 3, 4) will trigger duplicate ACKs, leading to fast retransmit.
       for (int i = 0; i < 4; i++) {
         await clientStream.add(Uint8List.fromList([i]));
       }

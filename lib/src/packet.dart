@@ -1,5 +1,8 @@
 import 'dart:async';
 import 'dart:typed_data';
+import 'dart:convert';
+import 'package:crypto/crypto.dart';
+import 'package:collection/collection.dart';
 
 import 'cid.dart';
 import 'congestion.dart';
@@ -19,6 +22,12 @@ enum FrameType {
   mtuProbe, // New frame type for Path MTU Discovery
   pathChallenge,
   pathResponse,
+  connectionClose, // Graceful connection termination with error details
+  stopSending, // Request peer to stop sending on a stream
+  dataBlocked, // Connection-level flow control blocked
+  streamDataBlocked, // Stream-level flow control blocked
+  newConnectionId, // Provides a new CID that the peer can use
+  retireConnectionId, // Requests retirement of a previously issued CID
 }
 
 /// Base class for all UDX frames.
@@ -36,6 +45,9 @@ abstract class Frame {
   /// A factory constructor to deserialize a frame from bytes.
   static Frame fromBytes(ByteData view, int offset) {
     final type = view.getUint8(offset);
+    if (type >= FrameType.values.length) {
+      throw ArgumentError('Unknown frame type: $type');
+    }
     switch (FrameType.values[type]) {
       case FrameType.padding:
         return PaddingFrame.fromBytes(view, offset);
@@ -47,7 +59,7 @@ abstract class Frame {
         return StreamFrame.fromBytes(view, offset);
       case FrameType.windowUpdate:
         return WindowUpdateFrame.fromBytes(view, offset);
-      case FrameType.maxData: // Handle new MaxDataFrame
+      case FrameType.maxData:
         return MaxDataFrame.fromBytes(view, offset);
       case FrameType.resetStream:
         return ResetStreamFrame.fromBytes(view, offset);
@@ -59,8 +71,18 @@ abstract class Frame {
         return PathChallengeFrame.fromBytes(view, offset);
       case FrameType.pathResponse:
         return PathResponseFrame.fromBytes(view, offset);
-      default:
-        throw ArgumentError('Unknown frame type: $type');
+      case FrameType.connectionClose:
+        return ConnectionCloseFrame.fromBytes(view, offset);
+      case FrameType.stopSending:
+        return StopSendingFrame.fromBytes(view, offset);
+      case FrameType.dataBlocked:
+        return DataBlockedFrame.fromBytes(view, offset);
+      case FrameType.streamDataBlocked:
+        return StreamDataBlockedFrame.fromBytes(view, offset);
+      case FrameType.newConnectionId:
+        return NewConnectionIdFrame.fromBytes(view, offset);
+      case FrameType.retireConnectionId:
+        return RetireConnectionIdFrame.fromBytes(view, offset);
     }
   }
 }
@@ -112,17 +134,27 @@ class AckRange {
 /// ACK Frame (Type 0x02)
 /// Acknowledges one or more packet ranges.
 /// Based on QUIC ACK Frame (RFC 9000, Section 19.3).
+/// Includes optional ECN counts for Explicit Congestion Notification.
 class AckFrame extends Frame {
   final int largestAcked;
   final int ackDelay; // In milliseconds
   final int firstAckRangeLength; // Number of contiguous packets ending at largestAcked
   final List<AckRange> ackRanges; // Additional non-contiguous ranges
+  
+  // Optional ECN counts (RFC 9000 Section 19.3.2)
+  // These are counts of packets received with ECN markings
+  final int? ect0Count;  // ECT(0) - ECN Capable Transport(0)
+  final int? ect1Count;  // ECT(1) - ECN Capable Transport(1)
+  final int? ceCount;    // CE - Congestion Experienced
 
   AckFrame({
     required this.largestAcked,
     required this.ackDelay,
     required this.firstAckRangeLength,
     this.ackRanges = const [],
+    this.ect0Count,
+    this.ect1Count,
+    this.ceCount,
   }) : super(FrameType.ack);
 
   @override
@@ -133,7 +165,17 @@ class AckFrame extends Frame {
     // ACK Range Count (1)
     // First ACK Range Length (4)
     // Each additional ACK Range: Gap (1) + ACK Range Length (4) = 5 bytes
-    return 1 + 4 + 2 + 1 + 4 + (ackRanges.length * (1 + 4));
+    int baseLength = 1 + 4 + 2 + 1 + 4 + (ackRanges.length * (1 + 4));
+    
+    // Add ECN counts if present (8 bytes each)
+    if (ect0Count != null || ect1Count != null || ceCount != null) {
+      baseLength += 1; // ECN flag byte
+      if (ect0Count != null) baseLength += 8;
+      if (ect1Count != null) baseLength += 8;
+      if (ceCount != null) baseLength += 8;
+    }
+    
+    return baseLength;
   }
 
   @override
@@ -430,9 +472,458 @@ class PathResponseFrame extends Frame {
   }
 }
 
+/// UDX error codes for CONNECTION_CLOSE and RESET_STREAM frames
+class UdxErrorCode {
+  /// No error (graceful close)
+  static const int noError = 0x00;
+  
+  /// Internal error
+  static const int internalError = 0x01;
+  
+  /// Stream limit exceeded
+  static const int streamLimitError = 0x02;
+  
+  /// Flow control error
+  static const int flowControlError = 0x03;
+  
+  /// Protocol violation
+  static const int protocolViolation = 0x04;
+  
+  /// Invalid connection migration
+  static const int invalidMigration = 0x05;
+  
+  /// Connection timeout
+  static const int connectionTimeout = 0x06;
+}
+
+/// CONNECTION_CLOSE Frame (Type 0x0b)
+/// Signals graceful or error termination of the connection.
+/// Contains error code, frame type that caused error (if applicable),
+/// and a human-readable reason phrase.
+class ConnectionCloseFrame extends Frame {
+  final int errorCode;        // 4 bytes
+  final int frameType;        // 4 bytes - which frame type caused error (0 if N/A)
+  final String reasonPhrase;  // Variable length
+
+  ConnectionCloseFrame({
+    required this.errorCode,
+    this.frameType = 0,
+    this.reasonPhrase = '',
+  }) : super(FrameType.connectionClose);
+
+  @override
+  int get length {
+    // Type (1) + Error Code (4) + Frame Type (4) + Reason Length (2) + Reason
+    return 1 + 4 + 4 + 2 + reasonPhrase.length;
+  }
+
+  @override
+  Uint8List toBytes() {
+    final reasonBytes = reasonPhrase.codeUnits;
+    final buffer = Uint8List(length);
+    final view = ByteData.view(buffer.buffer);
+    
+    int offset = 0;
+    view.setUint8(offset, FrameType.connectionClose.index);
+    offset += 1;
+    
+    view.setUint32(offset, errorCode, Endian.big);
+    offset += 4;
+    
+    view.setUint32(offset, frameType, Endian.big);
+    offset += 4;
+    
+    view.setUint16(offset, reasonBytes.length, Endian.big);
+    offset += 2;
+    
+    buffer.setAll(offset, reasonBytes);
+    
+    return buffer;
+  }
+
+  static ConnectionCloseFrame fromBytes(ByteData view, int offset) {
+    int currentOffset = offset;
+    
+    // Skip type byte
+    currentOffset += 1;
+    
+    final errorCode = view.getUint32(currentOffset, Endian.big);
+    currentOffset += 4;
+    
+    final frameType = view.getUint32(currentOffset, Endian.big);
+    currentOffset += 4;
+    
+    final reasonLength = view.getUint16(currentOffset, Endian.big);
+    currentOffset += 2;
+    
+    final reasonBytes = Uint8List.view(
+      view.buffer,
+      view.offsetInBytes + currentOffset,
+      reasonLength
+    );
+    final reasonPhrase = String.fromCharCodes(reasonBytes);
+    
+    return ConnectionCloseFrame(
+      errorCode: errorCode,
+      frameType: frameType,
+      reasonPhrase: reasonPhrase,
+    );
+  }
+}
+
+/// STOP_SENDING Frame (Type 0x0d)
+/// Signals that the endpoint no longer wishes to receive data on a stream.
+/// The peer should close the write side of the stream in response.
+class StopSendingFrame extends Frame {
+  final int streamId;   // 4 bytes
+  final int errorCode;  // 4 bytes
+  
+  StopSendingFrame({
+    required this.streamId,
+    required this.errorCode,
+  }) : super(FrameType.stopSending);
+  
+  @override
+  int get length => 1 + 4 + 4; // Type + Stream ID + Error Code
+  
+  @override
+  Uint8List toBytes() {
+    final buffer = Uint8List(length);
+    final view = ByteData.view(buffer.buffer);
+    
+    view.setUint8(0, FrameType.stopSending.index);
+    view.setUint32(1, streamId, Endian.big);
+    view.setUint32(5, errorCode, Endian.big);
+    
+    return buffer;
+  }
+  
+  static StopSendingFrame fromBytes(ByteData view, int offset) {
+    final streamId = view.getUint32(offset + 1, Endian.big);
+    final errorCode = view.getUint32(offset + 5, Endian.big);
+    
+    return StopSendingFrame(
+      streamId: streamId,
+      errorCode: errorCode,
+    );
+  }
+}
+
+/// DATA_BLOCKED Frame (Type 0x0e)
+/// Indicates that the connection is blocked due to connection-level
+/// flow control. Sent when the sender wants to send data but is blocked
+/// by the connection-level MAX_DATA limit.
+class DataBlockedFrame extends Frame {
+  final int maxData; // The connection-level data limit at which blocking occurred
+  
+  DataBlockedFrame({
+    required this.maxData,
+  }) : super(FrameType.dataBlocked);
+  
+  @override
+  int get length => 1 + 8; // Type + Max Data (8 bytes)
+  
+  @override
+  Uint8List toBytes() {
+    final buffer = Uint8List(length);
+    final view = ByteData.view(buffer.buffer);
+    
+    view.setUint8(0, FrameType.dataBlocked.index);
+    view.setUint64(1, maxData, Endian.big);
+    
+    return buffer;
+  }
+  
+  static DataBlockedFrame fromBytes(ByteData view, int offset) {
+    final maxData = view.getUint64(offset + 1, Endian.big);
+    return DataBlockedFrame(maxData: maxData);
+  }
+}
+
+/// STREAM_DATA_BLOCKED Frame (Type 0x0f)
+/// Indicates that a stream is blocked due to stream-level flow control.
+/// Sent when the sender wants to send data on a stream but is blocked
+/// by the stream-level flow control limit.
+class StreamDataBlockedFrame extends Frame {
+  final int streamId;        // 4 bytes
+  final int maxStreamData;   // 8 bytes - the stream-level data limit at which blocking occurred
+  
+  StreamDataBlockedFrame({
+    required this.streamId,
+    required this.maxStreamData,
+  }) : super(FrameType.streamDataBlocked);
+  
+  @override
+  int get length => 1 + 4 + 8; // Type + Stream ID + Max Stream Data
+  
+  @override
+  Uint8List toBytes() {
+    final buffer = Uint8List(length);
+    final view = ByteData.view(buffer.buffer);
+    
+    view.setUint8(0, FrameType.streamDataBlocked.index);
+    view.setUint32(1, streamId, Endian.big);
+    view.setUint64(5, maxStreamData, Endian.big);
+    
+    return buffer;
+  }
+  
+  static StreamDataBlockedFrame fromBytes(ByteData view, int offset) {
+    final streamId = view.getUint32(offset + 1, Endian.big);
+    final maxStreamData = view.getUint64(offset + 5, Endian.big);
+    
+    return StreamDataBlockedFrame(
+      streamId: streamId,
+      maxStreamData: maxStreamData,
+    );
+  }
+}
+
+/// NEW_CONNECTION_ID Frame (Type 0x10)
+/// Provides the peer with a new Connection ID that can be used for this connection.
+/// This enables connection migration and prevents linkability attacks.
+class NewConnectionIdFrame extends Frame {
+  final int sequenceNumber;     // Sequence number for this CID
+  final int retirePriorTo;      // All CIDs with sequence < this should be retired
+  final ConnectionId connectionId; // The new CID
+  final StatelessResetToken resetToken; // Associated stateless reset token
+  
+  NewConnectionIdFrame({
+    required this.sequenceNumber,
+    required this.retirePriorTo,
+    required this.connectionId,
+    required this.resetToken,
+  }) : super(FrameType.newConnectionId);
+  
+  @override
+  int get length {
+    // Type (1) + Seq (8) + RetirePriorTo (8) + CID Length (1) + CID + Reset Token (16)
+    return 1 + 8 + 8 + 1 + connectionId.length + StatelessResetToken.length;
+  }
+  
+  @override
+  Uint8List toBytes() {
+    final buffer = Uint8List(length);
+    final view = ByteData.view(buffer.buffer);
+    
+    int offset = 0;
+    view.setUint8(offset, FrameType.newConnectionId.index);
+    offset += 1;
+    
+    view.setUint64(offset, sequenceNumber, Endian.big);
+    offset += 8;
+    
+    view.setUint64(offset, retirePriorTo, Endian.big);
+    offset += 8;
+    
+    view.setUint8(offset, connectionId.length);
+    offset += 1;
+    
+    buffer.setAll(offset, connectionId.bytes);
+    offset += connectionId.length;
+    
+    buffer.setAll(offset, resetToken.bytes);
+    
+    return buffer;
+  }
+  
+  static NewConnectionIdFrame fromBytes(ByteData view, int offset) {
+    int currentOffset = offset + 1; // Skip type
+    
+    final sequenceNumber = view.getUint64(currentOffset, Endian.big);
+    currentOffset += 8;
+    
+    final retirePriorTo = view.getUint64(currentOffset, Endian.big);
+    currentOffset += 8;
+    
+    final cidLength = view.getUint8(currentOffset);
+    currentOffset += 1;
+    
+    final cidBytes = Uint8List.view(
+      view.buffer,
+      view.offsetInBytes + currentOffset,
+      cidLength
+    );
+    final connectionId = ConnectionId.fromUint8List(cidBytes);
+    currentOffset += cidLength;
+    
+    final resetTokenBytes = Uint8List.view(
+      view.buffer,
+      view.offsetInBytes + currentOffset,
+      StatelessResetToken.length
+    );
+    final resetToken = StatelessResetToken(resetTokenBytes);
+    
+    return NewConnectionIdFrame(
+      sequenceNumber: sequenceNumber,
+      retirePriorTo: retirePriorTo,
+      connectionId: connectionId,
+      resetToken: resetToken,
+    );
+  }
+}
+
+/// RETIRE_CONNECTION_ID Frame (Type 0x11)
+/// Indicates that the endpoint will no longer use a Connection ID that was
+/// issued by the peer. This also serves as a request for the peer to send
+/// a new Connection ID.
+class RetireConnectionIdFrame extends Frame {
+  final int sequenceNumber; // Sequence number of the CID to retire
+  
+  RetireConnectionIdFrame({
+    required this.sequenceNumber,
+  }) : super(FrameType.retireConnectionId);
+  
+  @override
+  int get length => 1 + 8; // Type + Sequence Number
+  
+  @override
+  Uint8List toBytes() {
+    final buffer = Uint8List(length);
+    final view = ByteData.view(buffer.buffer);
+    
+    view.setUint8(0, FrameType.retireConnectionId.index);
+    view.setUint64(1, sequenceNumber, Endian.big);
+    
+    return buffer;
+  }
+  
+  static RetireConnectionIdFrame fromBytes(ByteData view, int offset) {
+    final sequenceNumber = view.getUint64(offset + 1, Endian.big);
+    
+    return RetireConnectionIdFrame(
+      sequenceNumber: sequenceNumber,
+    );
+  }
+}
+
+/// Represents a stateless reset token used to validate STATELESS_RESET packets.
+/// 
+/// A stateless reset token is a cryptographically secure 16-byte value derived
+/// from a connection ID using HMAC-SHA256. This allows servers to send a
+/// stateless reset without maintaining connection state.
+class StatelessResetToken {
+  /// The fixed length of a stateless reset token
+  static const int length = 16;
+  
+  /// The token bytes
+  final Uint8List bytes;
+  
+  /// A secret key used for HMAC generation (should be kept server-side)
+  static Uint8List? _serverSecret;
+  
+  StatelessResetToken(this.bytes) {
+    if (bytes.length != length) {
+      throw ArgumentError('StatelessResetToken must be exactly $length bytes');
+    }
+  }
+  
+  /// Generates a stateless reset token from a Connection ID using HMAC-SHA256.
+  /// Requires a server secret to be set via setServerSecret().
+  factory StatelessResetToken.generate(ConnectionId cid) {
+    if (_serverSecret == null) {
+      throw StateError('Server secret must be set before generating tokens');
+    }
+    
+    // Use HMAC-SHA256 and take first 16 bytes
+    final hmac = Hmac(sha256, _serverSecret!);
+    final digest = hmac.convert(cid.bytes);
+    final tokenBytes = Uint8List.fromList(digest.bytes.sublist(0, length));
+    
+    return StatelessResetToken(tokenBytes);
+  }
+  
+  /// Sets the server secret used for token generation.
+  /// This should be called once at server startup with a cryptographically
+  /// secure random value.
+  static void setServerSecret(Uint8List secret) {
+    if (secret.length < 32) {
+      throw ArgumentError('Server secret should be at least 32 bytes');
+    }
+    _serverSecret = secret;
+  }
+  
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is StatelessResetToken &&
+          const ListEquality().equals(bytes, other.bytes);
+  
+  @override
+  int get hashCode => const ListEquality().hash(bytes);
+}
+
+/// A STATELESS_RESET packet that can be sent by a server that has lost
+/// connection state. It looks like a regular packet but is identified by
+/// the presence of a valid stateless reset token.
+class StatelessResetPacket {
+  /// The stateless reset token (last 16 bytes of the packet)
+  final StatelessResetToken token;
+  
+  /// Random bytes to pad the packet to a minimum size
+  final Uint8List randomBytes;
+  
+  /// Minimum packet size for stateless reset (to avoid amplification)
+  static const int minPacketSize = 39;
+  
+  StatelessResetPacket({
+    required this.token,
+    required this.randomBytes,
+  });
+  
+  /// Creates a stateless reset packet with random padding
+  factory StatelessResetPacket.create(StatelessResetToken token) {
+    // Packet size = random bytes + token (16)
+    // Minimum size is 39 bytes, so random bytes = at least 23
+    final randomBytesLength = minPacketSize - StatelessResetToken.length;
+    final randomBytes = Uint8List(randomBytesLength);
+    
+    // Fill with random data
+    for (int i = 0; i < randomBytes.length; i++) {
+      randomBytes[i] = (DateTime.now().microsecondsSinceEpoch + i) & 0xFF;
+    }
+    
+    return StatelessResetPacket(
+      token: token,
+      randomBytes: randomBytes,
+    );
+  }
+  
+  /// Converts the stateless reset packet to bytes
+  Uint8List toBytes() {
+    final buffer = Uint8List(randomBytes.length + StatelessResetToken.length);
+    buffer.setAll(0, randomBytes);
+    buffer.setAll(randomBytes.length, token.bytes);
+    return buffer;
+  }
+  
+  /// Attempts to parse a stateless reset packet from bytes.
+  /// Returns null if the packet is too small or doesn't have a token at the end.
+  static StatelessResetPacket? tryParse(Uint8List bytes) {
+    if (bytes.length < minPacketSize) {
+      return null;
+    }
+    
+    // Extract last 16 bytes as potential token
+    final tokenBytes = bytes.sublist(bytes.length - StatelessResetToken.length);
+    final token = StatelessResetToken(tokenBytes);
+    
+    // Extract random bytes
+    final randomBytes = bytes.sublist(0, bytes.length - StatelessResetToken.length);
+    
+    return StatelessResetPacket(
+      token: token,
+      randomBytes: randomBytes,
+    );
+  }
+}
+
 
 /// A UDX packet with stream information and a list of frames.
 class UDXPacket {
+  /// The protocol version (4 bytes)
+  final int version;
+
   /// The destination Connection ID.
   final ConnectionId destinationCid;
 
@@ -457,8 +948,12 @@ class UDXPacket {
   /// Whether the packet has been acknowledged
   bool isAcked = false;
 
+  /// The current UDX protocol version
+  static const int currentVersion = 0x00000002;
+
   /// Creates a new UDX packet
   UDXPacket({
+    this.version = currentVersion,
     required this.destinationCid,
     required this.sourceCid,
     required this.destinationStreamId,
@@ -468,31 +963,62 @@ class UDXPacket {
     this.sentTime,
   });
 
-  /// Creates a UDX packet from raw bytes. Header is 28 bytes.
-  /// 0-7: destinationConnectionId
-  /// 8-15: sourceConnectionId
-  /// 16-19: sequence
-  /// 20-23: destinationStreamId
-  /// 24-27: sourceStreamId
+  /// Creates a UDX packet from raw bytes.
+  /// New header format (variable length):
+  /// 0-3: version (4 bytes)
+  /// 4: destinationCidLength (1 byte)
+  /// 5 to 5+destCidLen: destinationConnectionId
+  /// 5+destCidLen: sourceCidLength (1 byte)
+  /// 6+destCidLen to 6+destCidLen+srcCidLen: sourceConnectionId
+  /// Next 4: sequence
+  /// Next 4: destinationStreamId
+  /// Next 4: sourceStreamId
+  /// Rest: frames
   factory UDXPacket.fromBytes(Uint8List bytes) {
-    const headerLength = 28;
-    if (bytes.length < headerLength) {
+    const minHeaderLength = 18; // version(4) + dcidLen(1) + scidLen(1) + seq(4) + destId(4) + srcId(4)
+    if (bytes.length < minHeaderLength) {
       throw ArgumentError(
-          'Byte array too short for UDXPacket. Minimum $headerLength bytes required, got ${bytes.length}');
+          'Byte array too short for UDXPacket. Minimum $minHeaderLength bytes required, got ${bytes.length}');
     }
     final view =
         ByteData.view(bytes.buffer, bytes.offsetInBytes, bytes.lengthInBytes);
 
-    final destCid = ConnectionId.fromUint8List(
-        bytes.sublist(0, ConnectionId.cidLength));
-    final srcCid = ConnectionId.fromUint8List(
-        bytes.sublist(ConnectionId.cidLength, ConnectionId.cidLength * 2));
-    final sequence = view.getUint32(16, Endian.big);
-    final destinationStreamId = view.getUint32(20, Endian.big);
-    final sourceStreamId = view.getUint32(24, Endian.big);
+    int offset = 0;
 
+    // Read version
+    final version = view.getUint32(offset, Endian.big);
+    offset += 4;
+
+    // Read destination CID
+    final destCidLength = view.getUint8(offset);
+    offset += 1;
+    if (destCidLength < ConnectionId.minCidLength || destCidLength > ConnectionId.maxCidLength) {
+      throw ArgumentError('Invalid destination CID length: $destCidLength');
+    }
+    final destCid = ConnectionId.fromUint8List(
+        bytes.sublist(offset, offset + destCidLength));
+    offset += destCidLength;
+
+    // Read source CID
+    final srcCidLength = view.getUint8(offset);
+    offset += 1;
+    if (srcCidLength < ConnectionId.minCidLength || srcCidLength > ConnectionId.maxCidLength) {
+      throw ArgumentError('Invalid source CID length: $srcCidLength');
+    }
+    final srcCid = ConnectionId.fromUint8List(
+        bytes.sublist(offset, offset + srcCidLength));
+    offset += srcCidLength;
+
+    // Read sequence, stream IDs
+    final sequence = view.getUint32(offset, Endian.big);
+    offset += 4;
+    final destinationStreamId = view.getUint32(offset, Endian.big);
+    offset += 4;
+    final sourceStreamId = view.getUint32(offset, Endian.big);
+    offset += 4;
+
+    // Parse frames
     final frames = <Frame>[];
-    int offset = headerLength;
     while (offset < bytes.length) {
       final frame = Frame.fromBytes(view, offset);
       frames.add(frame);
@@ -500,6 +1026,7 @@ class UDXPacket {
     }
 
     return UDXPacket(
+      version: version,
       destinationCid: destCid,
       sourceCid: srcCid,
       destinationStreamId: destinationStreamId,
@@ -513,17 +1040,40 @@ class UDXPacket {
   Uint8List toBytes() {
     final framesBytes =
         frames.map((f) => f.toBytes()).expand((b) => b).toList();
-    const headerLength = 28;
+    
+    // Calculate header length: version(4) + dcidLen(1) + dcid + scidLen(1) + scid + seq(4) + destId(4) + srcId(4)
+    final headerLength = 4 + 1 + destinationCid.length + 1 + sourceCid.length + 4 + 4 + 4;
     final buffer = Uint8List(headerLength + framesBytes.length);
     final view = ByteData.view(buffer.buffer);
 
-    buffer.setAll(0, destinationCid.bytes);
-    buffer.setAll(ConnectionId.cidLength, sourceCid.bytes);
-    view.setUint32(16, sequence, Endian.big);
-    view.setUint32(20, destinationStreamId, Endian.big);
-    view.setUint32(24, sourceStreamId, Endian.big);
+    int offset = 0;
 
-    buffer.setAll(headerLength, framesBytes);
+    // Write version
+    view.setUint32(offset, version, Endian.big);
+    offset += 4;
+
+    // Write destination CID
+    view.setUint8(offset, destinationCid.length);
+    offset += 1;
+    buffer.setAll(offset, destinationCid.bytes);
+    offset += destinationCid.length;
+
+    // Write source CID
+    view.setUint8(offset, sourceCid.length);
+    offset += 1;
+    buffer.setAll(offset, sourceCid.bytes);
+    offset += sourceCid.length;
+
+    // Write sequence and stream IDs
+    view.setUint32(offset, sequence, Endian.big);
+    offset += 4;
+    view.setUint32(offset, destinationStreamId, Endian.big);
+    offset += 4;
+    view.setUint32(offset, sourceStreamId, Endian.big);
+    offset += 4;
+
+    // Write frames
+    buffer.setAll(offset, framesBytes);
 
     return buffer;
   }
@@ -567,6 +1117,9 @@ class PacketManager {
   /// The retransmission timers
   final Map<int, Timer> _retransmitTimers = {};
 
+  /// Track retransmission attempts per packet for metrics
+  final Map<int, int> _retransmitAttempts = {};
+
   /// Creates a new packet manager
   PacketManager({CongestionController? congestionController}) {
     if (congestionController != null) {
@@ -576,6 +1129,14 @@ class PacketManager {
 
   /// Callback to be invoked when a packet needs to be retransmitted.
   void Function(UDXPacket packet)? onRetransmit;
+  
+  /// Callback for metrics when a packet is retransmitted.
+  /// Provides sequence number, attempt count, and current RTO.
+  void Function(int sequence, int attemptCount, Duration rto)? onPacketRetransmitEvent;
+  
+  /// Callback for metrics when packet loss is detected.
+  /// Provides sequence number and loss type ('timeout' or 'fast_retransmit').
+  void Function(int sequence, String lossType)? onPacketLossEvent;
 
   /// Callback to be invoked when a probe packet needs to be sent.
   void Function(UDXPacket packet)? onSendProbe;
@@ -660,12 +1221,18 @@ class PacketManager {
   /// Sends a probe packet to elicit an ACK.
   /// The probe packet contains a PING frame.
   void sendProbe(ConnectionId destCid, ConnectionId srcCid, int destId, int srcId) {
+    // FIX: Probe packets should NOT consume new sequence numbers.
+    // Like ACKs, they are not registered for retransmission, and if lost,
+    // the receiver's _nextExpectedSeq gets stuck forever. Use the last
+    // sent sequence number (or 0 if none sent yet) to avoid sequence gaps.
+    final probeSeq = lastSentPacketNumber >= 0 ? lastSentPacketNumber : 0;
+    
     final probePacket = UDXPacket(
       destinationCid: destCid,
       sourceCid: srcCid,
       destinationStreamId: destId,
       sourceStreamId: srcId,
-      sequence: nextSequence, // Use a new sequence number
+      sequence: probeSeq,
       frames: [PingFrame()],
     );
     onSendProbe?.call(probePacket);
@@ -701,6 +1268,12 @@ class PacketManager {
       
       if (retryCount <= maxRetries) {
         // print('PacketManager: Retransmitting packet ${packet.sequence} (attempt $retryCount/$maxRetries)');
+        
+        // Track the retransmit attempt and notify observer
+        _retransmitAttempts[packet.sequence] = retryCount;
+        final rto = Duration(milliseconds: retransmitTimeout);
+        onPacketRetransmitEvent?.call(packet.sequence, retryCount, rto);
+        
         // Invoke the callback to perform the actual retransmission
         if (onRetransmit != null) {
           onRetransmit!(packet);
@@ -722,8 +1295,12 @@ class PacketManager {
         _retransmitTimers[packet.sequence]?.cancel();
         _retransmitTimers.remove(packet.sequence);
         
+        // Notify observer of packet loss
+        onPacketLossEvent?.call(packet.sequence, 'timeout');
+        
         // Remove from sent packets to prevent further retransmission attempts
         _sentPackets.remove(packet.sequence);
+        _retransmitAttempts.remove(packet.sequence);
         
         // Note: We don't call onPacketPermanentlyLost as that was causing stream crashes
         // The QUIC-compliant PTO system will handle loss detection gracefully

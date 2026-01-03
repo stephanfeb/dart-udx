@@ -11,6 +11,8 @@ import 'stream.dart';
 import 'packet.dart';
 import 'multiplexer.dart';
 import 'pmtud.dart';
+import 'metrics_observer.dart';
+import 'version.dart';
 
 /// Custom error for when a stream creation attempt exceeds the peer's advertised limit.
 class StreamLimitExceededError extends StateError {
@@ -46,9 +48,13 @@ class UDPSocket with UDXEventEmitter {
 
   final Completer<void> _handshakeCompleter = Completer<void>();
   bool _handshakeCompleted = false;
+  DateTime? _handshakeStartTime;
 
   /// A future that completes when the handshake is successful.
   Future<void> get handshakeComplete => _handshakeCompleter.future;
+
+  /// Metrics observer for this socket (optional).
+  UdxMetricsObserver? metricsObserver;
 
   // --- Path Migration Properties ---
   /// Data for an in-flight path challenge.
@@ -77,6 +83,13 @@ class UDPSocket with UDXEventEmitter {
   late int _localMaxStreams; // Our advertised stream limit
   int _remoteMaxStreams = defaultMaxStreams; // Peer's stream limit
   int _activeOutgoingStreams = 0; // Count of our active streams to the peer
+
+  // Anti-amplification properties (RFC 9000 Section 8.1)
+  bool _addressValidated = false; // Whether the peer's address has been validated
+  int _bytesReceivedBeforeValidation = 0; // Bytes received before address validation
+  int _bytesSentBeforeValidation = 0; // Bytes sent before address validation
+  final List<Uint8List> _pendingPackets = []; // Packets queued due to amplification limit
+  static const int amplificationFactor = 3; // RFC 9000: 3x amplification limit
 
   /// Whether the socket is closing.
   bool get closing => _closing;
@@ -109,17 +122,55 @@ class UDPSocket with UDXEventEmitter {
     required this.remoteAddress,
     required this.remotePort,
     required this.cids,
+    this.metricsObserver,
+    bool isServer = false,
   }) {
     _localConnectionMaxData = defaultInitialConnectionWindow;
     _remoteConnectionMaxData = defaultInitialConnectionWindow;
     _localMaxStreams = defaultMaxStreams;
     _pmtudController = PathMtuDiscoveryController();
+    
+    // For client-initiated connections, address is validated by default
+    // For server-side connections (receiving SYN), address must be validated
+    _addressValidated = !isServer;
+    
+    // Notify observer that handshake is starting
+    _handshakeStartTime = DateTime.now();
+    metricsObserver?.onHandshakeStart(
+      cids.localCid,
+      cids.remoteCid,
+      '${remoteAddress.address}:$remotePort',
+    );
   }
 
   /// Processes an incoming datagram from the multiplexer.
-  void handleIncomingDatagram(Uint8List data, InternetAddress fromAddress, int fromPort) {
+  Future<void> handleIncomingDatagram(Uint8List data, InternetAddress fromAddress, int fromPort) async {
+    // Track received bytes for anti-amplification
+    if (!_addressValidated) {
+      _bytesReceivedBeforeValidation += data.length;
+      // Address is validated after receiving a certain amount of data
+      // or on successful handshake completion
+      if (_bytesReceivedBeforeValidation >= 1000 || _handshakeCompleted) {
+        _onAddressValidated();
+      }
+    }
+    
     try {
       final packet = UDXPacket.fromBytes(data);
+      
+      // Check if version is supported
+      if (!UdxVersion.isSupported(packet.version) && !_handshakeCompleted) {
+        // Send VERSION_NEGOTIATION packet
+        final versionNegPacket = VersionNegotiationPacket(
+          destinationCid: packet.sourceCid,
+          sourceCid: packet.destinationCid,
+          supportedVersions: UdxVersion.supportedVersions,
+        );
+        multiplexer.send(versionNegPacket.toBytes(), fromAddress, fromPort);
+        emit('versionNegotiation', {'clientVersion': packet.version, 'supportedVersions': UdxVersion.supportedVersions});
+        return;
+      }
+      
       // Always update the remote CID from the packet's source CID.
       // This ensures that even during retransmissions or path migrations,
       // we are targeting the correct peer identifier.
@@ -131,6 +182,13 @@ class UDPSocket with UDXEventEmitter {
         if (!_handshakeCompleter.isCompleted) {
           _handshakeCompleter.complete();
         }
+        
+        // Notify observer of successful handshake
+        if (_handshakeStartTime != null) {
+          final duration = DateTime.now().difference(_handshakeStartTime!);
+          metricsObserver?.onHandshakeComplete(cids.localCid, duration, true, null);
+        }
+        
         emit('connect');
       }
     } catch (e) {
@@ -148,7 +206,6 @@ class UDPSocket with UDXEventEmitter {
       if (pathHasChanged && _pathChallengeData == null) {
         _initiatePathValidation(fromAddress, fromPort);
       }
-      final remotePeerKey = '${fromAddress.address}:$fromPort';
 
       // --- PMTUD: Handle ACKs for Probes & Trigger New Probes ---
       for (final frame in udxPacket.frames.whereType<AckFrame>()) {
@@ -158,7 +215,17 @@ class UDPSocket with UDXEventEmitter {
 
       // Process connection-level frames first
       for (final frame in udxPacket.frames) {
-        if (frame is MaxDataFrame) {
+        if (frame is ConnectionCloseFrame) {
+          // Handle CONNECTION_CLOSE frame - peer is terminating the connection
+          emit('connectionClose', {
+            'errorCode': frame.errorCode,
+            'frameType': frame.frameType,
+            'reason': frame.reasonPhrase
+          });
+          // Close our side of the connection
+          await close();
+          return;
+        } else if (frame is MaxDataFrame) {
           _handleMaxDataFrame(frame);
         } else if (frame is MaxStreamsFrame) {
           _handleMaxStreamsFrame(frame);
@@ -166,6 +233,10 @@ class UDPSocket with UDXEventEmitter {
           _handlePathChallenge(frame, fromAddress, fromPort);
         } else if (frame is PathResponseFrame) {
           _handlePathResponse(frame, fromAddress, fromPort);
+        } else if (frame is DataBlockedFrame) {
+          // Peer is blocked on connection-level flow control
+          emit('dataBlocked', {'maxData': frame.maxData});
+          // Application can listen to this event and potentially increase the connection window
         } else if (frame is StreamFrame) {
           _connectionBytesReceived += frame.data.length;
           _checkAndSendLocalMaxDataUpdate();
@@ -236,9 +307,38 @@ class UDPSocket with UDXEventEmitter {
   }
 
   /// Sends data to the peer via the multiplexer.
+  /// Enforces anti-amplification limits per RFC 9000 Section 8.1.
   void send(Uint8List data) {
     if (_closing) throw StateError('Socket is closing');
+    
+    // Anti-amplification check: don't send more than 3x what we've received
+    // until the address is validated
+    if (!_addressValidated) {
+      final limit = _bytesReceivedBeforeValidation * amplificationFactor;
+      if (_bytesSentBeforeValidation + data.length > limit) {
+        // Queue the packet until address is validated
+        _pendingPackets.add(data);
+        return;
+      }
+      _bytesSentBeforeValidation += data.length;
+    }
+    
     multiplexer.send(data, remoteAddress, remotePort);
+  }
+
+  /// Called when the peer's address has been validated.
+  /// Flushes any packets that were queued due to amplification limits.
+  void _onAddressValidated() {
+    if (_addressValidated) return;
+    
+    _addressValidated = true;
+    emit('addressValidated');
+    
+    // Flush all pending packets
+    for (final packet in _pendingPackets) {
+      multiplexer.send(packet, remoteAddress, remotePort);
+    }
+    _pendingPackets.clear();
   }
 
   /// Sets the TTL (Time To Live) for outgoing packets. (Not implemented)
@@ -269,7 +369,56 @@ class UDPSocket with UDXEventEmitter {
     _sendBufferSize = size;
   }
 
-  
+  /// Closes the connection with an error code and reason.
+  /// Sends a CONNECTION_CLOSE frame to the peer before terminating.
+  Future<void> closeWithError(int errorCode, String reason, {int frameType = 0}) async {
+    if (_closing) return;
+    _closing = true;
+
+    try {
+      // Send CONNECTION_CLOSE frame
+      final closeFrame = ConnectionCloseFrame(
+        errorCode: errorCode,
+        frameType: frameType,
+        reasonPhrase: reason,
+      );
+      final closePacket = UDXPacket(
+        destinationCid: cids.remoteCid,
+        sourceCid: cids.localCid,
+        destinationStreamId: 0,
+        sourceStreamId: 0,
+        sequence: 0,
+        frames: [closeFrame],
+      );
+      
+      try {
+        send(closePacket.toBytes());
+        // Small delay to ensure CONNECTION_CLOSE is sent
+        await Future.delayed(Duration(milliseconds: 100));
+      } catch (e) {
+        // Ignore send errors during close
+      }
+
+      // Close all streams
+      final streamIds = List<int>.from(_registeredStreams.keys);
+      for (final streamId in streamIds) {
+        final stream = _registeredStreams[streamId];
+        if (stream != null) {
+          await stream.close();
+        }
+      }
+      _registeredStreams.clear();
+
+      multiplexer.removeSocket(cids.localCid);
+
+      emit('close', {'error': errorCode, 'reason': reason});
+    } catch (e) {
+      emit('error', e);
+      rethrow;
+    } finally {
+      super.close();
+    }
+  }
 
   /// Closes the connection.
   Future<void> close() async {
@@ -315,12 +464,27 @@ class UDPSocket with UDXEventEmitter {
       // Potentially throw an error or close the old stream
     }
     _registeredStreams[stream.id] = stream;
+    
+    // Notify observer of stream creation
+    metricsObserver?.onStreamCreated(cids.localCid, stream.id, stream.isInitiator);
   }
 
   /// Unregisters a UDXStream from this socket.
   void unregisterStream(int streamId) {
     final stream = _registeredStreams[streamId];
     if (stream != null) {
+      // Notify observer of stream closure (we'll get duration and bytes from the stream)
+      final duration = stream.connectedAt != null 
+          ? DateTime.now().difference(stream.connectedAt!) 
+          : Duration.zero;
+      metricsObserver?.onStreamClosed(
+        cids.localCid, 
+        streamId, 
+        duration,
+        stream.bytesRead,
+        stream.bytesWritten,
+      );
+      
       _registeredStreams.remove(streamId);
       if (stream.isInitiator) {
         _activeOutgoingStreams = (_activeOutgoingStreams - 1).clamp(0, 9999);
@@ -379,6 +543,13 @@ class UDPSocket with UDXEventEmitter {
     _pendingRemoteAddress = newAddress;
     _pendingRemotePort = newPort;
 
+    // Notify observer of path migration start
+    metricsObserver?.onPathMigrationStart(
+      cids.localCid,
+      '${remoteAddress.address}:$remotePort',
+      '${newAddress.address}:$newPort',
+    );
+
     final challengeFrame = PathChallengeFrame(data: _pathChallengeData!);
     final packet = UDXPacket(
       destinationCid: cids.remoteCid,
@@ -398,6 +569,9 @@ class UDPSocket with UDXEventEmitter {
     // Start a timer. If we don't get a valid response, abort the validation.
     _pathChallengeTimer?.cancel();
     _pathChallengeTimer = Timer(const Duration(seconds: 5), () {
+      // Notify observer of failed path migration
+      metricsObserver?.onPathMigrationComplete(cids.localCid, false);
+      
       _pathChallengeData = null;
       _pendingRemoteAddress = null;
       _pendingRemotePort = null;
@@ -440,6 +614,9 @@ class UDPSocket with UDXEventEmitter {
     // Success! The new path is validated.
     remoteAddress = _pendingRemoteAddress!;
     remotePort = _pendingRemotePort!;
+
+    // Notify observer of successful path migration
+    metricsObserver?.onPathMigrationComplete(cids.localCid, true);
 
     // Clean up state.
     _pathChallengeTimer?.cancel();

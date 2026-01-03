@@ -87,6 +87,35 @@ class MockPacketManager extends _i1.Mock implements _i3.PacketManager {
       );
 
   @override
+  set onPacketRetransmitEvent(
+          void Function(
+            int,
+            int,
+            Duration,
+          )? _onPacketRetransmitEvent) =>
+      super.noSuchMethod(
+        Invocation.setter(
+          #onPacketRetransmitEvent,
+          _onPacketRetransmitEvent,
+        ),
+        returnValueForMissingStub: null,
+      );
+
+  @override
+  set onPacketLossEvent(
+          void Function(
+            int,
+            String,
+          )? _onPacketLossEvent) =>
+      super.noSuchMethod(
+        Invocation.setter(
+          #onPacketLossEvent,
+          _onPacketLossEvent,
+        ),
+        returnValueForMissingStub: null,
+      );
+
+  @override
   set onSendProbe(void Function(_i3.UDXPacket)? _onSendProbe) =>
       super.noSuchMethod(
         Invocation.setter(

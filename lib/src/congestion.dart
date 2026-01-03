@@ -1,15 +1,25 @@
 import 'dart:async';
 import 'dart:math';
 
-import 'packet.dart'; // Import PacketManager
+import 'cid.dart';
+import 'packet.dart';
 import 'pacing.dart';
+import 'metrics_observer.dart';
+import 'logging.dart';
 
 /// Implements QUIC-style congestion control for UDX streams, based on RFC 9002.
 class CongestionController {
   final PacketManager packetManager;
+  
+  /// Metrics observer for this controller (optional).
+  UdxMetricsObserver? metricsObserver;
+  
+  /// Connection ID for metrics reporting.
+  ConnectionId? connectionId;
 
   // Constants based on RFC 9002
   static const int maxDatagramSize = 1472;
+  static const int maxAckDelay = 25; // milliseconds - per RFC 9002
   static final int initialCwnd =
       max(10 * maxDatagramSize, 14720); // 10 * max_datagram_size or 14720 bytes
   static const int minCwnd =
@@ -74,6 +84,9 @@ class CongestionController {
   /// Flag indicating if the controller is in a fast recovery phase.
   bool get isInRecoveryForTest => _inRecovery;
   bool _inRecovery = false;
+  
+  /// Flag to track if we've emitted the initial CWND value
+  bool _initialCwndEmitted = false;
 
   /// When in recovery, this is the packet number of the last packet sent
   /// that marks the end of the "recovery block". We exit recovery once a
@@ -130,10 +143,18 @@ class CongestionController {
   /// [isNewCumulativeAck] true if the ACK frame advanced the highest cumulative ACK point.
   /// [currentFrameLargestAcked] the 'largest_acked' value from the current ACK frame.
   void onPacketAcked(int bytes, DateTime sentTime, Duration ackDelay, bool isNewCumulativeAck, int currentFrameLargestAcked) {
+    // Debug logging
+    print('[CongestionController.onPacketAcked] bytes=$bytes, isNewCumulativeAck=$isNewCumulativeAck, largestAcked=$currentFrameLargestAcked');
     // DIAGNOSTIC LOGGING START
     // //print('[CC onPacketAcked] INPUTS: bytes=$bytes, sentTime=$sentTime, ackDelay=$ackDelay, isNewCumulativeAck=$isNewCumulativeAck, currentFrameLargestAcked=$currentFrameLargestAcked');
     // //print('[CC onPacketAcked] PRE-STATE: _inRecovery=$_inRecovery, _highestProcessedCumulativeAck=$_highestProcessedCumulativeAck, _dupAcks=$_dupAcks, _lastAckedForDupCount=$_lastAckedForDupCount, _cwnd=$_cwnd, _ssthresh=$_ssthresh, _inflight=$_inflight');
     // DIAGNOSTIC LOGGING END
+
+    // Emit initial CWND on first ack so metrics UI shows the starting value
+    if (!_initialCwndEmitted && connectionId != null) {
+      _initialCwndEmitted = true;
+      metricsObserver?.onCongestionWindowUpdate(connectionId!, 0, _cwnd, 'initial');
+    }
 
     _inflight -= bytes;
     if (_inflight < 0) _inflight = 0;
@@ -218,11 +239,21 @@ class CongestionController {
   /// Updates RTT estimates based on a new sample.
   void _updateRtt(DateTime sentTime, Duration ackDelay) {
     final now = DateTime.now();
+    
+    // Cap ack_delay per RFC 9002 Section 5.3
+    // The ack_delay should not exceed max_ack_delay transport parameter
+    final cappedAckDelay = Duration(
+      milliseconds: min(ackDelay.inMilliseconds, maxAckDelay)
+    );
+    
     // Adjust for ack_delay as per RFC 9002
     _latestRtt = now.difference(sentTime);
-    if (_latestRtt > ackDelay) {
-      _latestRtt -= ackDelay;
+    if (_latestRtt > cappedAckDelay) {
+      _latestRtt -= cappedAckDelay;
     }
+    
+    // Debug logging for RTT updates
+    UdxLogging.debug('CongestionController._updateRtt: RTT=${_latestRtt.inMilliseconds}ms, connectionId=${connectionId?.toString().substring(0, 8) ?? "null"}, hasObserver=${metricsObserver != null}');
 
     // Update min_rtt
     if (_latestRtt < _minRtt) {
@@ -248,6 +279,11 @@ class CongestionController {
               ((1 - beta) * _rttVar.inMicroseconds + beta * rttVarSample)
                   .round());
     }
+    
+    // Notify observer of RTT sample
+    if (connectionId != null) {
+      metricsObserver?.onRttSample(connectionId!, _latestRtt, _smoothedRtt, _rttVar);
+    }
   }
 
   /// Performs the CUBIC window increase calculation.
@@ -264,16 +300,28 @@ class CongestionController {
     // Check if we are in the TCP-friendly region
     if (targetCwndBytes < wTcp) {
       // If CUBIC is less aggressive than TCP, we use the TCP-friendly growth.
+      final oldCwnd = _cwnd;
       _cwnd = wTcp;
+      if (connectionId != null && oldCwnd != _cwnd) {
+        metricsObserver?.onCongestionWindowUpdate(connectionId!, oldCwnd, _cwnd, 'tcp_growth');
+      }
     } else {
       // Otherwise, use the CUBIC growth.
       // The increase is the difference between the target and current, scaled.
       if (_cwnd < targetCwndBytes) {
+        final oldCwnd = _cwnd;
         int increase = ((targetCwndBytes - _cwnd) * maxDatagramSize / _cwnd).round();
         _cwnd += increase;
+        if (connectionId != null && oldCwnd != _cwnd) {
+          metricsObserver?.onCongestionWindowUpdate(connectionId!, oldCwnd, _cwnd, 'cubic_growth');
+        }
       } else {
         // If we are already past the target, use standard linear growth to probe.
+        final oldCwnd = _cwnd;
         _cwnd += (maxDatagramSize * bytes) ~/ _cwnd;
+        if (connectionId != null && oldCwnd != _cwnd) {
+          metricsObserver?.onCongestionWindowUpdate(connectionId!, oldCwnd, _cwnd, 'linear_probe');
+        }
       }
     }
   }
@@ -318,9 +366,14 @@ class CongestionController {
     _k = pow(diff, 1/3).toDouble();
 
 
+    final oldCwnd = _cwnd;
     _cwnd = _ssthresh; // Reduce the window
     _dupAcks = 0;
     pacingController.updateRate(_cwnd, _minRtt);
+    
+    if (connectionId != null) {
+      metricsObserver?.onCongestionWindowUpdate(connectionId!, oldCwnd, _cwnd, 'loss_detected');
+    }
   }
 
   /// Called by UDXStream when an ACK frame is received that does not advance the _highestProcessedCumulativeAck.
@@ -494,5 +547,28 @@ class CongestionController {
     pacingController.updateRate(_cwnd, _minRtt);
     _inRecovery = false; // Exit recovery to allow for slow start
     _recoveryEndPacketNumber = -1;
+  }
+
+  /// Processes ECN (Explicit Congestion Notification) feedback from ACK frames.
+  /// 
+  /// ECN allows routers to signal congestion before packet loss occurs,
+  /// enabling more responsive congestion control. This is a placeholder for
+  /// future OS-level ECN integration.
+  /// 
+  /// Per RFC 9000 Section 13.4:
+  /// - ECT(0), ECT(1): ECN Capable Transport markings
+  /// - CE: Congestion Experienced marking
+  /// 
+  /// An increase in CE count indicates congestion, which should trigger
+  /// congestion response similar to packet loss.
+  void processEcnFeedback(int ect0, int ect1, int ce) {
+    // TODO: Implement ECN-based congestion control once OS integration is available
+    // For now, this is a no-op placeholder
+    // 
+    // When implemented, logic should:
+    // 1. Track previous CE count
+    // 2. If CE count increases, treat as congestion signal
+    // 3. Enter recovery and reduce cwnd similar to packet loss
+    // 4. Update metrics/logging
   }
 }

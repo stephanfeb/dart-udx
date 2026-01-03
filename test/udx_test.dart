@@ -97,7 +97,8 @@ void main() {
         frames: [PingFrame()],
       );
       final bytes = originalPacket.toBytes();
-      expect(bytes.length, 28 + 1); // Header + PingFrame
+      // New v2 format: version(4) + dcidLen(1) + dcid(8) + scidLen(1) + scid(8) + seq(4) + destId(4) + srcId(4) + PingFrame(1) = 35
+      expect(bytes.length, 35);
 
       final reconstructedPacket = UDXPacket.fromBytes(bytes);
       expect(reconstructedPacket.frames.length, 1);

@@ -410,17 +410,20 @@ void main() {
     }
 
       test('processes a simple AckFrame and updates CC and PacketManager', () {
+        final sendTime0 = DateTime.now().subtract(Duration(milliseconds: 110)); // Handshake packet
         final sendTime1 = DateTime.now().subtract(Duration(milliseconds: 100));
         final sendTime2 = DateTime.now().subtract(Duration(milliseconds: 90));
         setupStreamSentPackets({
+          0: (sendTime0, 0),    // Handshake packet (no data, just establishes connection)
           1: (sendTime1, 1000),
           2: (sendTime2, 1000)
         });
 
         // Simulate that packetManager.handleAckFrame will report these as newly acked
-        when(mockPm.handleAckFrame(any)).thenReturn([1, 2]);
+        // (including packet 0 from the handshake)
+        when(mockPm.handleAckFrame(any)).thenReturn([0, 1, 2]);
 
-        final ackFrame = AckFrame(largestAcked: 2, ackDelay: 5, firstAckRangeLength: 2); // Acks 1, 2
+        final ackFrame = AckFrame(largestAcked: 2, ackDelay: 5, firstAckRangeLength: 3); // Acks 0, 1, 2
         final incomingPacket = UDXPacket(
             destinationCid: ConnectionId.random(),
             sourceCid: ConnectionId.random(),
@@ -447,16 +450,17 @@ void main() {
         // Verify CongestionController was updated for each acked packet
         // Note: ackedSize is now correctly retrieved from the map.
         // ackFrame.largestAcked is 2 in this test.
-        // With the new logic, if _currentHighestCumulativeAckFromRemote doesn't advance past _ccMirrorOfHighestProcessedCumulativeAck (-1 in this test setup),
-        // then isNewCumulativeForCC will be false for all onPacketAcked calls.
-        verify(mockCc.onPacketAcked(1000, sendTime1, Duration(milliseconds: 5), false, 2)).called(1);
-        verify(mockCc.onPacketAcked(1000, sendTime2, Duration(milliseconds: 5), false, 2)).called(1);
+        // Since this is the first ACK and largestAcked=2 advances past the initial state,
+        // isNewCumulativeForCC will be true for all packets (0, 1, 2).
+        verify(mockCc.onPacketAcked(0, sendTime0, Duration(milliseconds: 5), true, 2)).called(1); // Handshake packet
+        verify(mockCc.onPacketAcked(1000, sendTime1, Duration(milliseconds: 5), true, 2)).called(1);
+        verify(mockCc.onPacketAcked(1000, sendTime2, Duration(milliseconds: 5), true, 2)).called(1);
 
-        // Verify processDuplicateAck is called because the CC's cumulative ACK point did not advance.
-        // _ccMirrorOfHighestProcessedCumulativeAck remains -1 in this test scenario.
-        verify(mockCc.processDuplicateAck(-1)).called(1);
+        // Verify processDuplicateAck is NOT called because this is a new cumulative ACK.
+        verifyNever(mockCc.processDuplicateAck(any));
 
         // Verify stream's own _sentPackets map is updated
+        expect(stream.getSentPacketsTestHook().containsKey(0), isFalse);
         expect(stream.getSentPacketsTestHook().containsKey(1), isFalse);
         expect(stream.getSentPacketsTestHook().containsKey(2), isFalse);
 
@@ -466,23 +470,28 @@ void main() {
 
 
       test('processes AckFrame with gaps, updates CC and PacketManager for relevant packets', () {
+        final sendTime0 = DateTime.now().subtract(Duration(milliseconds: 110)); // Handshake packet
         final sendTime1 = DateTime.now().subtract(Duration(milliseconds: 100));
         final sendTime3 = DateTime.now().subtract(Duration(milliseconds: 80));
         final sendTime2 = DateTime.now().subtract(Duration(milliseconds: 90));
         setupStreamSentPackets({
+          0: (sendTime0, 0),    // Handshake packet
           1: (sendTime1, 1200),
-          2: (sendTime2, 1200), // Packet 2 will not be acked by this frame
+          2: (sendTime2, 1200), // Packet 2 will not be acked by this frame (lost/delayed)
           3: (sendTime3, 1200)
         });
 
-        // Simulate packetManager.handleAckFrame reports 1 and 3 as newly acked
-        when(mockPm.handleAckFrame(any)).thenReturn([1, 3]);
+        // Simulate packetManager.handleAckFrame reports 0, 1 and 3 as newly acked (gap at 2)
+        when(mockPm.handleAckFrame(any)).thenReturn([0, 1, 3]);
 
+        // ACK frame acknowledges: 0, 1, and 3 (with gap at 2)
+        // First range: largestAcked=3, firstAckRangeLength=1 → acks only 3
+        // Second range: gap=1 (skips 2), ackRangeLength=2 → acks 0 and 1
         final ackFrameWithGap = AckFrame(
           largestAcked: 3, 
           ackDelay: 8, 
           firstAckRangeLength: 1, // Acks 3
-          ackRanges: [AckRange(gap: 1, ackRangeLength: 1)] // Skips 2, Acks 1
+          ackRanges: [AckRange(gap: 1, ackRangeLength: 2)] // Skips 2, Acks 0 and 1
         );
         final incomingPacketWithGap = UDXPacket(
             destinationCid: ConnectionId.random(),
@@ -511,18 +520,24 @@ void main() {
           })
         ))).called(1);
 
-        // ackFrameWithGap.largestAcked is 3 in this test.
-        // Similar to the above test, isNewCumulativeForCC will be false.
-        verify(mockCc.onPacketAcked(1200, sendTime1, Duration(milliseconds: 8), false, 3)).called(1);
-        verify(mockCc.onPacketAcked(1200, sendTime3, Duration(milliseconds: 8), false, 3)).called(1);
+        // With true cumulative ACK logic:
+        // - Packets 0 and 1 are contiguously acknowledged, so cumulative ack advances to 1
+        // - Packet 3 is acknowledged via SACK but beyond cumulative (gap at 2)
+        // - Packet 0: isNewCumulativeForCC=true (within cumulative range 0..1)
+        // - Packet 1: isNewCumulativeForCC=true (within cumulative range 0..1)
+        // - Packet 3: isNewCumulativeForCC=false (3 > cumulative ack of 1)
+        verify(mockCc.onPacketAcked(0, sendTime0, Duration(milliseconds: 8), true, 3)).called(1);
+        verify(mockCc.onPacketAcked(1200, sendTime1, Duration(milliseconds: 8), true, 3)).called(1);
+        verify(mockCc.onPacketAcked(1200, sendTime3, Duration(milliseconds: 8), false, 3)).called(1); // Beyond cumulative
         verifyNever(mockCc.onPacketAcked(any, argThat(equals(sendTime2)), any, any, any)); // Packet 2 not acked
 
-        // Verify processDuplicateAck is called.
-        verify(mockCc.processDuplicateAck(-1)).called(1);
+        // processDuplicateAck is NOT called because the cumulative ACK did advance (from -1 to 1)
+        verifyNever(mockCc.processDuplicateAck(any));
 
+        expect(stream.getSentPacketsTestHook().containsKey(0), isFalse);
         expect(stream.getSentPacketsTestHook().containsKey(1), isFalse);
         expect(stream.getSentPacketsTestHook().containsKey(3), isFalse);
-        expect(stream.getSentPacketsTestHook().containsKey(2), isTrue); // Packet 2 remains
+        expect(stream.getSentPacketsTestHook().containsKey(2), isTrue); // Packet 2 remains (lost/delayed)
       });
     });
   });

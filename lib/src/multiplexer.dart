@@ -8,6 +8,7 @@ import 'package:dart_udx/src/socket.dart';
 import 'package:meta/meta.dart';
 
 import 'udx.dart';
+import 'metrics_observer.dart';
 
 /// A class that demultiplexes incoming UDX packets to the correct `UDPSocket`.
 ///
@@ -15,12 +16,17 @@ import 'udx.dart';
 /// packets to the appropriate `UDPSocket` instance based on their destination
 /// Connection ID (CID).
 class UDXMultiplexer {
-  UDXMultiplexer(this.socket) {
+  UDXMultiplexer(this.socket, {this.metricsObserver}) {
+    socket.readEventsEnabled = true;
+    socket.writeEventsEnabled = false; // We'll enable when needed
     _listen();
   }
 
   /// The underlying UDP socket that this multiplexer listens on.
   final RawDatagramSocket socket;
+  
+  /// Optional metrics observer to be passed to all created sockets
+  final UdxMetricsObserver? metricsObserver;
 
   final _connectionsController = StreamController<UDPSocket>.broadcast();
 
@@ -32,6 +38,10 @@ class UDXMultiplexer {
   final Map<ConnectionId, UDPSocket> socketsByCid = {};
   @visibleForTesting
   final Map<String, UDPSocket> socketsByPeer = {};
+  
+  /// A map of stateless reset tokens for known connections.
+  /// Used to validate incoming stateless reset packets.
+  final Map<ConnectionId, StatelessResetToken> _resetTokens = {};
 
   /// Starts listening for incoming datagrams and routes them.
   void _listen() {
@@ -41,14 +51,47 @@ class UDXMultiplexer {
         if (datagram == null) return;
 
         final data = datagram.data;
-        if (data.length < 28) return; // Not a valid UDX packet
+        // New packet format minimum: version(4) + dcidLen(1) + scidLen(1) + seq(4) + destId(4) + srcId(4) = 18 bytes
+        if (data.length < 18) return; // Not a valid UDX packet
 
-        // Extract the destination CID from the packet header
-        final destinationCid = ConnectionId(data.sublist(0, 8));
+        // Check if this might be a stateless reset packet
+        if (data.length >= StatelessResetPacket.minPacketSize) {
+          final resetPacket = StatelessResetPacket.tryParse(data);
+          if (resetPacket != null) {
+            // Check if we have this token registered
+            for (final entry in _resetTokens.entries) {
+              if (entry.value == resetPacket.token) {
+                // Valid stateless reset received
+                final socket = socketsByCid[entry.key];
+                if (socket != null) {
+                  // Close the socket due to stateless reset
+                  socket.closeWithError(
+                    UdxErrorCode.internalError,
+                    'Received stateless reset from peer',
+                  );
+                }
+                return;
+              }
+            }
+          }
+        }
+
+        // Extract the destination CID from the new packet header format
+        // New format: version(4) + dcidLen(1) + dcid(0-20) + ...
+        ConnectionId destinationCid;
+        try {
+          final dcidLength = data[4]; // Byte at offset 4 is destination CID length
+          if (dcidLength > 20 || data.length < 5 + dcidLength) {
+            return; // Invalid packet
+          }
+          destinationCid = ConnectionId(data.sublist(5, 5 + dcidLength));
+        } catch (e) {
+          return; // Failed to parse CID, ignore packet
+        }
 
         // Route the packet to the correct socket
         final socketConnection = socketsByCid[destinationCid];
-
+        
         if (socketConnection != null) {
           // print('[MUX] Forwarding packet to existing UDPSocket');
           socketConnection.handleIncomingDatagram(datagram.data, datagram.address, datagram.port);
@@ -58,7 +101,7 @@ class UDXMultiplexer {
             final isNewConnection = packet.frames
                 .whereType<StreamFrame>()
                 .any((frame) => frame.isSyn);
-
+            
             if (isNewConnection) {
               // print('[MUX] SYN packet detected. Creating new UDPSocket.');
               // This is a new connection attempt.
@@ -69,7 +112,8 @@ class UDXMultiplexer {
                 datagram.port,
                 localCid: destinationCid, // Use the CID from the SYN packet
                 remoteCid: packet.sourceCid,
-              );
+                isServer: true, // This is a server-side socket
+              ); // metricsObserver is already passed through the multiplexer
               // THE FIX: Map the temporary destination CID to the new socket
               // to handle retransmissions during the handshake.
               socketsByCid[destinationCid] = newSocket;
@@ -129,6 +173,7 @@ class UDXMultiplexer {
     int port, {
     ConnectionId? localCid,
     ConnectionId? remoteCid,
+    bool isServer = false,
   }) {
     final peerKey = '$host:$port';
     if (socketsByPeer.containsKey(peerKey)) {
@@ -148,11 +193,48 @@ class UDXMultiplexer {
       remoteAddress: remoteAddress,
       remotePort: port,
       cids: cids,
+      metricsObserver: metricsObserver,
+      isServer: isServer,
     );
 
     socketsByCid[effectiveLocalCid] = newSocket;
     socketsByPeer[peerKey] = newSocket;
     return newSocket;
+  }
+
+  /// Sends a stateless reset packet to a peer.
+  /// 
+  /// This is used when the server has lost connection state but receives
+  /// a packet for a connection. The stateless reset allows the client to
+  /// quickly detect that the server has lost state and close the connection.
+  void sendStatelessReset(
+    InternetAddress address,
+    int port,
+    ConnectionId connectionId,
+  ) {
+    try {
+      // Generate token for this CID if not already cached
+      StatelessResetToken token;
+      if (_resetTokens.containsKey(connectionId)) {
+        token = _resetTokens[connectionId]!;
+      } else {
+        token = StatelessResetToken.generate(connectionId);
+        _resetTokens[connectionId] = token;
+      }
+      
+      // Create and send stateless reset packet
+      final resetPacket = StatelessResetPacket.create(token);
+      socket.send(resetPacket.toBytes(), address, port);
+    } catch (e) {
+      // Silently fail if we can't send stateless reset
+      // (e.g., server secret not configured)
+    }
+  }
+  
+  /// Registers a reset token for a connection.
+  /// This allows the multiplexer to validate incoming stateless resets.
+  void registerResetToken(ConnectionId cid, StatelessResetToken token) {
+    _resetTokens[cid] = token;
   }
 
   // --- Test Hooks ---
@@ -161,9 +243,20 @@ class UDXMultiplexer {
   void handleIncomingDatagramForTest(
       Uint8List data, InternetAddress address, int port) {
     // This is a simplified version of the logic in _listen for test purposes
-    if (data.length < 28) return;
+    if (data.length < 18) return; // New minimum packet size
 
-    final destinationCid = ConnectionId(data.sublist(0, 8));
+    // Extract destination CID from new packet format
+    ConnectionId destinationCid;
+    try {
+      final dcidLength = data[4]; // Byte at offset 4 is destination CID length
+      if (dcidLength > 20 || data.length < 5 + dcidLength) {
+        return; // Invalid packet
+      }
+      destinationCid = ConnectionId(data.sublist(5, 5 + dcidLength));
+    } catch (e) {
+      return; // Failed to parse CID, ignore packet
+    }
+
     final socketConnection = socketsByCid[destinationCid];
 
     if (socketConnection != null) {

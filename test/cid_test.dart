@@ -11,15 +11,28 @@ void main() {
     });
 
     test('should throw an error if byte list has incorrect length', () {
-      final shortBytes = [0, 1, 2, 3];
-      final longBytes = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
-      expect(() => ConnectionId(shortBytes), throwsArgumentError);
-      expect(() => ConnectionId(longBytes), throwsArgumentError);
+      // CIDs must be between 0-20 bytes
+      final tooLongBytes = List.generate(21, (i) => i);
+      expect(() => ConnectionId(tooLongBytes), throwsArgumentError);
+    });
+
+    test('should accept variable-length CIDs within valid range', () {
+      // Test 0-byte CID
+      final cid0 = ConnectionId([]);
+      expect(cid0.length, equals(0));
+      
+      // Test 8-byte CID (default)
+      final cid8 = ConnectionId([0, 1, 2, 3, 4, 5, 6, 7]);
+      expect(cid8.length, equals(8));
+      
+      // Test 20-byte CID (max)
+      final cid20 = ConnectionId(List.generate(20, (i) => i));
+      expect(cid20.length, equals(20));
     });
 
     test('should generate a random ConnectionId with correct length', () {
       final cid = ConnectionId.random();
-      expect(cid.bytes.length, equals(ConnectionId.cidLength));
+      expect(cid.bytes.length, equals(ConnectionId.defaultCidLength));
     });
 
     test('should generate two different random ConnectionIds', () {

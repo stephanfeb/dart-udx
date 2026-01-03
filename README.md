@@ -21,6 +21,22 @@ UDX is a QUIC-inspired, UDP-based transport protocol that provides reliable, ord
 - **Stream Multiplexing** - Multiple concurrent streams per connection
 - **Event-Driven Architecture** - Responsive, asynchronous I/O
 
+### What's New in v2.0 (Enhanced QUIC Compliance)
+
+- **Variable-Length Connection IDs** - Flexible CID sizes (0-20 bytes) for improved privacy
+- **Version Negotiation** - Automatic protocol version negotiation
+- **Graceful Connection Termination** - CONNECTION_CLOSE frames with error details
+- **Unidirectional Streams** - Half-duplex streams for optimized data flow
+- **STOP_SENDING Frame** - Receiver-initiated stream termination
+- **Flow Control Signaling** - BLOCKED frames for better congestion visibility
+- **Stream Priorities** - Priority-based stream scheduling
+- **Anti-Amplification Protection** - Built-in DDoS mitigation per RFC 9000
+- **Stateless Reset** - Connection recovery without state
+- **ECN Support** - Infrastructure for Explicit Congestion Notification
+- **Improved RTT Estimation** - RFC 9002 compliant ACK delay handling
+
+See [CHANGELOG.md](CHANGELOG.md) for full details and migration guide.
+
 ## Installation
 
 Add this package to your `pubspec.yaml`:

@@ -29,6 +29,7 @@ void main() {
       when(mockSocket.closing).thenReturn(false);
       when(mockSocket.getAvailableConnectionSendWindow()).thenReturn(1500);
       when(mockSocket.on(any)).thenAnswer((_) => Stream.empty());
+      when(mockSocket.metricsObserver).thenReturn(null); // Metrics observer is optional
       // We will set up popInitialPacket on a per-test basis
       when(mockSocket.sendMaxDataFrame(any, streamId: anyNamed('streamId')))
           .thenAnswer((_) async {});

@@ -30,8 +30,8 @@ void main() {
       final frame = packet.frames.first;
       expect(frame, isA<MtuProbeFrame>());
       
-      // Frame length should be packet length minus header
-      expect(frame.length, 1280 - 28);
+      // Frame length should be packet length minus v2 header (34 bytes)
+      expect(frame.length, 1280 - 34);
 
       // Controller should now be in the searching state
       expect(controller.state, PmtudState.searching);

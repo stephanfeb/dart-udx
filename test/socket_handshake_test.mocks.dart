@@ -3,13 +3,15 @@
 // Do not manually edit this file.
 
 // ignore_for_file: no_leading_underscores_for_library_prefixes
-import 'dart:async' as _i5;
+import 'dart:async' as _i6;
 import 'dart:io' as _i2;
-import 'dart:typed_data' as _i6;
+import 'dart:typed_data' as _i7;
 
-import 'package:dart_udx/src/cid.dart' as _i7;
+import 'package:dart_udx/src/cid.dart' as _i5;
+import 'package:dart_udx/src/multiplexer.dart' as _i4;
+import 'package:dart_udx/src/packet.dart' as _i9;
 import 'package:dart_udx/src/socket.dart' as _i3;
-import 'package:dart_udx/dart_udx.dart' as _i4;
+import 'package:dart_udx/src/udx.dart' as _i8;
 import 'package:mockito/mockito.dart' as _i1;
 
 // ignore_for_file: type=lint
@@ -64,10 +66,22 @@ class MockUDXMultiplexer extends _i1.Mock implements _i4.UDXMultiplexer {
       ) as _i2.RawDatagramSocket);
 
   @override
-  _i5.Stream<_i3.UDPSocket> get connections => (super.noSuchMethod(
+  Map<_i5.ConnectionId, _i3.UDPSocket> get socketsByCid => (super.noSuchMethod(
+        Invocation.getter(#socketsByCid),
+        returnValue: <_i5.ConnectionId, _i3.UDPSocket>{},
+      ) as Map<_i5.ConnectionId, _i3.UDPSocket>);
+
+  @override
+  Map<String, _i3.UDPSocket> get socketsByPeer => (super.noSuchMethod(
+        Invocation.getter(#socketsByPeer),
+        returnValue: <String, _i3.UDPSocket>{},
+      ) as Map<String, _i3.UDPSocket>);
+
+  @override
+  _i6.Stream<_i3.UDPSocket> get connections => (super.noSuchMethod(
         Invocation.getter(#connections),
-        returnValue: _i5.Stream<_i3.UDPSocket>.empty(),
-      ) as _i5.Stream<_i3.UDPSocket>);
+        returnValue: _i6.Stream<_i3.UDPSocket>.empty(),
+      ) as _i6.Stream<_i3.UDPSocket>);
 
   @override
   void close() => super.noSuchMethod(
@@ -80,7 +94,7 @@ class MockUDXMultiplexer extends _i1.Mock implements _i4.UDXMultiplexer {
 
   @override
   void send(
-    _i6.Uint8List? data,
+    _i7.Uint8List? data,
     _i2.InternetAddress? address,
     int? port,
   ) =>
@@ -97,7 +111,7 @@ class MockUDXMultiplexer extends _i1.Mock implements _i4.UDXMultiplexer {
       );
 
   @override
-  void removeSocket(_i7.ConnectionId? localCid) => super.noSuchMethod(
+  void removeSocket(_i5.ConnectionId? localCid) => super.noSuchMethod(
         Invocation.method(
           #removeSocket,
           [localCid],
@@ -106,12 +120,22 @@ class MockUDXMultiplexer extends _i1.Mock implements _i4.UDXMultiplexer {
       );
 
   @override
+  void addSocket(_i3.UDPSocket? socket) => super.noSuchMethod(
+        Invocation.method(
+          #addSocket,
+          [socket],
+        ),
+        returnValueForMissingStub: null,
+      );
+
+  @override
   _i3.UDPSocket createSocket(
-    _i4.UDX? udx,
+    _i8.UDX? udx,
     String? host,
     int? port, {
-    _i7.ConnectionId? localCid,
-    _i7.ConnectionId? remoteCid,
+    _i5.ConnectionId? localCid,
+    _i5.ConnectionId? remoteCid,
+    bool? isServer = false,
   }) =>
       (super.noSuchMethod(
         Invocation.method(
@@ -124,6 +148,7 @@ class MockUDXMultiplexer extends _i1.Mock implements _i4.UDXMultiplexer {
           {
             #localCid: localCid,
             #remoteCid: remoteCid,
+            #isServer: isServer,
           },
         ),
         returnValue: _FakeUDPSocket_1(
@@ -138,24 +163,59 @@ class MockUDXMultiplexer extends _i1.Mock implements _i4.UDXMultiplexer {
             {
               #localCid: localCid,
               #remoteCid: remoteCid,
+              #isServer: isServer,
             },
           ),
         ),
       ) as _i3.UDPSocket);
 
   @override
-  Map<_i7.ConnectionId, _i3.UDPSocket> getSocketsForTest() =>
+  void sendStatelessReset(
+    _i2.InternetAddress? address,
+    int? port,
+    _i5.ConnectionId? connectionId,
+  ) =>
+      super.noSuchMethod(
+        Invocation.method(
+          #sendStatelessReset,
+          [
+            address,
+            port,
+            connectionId,
+          ],
+        ),
+        returnValueForMissingStub: null,
+      );
+
+  @override
+  void registerResetToken(
+    _i5.ConnectionId? cid,
+    _i9.StatelessResetToken? token,
+  ) =>
+      super.noSuchMethod(
+        Invocation.method(
+          #registerResetToken,
+          [
+            cid,
+            token,
+          ],
+        ),
+        returnValueForMissingStub: null,
+      );
+
+  @override
+  Map<_i5.ConnectionId, _i3.UDPSocket> getSocketsForTest() =>
       (super.noSuchMethod(
         Invocation.method(
           #getSocketsForTest,
           [],
         ),
-        returnValue: <_i7.ConnectionId, _i3.UDPSocket>{},
-      ) as Map<_i7.ConnectionId, _i3.UDPSocket>);
+        returnValue: <_i5.ConnectionId, _i3.UDPSocket>{},
+      ) as Map<_i5.ConnectionId, _i3.UDPSocket>);
 
   @override
   void handleIncomingDatagramForTest(
-    _i6.Uint8List? data,
+    _i7.Uint8List? data,
     _i2.InternetAddress? address,
     int? port,
   ) =>

@@ -65,7 +65,8 @@ class PathMtuDiscoveryController {
     }
 
     // The size of the probe frame needs to account for the UDX packet header.
-    final frameSize = _probeMtu - 28; // 28 bytes for the UDX header
+    // v2 header format: version(4) + dcidLen(1) + dcid(8) + scidLen(1) + scid(8) + seq(4) + destId(4) + srcId(4) = 34 bytes
+    final frameSize = _probeMtu - 34; // 34 bytes for the UDX v2 header with default CID length
     if (frameSize <= 0) {
       // This should not happen with reasonable MTU values.
       throw StateError('Calculated frame size for MTU probe is not positive.');
