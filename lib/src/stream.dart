@@ -1380,14 +1380,15 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
     int initialSeq = 0,
     int? initialCwnd,
     bool Function(UDPSocket socket, int port, String host)? firewall,
+    StreamType streamType = StreamType.bidirectional,  // Default to bidirectional for initial/handshake streams
   }) {
     if (socket.closing) {
       throw StateError('UDXStream.createIncoming: Socket is closing');
     }
     
-    // Determine stream type from the remote stream ID
-    // For incoming streams, we're not the initiator
-    final streamType = StreamIdHelper.getStreamType(remoteId, false);
+    // NOTE: We no longer derive stream type from the stream ID because UDX uses
+    // random stream IDs, not QUIC-style encoded IDs. The stream type is now
+    // explicitly passed as a parameter (defaulting to bidirectional).
     
     final stream = UDXStream(
       udx,
