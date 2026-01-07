@@ -339,41 +339,31 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
     final String sourceHost = event['address'] as String;
     final int sourcePort = event['port'] as int;
 
-    print('[UDXStream ${this.id}.internalHandleSocketEvent] 📬 ENTRY: from $sourceHost:$sourcePort. My remote: $remoteHost:$remotePort. My ID: $id, My remoteID: $remoteId, rawData.length=${rawData.length}');
 
     if (remoteHost == null || remotePort == null) {
-      print('[UDXStream ${this.id}.internalHandleSocketEvent] ❌ Discarding: remoteHost or remotePort is null.');
       return;
     }
     if (sourceHost != remoteHost || sourcePort != remotePort) {
-      print('[UDXStream ${this.id}.internalHandleSocketEvent] ❌ Discarding: Source $sourceHost:$sourcePort does not match expected remote $remoteHost:$remotePort.');
       return;
     }
 
     UDXPacket packet;
     try {
       packet = UDXPacket.fromBytes(rawData);
-      print('[UDXStream ${this.id}.internalHandleSocketEvent] 📦 Parsed packet: DestID=${packet.destinationStreamId}, SrcID=${packet.sourceStreamId}, Seq=${packet.sequence}, Frames=${packet.frames.map((f) => f.runtimeType).toList()}');
     } catch (e) {
-      print('[UDXStream ${this.id}.internalHandleSocketEvent] ❌ Error parsing packet: $e');
       return;
     }
 
     if (packet.destinationStreamId != id) {
-      print('[UDXStream ${this.id}.internalHandleSocketEvent] ❌ Discarding: Packet DestID ${packet.destinationStreamId} does not match my ID $id.');
       return;
     }
 
     if (remoteId == null) {
-      print('[UDXStream ${this.id}.internalHandleSocketEvent] ❌ Discarding: My remoteId is null.');
       return;
     }
     if (packet.sourceStreamId != remoteId) {
-      print('[UDXStream ${this.id}.internalHandleSocketEvent] ❌ Discarding: Packet SrcID ${packet.sourceStreamId} does not match my remoteId $remoteId.');
       return;
     }
-
-    print('[UDXStream ${this.id}.internalHandleSocketEvent] ✅ PROCESSING packet: DestID=${packet.destinationStreamId}, SrcID=${packet.sourceStreamId}, Seq=${packet.sequence}, ExpectedSeq=$_nextExpectedSeq');
 
     bool needsAck = false;
     bool packetIsSequential = (packet.sequence == _nextExpectedSeq);
@@ -412,11 +402,6 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
         emit('drain');
       }
       if (frame is AckFrame) {
-        // DIAGNOSTIC LOGGING START
-        // ////print('[UDXStream $id internalHandleSocketEvent] ACK FRAME: largestAcked=${frame.largestAcked}, firstAckRangeLength=${frame.firstAckRangeLength}, ackRanges=${frame.ackRanges.map((r) => "G:${r.gap},L:${r.ackRangeLength}").toList()}');
-        // ////print('[UDXStream $id internalHandleSocketEvent] PRE-ACK: _ccMirrorOfHighestProcessedCumulativeAck=$_ccMirrorOfHighestProcessedCumulativeAck');
-        // DIAGNOSTIC LOGGING END
-
         // Let PacketManager update its internal state (_sentPackets, _retransmitTimers)
         final List<int> newlySackedSequences = packetManager.handleAckFrame(frame);
 
@@ -508,16 +493,13 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
 
     if (packetIsSequential) {
       // This packet is the next expected one. Process its frames.
-      print('[UDXStream ${this.id}.internalHandleSocketEvent] ✅ SEQUENTIAL packet Seq=${packet.sequence}');
       _receivedPacketSequences.add(packet.sequence); // Track for ACK generation
       _largestAckedPacketArrivalTime = DateTime.now(); // Update arrival time for potential largest_acked
 
       for (final frame in packet.frames) {
         if (frame is StreamFrame) {
-          print('[UDXStream ${this.id}.internalHandleSocketEvent] 📄 StreamFrame: DataLen=${frame.data.length}, IsFin=${frame.isFin}');
           needsAck = true;
           if (frame.data.isNotEmpty) {
-            print('[UDXStream ${this.id}.internalHandleSocketEvent] 🚀 ADDING ${frame.data.length} bytes to _dataController');
             bytesRead += frame.data.length;
             _dataController.add(frame.data);
             if (_socket != null && remoteHost != null && remotePort != null) {
@@ -562,7 +544,6 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
       // Packet is for the future. Buffer if it contains stream data.
       bool hasStreamDataContent = packet.frames.any((f) => f is StreamFrame && (f.data.isNotEmpty || f.isFin));
       if (hasStreamDataContent) {
-        print('[UDXStream ${this.id}.internalHandleSocketEvent] ⏳ BUFFERING out-of-order packet: Seq=${packet.sequence}, ExpectedSeq=$_nextExpectedSeq.');
         _receiveBuffer[packet.sequence] = packet; // Buffer the whole packet
       } else {
         ////print('[UDXStream ${this.id}.internalHandleSocketEvent] Received out-of-order packet without StreamFrames (e.g. just ACK or future PING): Seq=${packet.sequence}. Processing relevant frames.');
@@ -576,7 +557,6 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
       }
     } else { // packet.sequence < _nextExpectedSeq
       // Packet is older than expected, likely a duplicate.
-      print('[UDXStream ${this.id}.internalHandleSocketEvent] ⚠️ OLD/DUPLICATE packet: Seq=${packet.sequence}, ExpectedSeq=$_nextExpectedSeq.');
       // Still ACK if it contained frames that would normally be ACKed (Stream, Ping)
       // This ensures SACKs are sent even for duplicates, helping sender confirm receipt.
       if (containsAckElicitingFrames) {

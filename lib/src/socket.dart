@@ -628,6 +628,72 @@ class UDPSocket with UDXEventEmitter {
     emit('pathUpdate', {'host': remoteAddress.address, 'port': remotePort});
   }
 
+  // --- Connection Liveness Check ---
+
+  /// Send a PING frame and wait for ACK to verify connection liveness.
+  /// Returns true if ACK received within timeout, false otherwise.
+  /// 
+  /// This is a lightweight, non-intrusive way to check if the connection
+  /// is still alive. The PING frame is just 1 byte and elicits an ACK response.
+  Future<bool> ping({Duration timeout = const Duration(seconds: 5)}) async {
+    if (_closing || closing) return false;
+    
+    // Send a packet containing just a PING frame
+    final pingSequence = _nextConnectionSeq++;
+    final packet = UDXPacket(
+      destinationCid: cids.remoteCid,
+      sourceCid: cids.localCid,
+      destinationStreamId: 0, // Connection-level packet
+      sourceStreamId: 0,       // Connection-level packet
+      sequence: pingSequence,
+      frames: [PingFrame()],
+    );
+    
+    final completer = Completer<bool>();
+    Timer? timeoutTimer;
+    StreamSubscription? ackSubscription;
+    
+    // Listen for ACK of our ping packet
+    ackSubscription = on('ack').listen((event) {
+      // Check if this ACK acknowledges our ping packet
+      if (event.data is Map) {
+        final data = event.data as Map;
+        if (data['largestAcked'] != null) {
+          final largestAcked = data['largestAcked'] as int;
+          if (largestAcked >= pingSequence) {
+            // Our ping was acknowledged
+            if (!completer.isCompleted) {
+              timeoutTimer?.cancel();
+              ackSubscription?.cancel();
+              completer.complete(true);
+            }
+          }
+        }
+      }
+    });
+    
+    // Set up timeout
+    timeoutTimer = Timer(timeout, () {
+      if (!completer.isCompleted) {
+        ackSubscription?.cancel();
+        completer.complete(false);
+      }
+    });
+    
+    // Send the ping packet
+    try {
+      send(packet.toBytes());
+    } catch (e) {
+      timeoutTimer.cancel();
+      ackSubscription.cancel();
+      if (!completer.isCompleted) {
+        completer.complete(false);
+      }
+    }
+    
+    return completer.future;
+  }
+
   // --- PMTUD Methods ---
 
   void _sendMtuProbeIfNeeded() {

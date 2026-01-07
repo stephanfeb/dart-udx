@@ -144,7 +144,7 @@ class CongestionController {
   /// [currentFrameLargestAcked] the 'largest_acked' value from the current ACK frame.
   void onPacketAcked(int bytes, DateTime sentTime, Duration ackDelay, bool isNewCumulativeAck, int currentFrameLargestAcked) {
     // Debug logging
-    print('[CongestionController.onPacketAcked] bytes=$bytes, isNewCumulativeAck=$isNewCumulativeAck, largestAcked=$currentFrameLargestAcked');
+    // print('[CongestionController.onPacketAcked] bytes=$bytes, isNewCumulativeAck=$isNewCumulativeAck, largestAcked=$currentFrameLargestAcked');
     // DIAGNOSTIC LOGGING START
     // //print('[CC onPacketAcked] INPUTS: bytes=$bytes, sentTime=$sentTime, ackDelay=$ackDelay, isNewCumulativeAck=$isNewCumulativeAck, currentFrameLargestAcked=$currentFrameLargestAcked');
     // //print('[CC onPacketAcked] PRE-STATE: _inRecovery=$_inRecovery, _highestProcessedCumulativeAck=$_highestProcessedCumulativeAck, _dupAcks=$_dupAcks, _lastAckedForDupCount=$_lastAckedForDupCount, _cwnd=$_cwnd, _ssthresh=$_ssthresh, _inflight=$_inflight');
@@ -253,7 +253,7 @@ class CongestionController {
     }
     
     // Debug logging for RTT updates
-    UdxLogging.debug('CongestionController._updateRtt: RTT=${_latestRtt.inMilliseconds}ms, connectionId=${connectionId?.toString().substring(0, 8) ?? "null"}, hasObserver=${metricsObserver != null}');
+    // UdxLogging.debug('CongestionController._updateRtt: RTT=${_latestRtt.inMilliseconds}ms, connectionId=${connectionId?.toString().substring(0, 8) ?? "null"}, hasObserver=${metricsObserver != null}');
 
     // Update min_rtt
     if (_latestRtt < _minRtt) {
@@ -288,6 +288,8 @@ class CongestionController {
 
   /// Performs the CUBIC window increase calculation.
   void _cubicUpdate(int bytes) {
+    // Initialize epoch start if this is the first time entering congestion avoidance
+    _epochStart ??= DateTime.now();
     final t = DateTime.now().difference(_epochStart!).inMilliseconds / 1000.0; // Time in seconds
 
     // Calculate target CWND using the CUBIC function
