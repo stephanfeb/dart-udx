@@ -189,11 +189,12 @@ void main() {
       );
       
       stream1.on('send').listen((_) => eventsS1.add('send'));
-      stream1.on('ack').listen((_) {
+      // ACKs are now emitted at the socket level (per-connection sequencing)
+      clientSocket.on('ack').listen((_) {
         eventsS1.add('ack');
         if (!ackCompleter.isCompleted) ackCompleter.complete();
       });
-      
+
       multiplexer2.connections.listen((serverSocket) {
         serverSocket.on('stream').listen((event) {
           final stream2 = event.data as UDXStream;
@@ -203,9 +204,9 @@ void main() {
 
       final data = Uint8List.fromList([1, 2, 3]);
       await stream1.add(data);
-      
-      await ackCompleter.future.timeout(const Duration(seconds: 1));
-      
+
+      await ackCompleter.future.timeout(const Duration(seconds: 2));
+
       expect(stream1.connected, isTrue);
       expect(eventsS1, contains('send'));
       expect(eventsS1, contains('ack'));

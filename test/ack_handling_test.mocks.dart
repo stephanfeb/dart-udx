@@ -8,12 +8,12 @@ import 'dart:io' as _i5;
 import 'dart:typed_data' as _i13;
 
 import 'package:dart_udx/src/cid.dart' as _i6;
-import 'package:dart_udx/src/congestion.dart' as _i9;
+import 'package:dart_udx/src/congestion.dart' as _i7;
 import 'package:dart_udx/src/events.dart' as _i14;
 import 'package:dart_udx/src/metrics_observer.dart' as _i11;
 import 'package:dart_udx/src/multiplexer.dart' as _i4;
-import 'package:dart_udx/src/pacing.dart' as _i8;
-import 'package:dart_udx/src/packet.dart' as _i7;
+import 'package:dart_udx/src/pacing.dart' as _i9;
+import 'package:dart_udx/src/packet.dart' as _i8;
 import 'package:dart_udx/src/socket.dart' as _i10;
 import 'package:dart_udx/src/stream.dart' as _i2;
 import 'package:dart_udx/src/udx.dart' as _i3;
@@ -85,8 +85,9 @@ class _FakeConnectionCids_4 extends _i1.SmartFake
         );
 }
 
-class _FakePacketManager_5 extends _i1.SmartFake implements _i7.PacketManager {
-  _FakePacketManager_5(
+class _FakeCongestionController_5 extends _i1.SmartFake
+    implements _i7.CongestionController {
+  _FakeCongestionController_5(
     Object parent,
     Invocation parentInvocation,
   ) : super(
@@ -95,9 +96,8 @@ class _FakePacketManager_5 extends _i1.SmartFake implements _i7.PacketManager {
         );
 }
 
-class _FakePacingController_6 extends _i1.SmartFake
-    implements _i8.PacingController {
-  _FakePacingController_6(
+class _FakePacketManager_6 extends _i1.SmartFake implements _i8.PacketManager {
+  _FakePacketManager_6(
     Object parent,
     Invocation parentInvocation,
   ) : super(
@@ -106,8 +106,9 @@ class _FakePacingController_6 extends _i1.SmartFake
         );
 }
 
-class _FakeDuration_7 extends _i1.SmartFake implements Duration {
-  _FakeDuration_7(
+class _FakePacingController_7 extends _i1.SmartFake
+    implements _i9.PacingController {
+  _FakePacingController_7(
     Object parent,
     Invocation parentInvocation,
   ) : super(
@@ -116,9 +117,8 @@ class _FakeDuration_7 extends _i1.SmartFake implements Duration {
         );
 }
 
-class _FakeCongestionController_8 extends _i1.SmartFake
-    implements _i9.CongestionController {
-  _FakeCongestionController_8(
+class _FakeDuration_8 extends _i1.SmartFake implements Duration {
+  _FakeDuration_8(
     Object parent,
     Invocation parentInvocation,
   ) : super(
@@ -285,6 +285,24 @@ class MockUDPSocket extends _i1.Mock implements _i10.UDPSocket {
       ) as bool);
 
   @override
+  _i7.CongestionController get congestionController => (super.noSuchMethod(
+        Invocation.getter(#congestionController),
+        returnValue: _FakeCongestionController_5(
+          this,
+          Invocation.getter(#congestionController),
+        ),
+      ) as _i7.CongestionController);
+
+  @override
+  _i8.PacketManager get packetManager => (super.noSuchMethod(
+        Invocation.getter(#packetManager),
+        returnValue: _FakePacketManager_6(
+          this,
+          Invocation.getter(#packetManager),
+        ),
+      ) as _i8.PacketManager);
+
+  @override
   List<_i2.UDXStream> getStreamBuffer() => (super.noSuchMethod(
         Invocation.method(
           #getStreamBuffer,
@@ -311,6 +329,26 @@ class MockUDPSocket extends _i1.Mock implements _i10.UDPSocket {
         returnValue: _i12.Future<void>.value(),
         returnValueForMissingStub: _i12.Future<void>.value(),
       ) as _i12.Future<void>);
+
+  @override
+  void sendStreamPacket(
+    int? dstStreamId,
+    int? srcStreamId,
+    List<_i8.Frame>? frames, {
+    bool? trackForRetransmit = true,
+  }) =>
+      super.noSuchMethod(
+        Invocation.method(
+          #sendStreamPacket,
+          [
+            dstStreamId,
+            srcStreamId,
+            frames,
+          ],
+          {#trackForRetransmit: trackForRetransmit},
+        ),
+        returnValueForMissingStub: null,
+      );
 
   @override
   void send(_i13.Uint8List? data) => super.noSuchMethod(
@@ -449,6 +487,17 @@ class MockUDPSocket extends _i1.Mock implements _i10.UDPSocket {
         ),
         returnValueForMissingStub: null,
       );
+
+  @override
+  _i12.Future<bool> ping({Duration? timeout = const Duration(seconds: 5)}) =>
+      (super.noSuchMethod(
+        Invocation.method(
+          #ping,
+          [],
+          {#timeout: timeout},
+        ),
+        returnValue: _i12.Future<bool>.value(false),
+      ) as _i12.Future<bool>);
 
   @override
   void setLocalMaxStreamsForTest(int? value) => super.noSuchMethod(
@@ -592,19 +641,19 @@ class MockUDPSocket extends _i1.Mock implements _i10.UDPSocket {
 ///
 /// See the documentation for Mockito's code generation for more information.
 class MockCongestionController extends _i1.Mock
-    implements _i9.CongestionController {
+    implements _i7.CongestionController {
   MockCongestionController() {
     _i1.throwOnMissingStub(this);
   }
 
   @override
-  _i7.PacketManager get packetManager => (super.noSuchMethod(
+  _i8.PacketManager get packetManager => (super.noSuchMethod(
         Invocation.getter(#packetManager),
-        returnValue: _FakePacketManager_5(
+        returnValue: _FakePacketManager_6(
           this,
           Invocation.getter(#packetManager),
         ),
-      ) as _i7.PacketManager);
+      ) as _i8.PacketManager);
 
   @override
   set metricsObserver(_i11.UdxMetricsObserver? _metricsObserver) =>
@@ -660,13 +709,13 @@ class MockCongestionController extends _i1.Mock
       );
 
   @override
-  _i8.PacingController get pacingController => (super.noSuchMethod(
+  _i9.PacingController get pacingController => (super.noSuchMethod(
         Invocation.getter(#pacingController),
-        returnValue: _FakePacingController_6(
+        returnValue: _FakePacingController_7(
           this,
           Invocation.getter(#pacingController),
         ),
-      ) as _i8.PacingController);
+      ) as _i9.PacingController);
 
   @override
   int get cwnd => (super.noSuchMethod(
@@ -683,7 +732,7 @@ class MockCongestionController extends _i1.Mock
   @override
   Duration get smoothedRtt => (super.noSuchMethod(
         Invocation.getter(#smoothedRtt),
-        returnValue: _FakeDuration_7(
+        returnValue: _FakeDuration_8(
           this,
           Invocation.getter(#smoothedRtt),
         ),
@@ -692,7 +741,7 @@ class MockCongestionController extends _i1.Mock
   @override
   Duration get rttVar => (super.noSuchMethod(
         Invocation.getter(#rttVar),
-        returnValue: _FakeDuration_7(
+        returnValue: _FakeDuration_8(
           this,
           Invocation.getter(#rttVar),
         ),
@@ -701,7 +750,7 @@ class MockCongestionController extends _i1.Mock
   @override
   Duration get minRtt => (super.noSuchMethod(
         Invocation.getter(#minRtt),
-        returnValue: _FakeDuration_7(
+        returnValue: _FakeDuration_8(
           this,
           Invocation.getter(#minRtt),
         ),
@@ -710,7 +759,7 @@ class MockCongestionController extends _i1.Mock
   @override
   Duration get latestRttForTest => (super.noSuchMethod(
         Invocation.getter(#latestRttForTest),
-        returnValue: _FakeDuration_7(
+        returnValue: _FakeDuration_8(
           this,
           Invocation.getter(#latestRttForTest),
         ),
@@ -731,7 +780,7 @@ class MockCongestionController extends _i1.Mock
   @override
   Duration get pto => (super.noSuchMethod(
         Invocation.getter(#pto),
-        returnValue: _FakeDuration_7(
+        returnValue: _FakeDuration_8(
           this,
           Invocation.getter(#pto),
         ),
@@ -789,7 +838,7 @@ class MockCongestionController extends _i1.Mock
   @override
   void onPacketLost(
     int? bytes,
-    List<_i7.UDXPacket>? lostPackets,
+    List<_i8.UDXPacket>? lostPackets,
   ) =>
       super.noSuchMethod(
         Invocation.method(
@@ -842,22 +891,22 @@ class MockCongestionController extends _i1.Mock
 /// A class which mocks [PacketManager].
 ///
 /// See the documentation for Mockito's code generation for more information.
-class MockPacketManager extends _i1.Mock implements _i7.PacketManager {
+class MockPacketManager extends _i1.Mock implements _i8.PacketManager {
   MockPacketManager() {
     _i1.throwOnMissingStub(this);
   }
 
   @override
-  _i9.CongestionController get congestionController => (super.noSuchMethod(
+  _i7.CongestionController get congestionController => (super.noSuchMethod(
         Invocation.getter(#congestionController),
-        returnValue: _FakeCongestionController_8(
+        returnValue: _FakeCongestionController_5(
           this,
           Invocation.getter(#congestionController),
         ),
-      ) as _i9.CongestionController);
+      ) as _i7.CongestionController);
 
   @override
-  set congestionController(_i9.CongestionController? _congestionController) =>
+  set congestionController(_i7.CongestionController? _congestionController) =>
       super.noSuchMethod(
         Invocation.setter(
           #congestionController,
@@ -882,7 +931,7 @@ class MockPacketManager extends _i1.Mock implements _i7.PacketManager {
       );
 
   @override
-  set onRetransmit(void Function(_i7.UDXPacket)? _onRetransmit) =>
+  set onRetransmit(void Function(_i8.UDXPacket)? _onRetransmit) =>
       super.noSuchMethod(
         Invocation.setter(
           #onRetransmit,
@@ -921,7 +970,7 @@ class MockPacketManager extends _i1.Mock implements _i7.PacketManager {
       );
 
   @override
-  set onSendProbe(void Function(_i7.UDXPacket)? _onSendProbe) =>
+  set onSendProbe(void Function(_i8.UDXPacket)? _onSendProbe) =>
       super.noSuchMethod(
         Invocation.setter(
           #onSendProbe,
@@ -932,7 +981,7 @@ class MockPacketManager extends _i1.Mock implements _i7.PacketManager {
 
   @override
   set onPacketPermanentlyLost(
-          void Function(_i7.UDXPacket)? _onPacketPermanentlyLost) =>
+          void Function(_i8.UDXPacket)? _onPacketPermanentlyLost) =>
       super.noSuchMethod(
         Invocation.setter(
           #onPacketPermanentlyLost,
@@ -948,10 +997,10 @@ class MockPacketManager extends _i1.Mock implements _i7.PacketManager {
       ) as int);
 
   @override
-  List<_i7.UDXPacket> get sentPackets => (super.noSuchMethod(
+  List<_i8.UDXPacket> get sentPackets => (super.noSuchMethod(
         Invocation.getter(#sentPackets),
-        returnValue: <_i7.UDXPacket>[],
-      ) as List<_i7.UDXPacket>);
+        returnValue: <_i8.UDXPacket>[],
+      ) as List<_i8.UDXPacket>);
 
   @override
   int get retransmitTimeout => (super.noSuchMethod(
@@ -960,7 +1009,7 @@ class MockPacketManager extends _i1.Mock implements _i7.PacketManager {
       ) as int);
 
   @override
-  void sendPacket(_i7.UDXPacket? packet) => super.noSuchMethod(
+  void sendPacket(_i8.UDXPacket? packet) => super.noSuchMethod(
         Invocation.method(
           #sendPacket,
           [packet],
@@ -969,7 +1018,7 @@ class MockPacketManager extends _i1.Mock implements _i7.PacketManager {
       );
 
   @override
-  List<int> handleAckFrame(_i7.AckFrame? frame) => (super.noSuchMethod(
+  List<int> handleAckFrame(_i8.AckFrame? frame) => (super.noSuchMethod(
         Invocation.method(
           #handleAckFrame,
           [frame],
@@ -978,7 +1027,7 @@ class MockPacketManager extends _i1.Mock implements _i7.PacketManager {
       ) as List<int>);
 
   @override
-  void handleData(_i7.UDXPacket? packet) => super.noSuchMethod(
+  void handleData(_i8.UDXPacket? packet) => super.noSuchMethod(
         Invocation.method(
           #handleData,
           [packet],
@@ -987,11 +1036,11 @@ class MockPacketManager extends _i1.Mock implements _i7.PacketManager {
       );
 
   @override
-  _i7.UDXPacket? getPacket(int? sequence) =>
+  _i8.UDXPacket? getPacket(int? sequence) =>
       (super.noSuchMethod(Invocation.method(
         #getPacket,
         [sequence],
-      )) as _i7.UDXPacket?);
+      )) as _i8.UDXPacket?);
 
   @override
   void sendProbe(
@@ -1032,13 +1081,13 @@ class MockPacketManager extends _i1.Mock implements _i7.PacketManager {
       );
 
   @override
-  Map<int, _i7.UDXPacket> getSentPacketsTestHook() => (super.noSuchMethod(
+  Map<int, _i8.UDXPacket> getSentPacketsTestHook() => (super.noSuchMethod(
         Invocation.method(
           #getSentPacketsTestHook,
           [],
         ),
-        returnValue: <int, _i7.UDXPacket>{},
-      ) as Map<int, _i7.UDXPacket>);
+        returnValue: <int, _i8.UDXPacket>{},
+      ) as Map<int, _i8.UDXPacket>);
 
   @override
   Map<int, _i12.Timer> getRetransmitTimersTestHook() => (super.noSuchMethod(

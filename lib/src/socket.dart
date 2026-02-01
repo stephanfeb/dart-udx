@@ -9,6 +9,7 @@ import 'udx.dart';
 import 'events.dart';
 import 'stream.dart';
 import 'packet.dart';
+import 'congestion.dart';
 import 'multiplexer.dart';
 import 'pmtud.dart';
 import 'metrics_observer.dart';
@@ -70,8 +71,35 @@ class UDPSocket with UDXEventEmitter {
   late final PathMtuDiscoveryController _pmtudController;
   /// Tracks in-flight MTU probes by their sequence number.
   final Map<int, Timer> _inFlightMtuProbes = {}; // seq -> timeoutTimer
-  /// A separate sequence number space for connection-level packets like MTU probes.
-  int _nextConnectionSeq = 0;
+  /// Connection-level packet manager (per-connection sequencing, per QUIC RFC 9000).
+  late final PacketManager _packetManager;
+
+  /// Connection-level congestion controller.
+  late final CongestionController _congestionController;
+
+  /// Connection-level receive ordering: next expected sequence number.
+  int _nextExpectedSeq = 0;
+
+  /// Connection-level receive buffer for out-of-order packets.
+  final Map<int, UDXPacket> _connectionReceiveBuffer = {};
+
+  /// Tracks received packet sequences for ACK generation.
+  final Set<int> _receivedPacketSequences = {};
+
+  /// Arrival time of the largest-acked packet, for ACK delay calculation.
+  DateTime? _largestAckedPacketArrivalTime;
+
+  /// Sent packets tracking for RTT calculation (maps seq -> (sentTime, dataSize)).
+  final Map<int, (DateTime, int)> _sentPacketsForRtt = {};
+
+  /// Tracks all sequences ever acked by remote for cumulative ack calculation.
+  final Set<int> _everAckedSequencesByRemote = {};
+
+  /// Highest seq N such that all packets 0..N are confirmed acked.
+  int _currentHighestCumulativeAckFromRemote = -1;
+
+  /// Mirror of CC's highest processed cumulative ack.
+  int _ccMirrorOfHighestProcessedCumulativeAck = -1;
 
   // Connection-level flow control properties
   late int _localConnectionMaxData; // Our connection receive window
@@ -129,6 +157,40 @@ class UDPSocket with UDXEventEmitter {
     _remoteConnectionMaxData = defaultInitialConnectionWindow;
     _localMaxStreams = defaultMaxStreams;
     _pmtudController = PathMtuDiscoveryController();
+
+    // Initialize connection-level packet management
+    _packetManager = PacketManager();
+    _congestionController = CongestionController(packetManager: _packetManager);
+    _packetManager.congestionController = _congestionController;
+
+    // Set up retransmission callback
+    _packetManager.onRetransmit = (packet) {
+      if (!_closing) {
+        try {
+          send(packet.toBytes());
+        } catch (e) {
+          // Ignore send errors during retransmission
+        }
+      }
+    };
+
+    _packetManager.onSendProbe = (packet) {
+      if (!_closing) {
+        try {
+          send(packet.toBytes());
+        } catch (e) {
+          // Ignore send errors for probes
+        }
+      }
+    };
+
+    _congestionController.onProbe = () {
+      _packetManager.sendProbe(cids.remoteCid, cids.localCid, 0, 0);
+    };
+
+    _congestionController.onFastRetransmit = (sequence) {
+      _packetManager.retransmitPacket(sequence);
+    };
     
     // For client-initiated connections, address is validated by default
     // For server-side connections (receiving SYN), address must be validated
@@ -201,8 +263,6 @@ class UDPSocket with UDXEventEmitter {
 
       // --- Path Migration Logic ---
       final pathHasChanged = remoteAddress.address != fromAddress.address || remotePort != fromPort;
-      // A packet arrived from a new path. If we aren't already validating a
-      // path, start a new validation.
       if (pathHasChanged && _pathChallengeData == null) {
         _initiatePathValidation(fromAddress, fromPort);
       }
@@ -213,16 +273,14 @@ class UDPSocket with UDXEventEmitter {
       }
       _sendMtuProbeIfNeeded();
 
-      // Process connection-level frames first
+      // --- Process connection-level frames (not sequence-dependent) ---
       for (final frame in udxPacket.frames) {
         if (frame is ConnectionCloseFrame) {
-          // Handle CONNECTION_CLOSE frame - peer is terminating the connection
           emit('connectionClose', {
             'errorCode': frame.errorCode,
             'frameType': frame.frameType,
             'reason': frame.reasonPhrase
           });
-          // Close our side of the connection
           await close();
           return;
         } else if (frame is MaxDataFrame) {
@@ -234,76 +292,309 @@ class UDPSocket with UDXEventEmitter {
         } else if (frame is PathResponseFrame) {
           _handlePathResponse(frame, fromAddress, fromPort);
         } else if (frame is DataBlockedFrame) {
-          // Peer is blocked on connection-level flow control
           emit('dataBlocked', {'maxData': frame.maxData});
-          // Application can listen to this event and potentially increase the connection window
-        } else if (frame is StreamFrame) {
-          _connectionBytesReceived += frame.data.length;
-          _checkAndSendLocalMaxDataUpdate();
         }
       }
 
-      final targetStreamId = udxPacket.destinationStreamId;
-      if (_registeredStreams.containsKey(targetStreamId)) {
-        final targetStream = _registeredStreams[targetStreamId]!;
-        targetStream.internalHandleSocketEvent({
-          'data': data,
-          'address': fromAddress.address,
-          'port': fromPort,
-        });
-      } else {
-        // Check for a SYN flag to create a new stream
-        final synFrame = udxPacket.frames.whereType<StreamFrame>().firstWhereOrNull((f) => f.isSyn);
-        if (synFrame != null) {
-          // print( '[SOCK ${cids.localCid}] SYN frame detected for stream ${udxPacket.destinationStreamId}. Creating new UDXStream.');
-          // Enforce incoming stream limit
-          final currentIncomingStreams = _registeredStreams.values.where((s) => !s.isInitiator).length;
+      // --- Process ACK frames at connection level ---
+      for (final frame in udxPacket.frames.whereType<AckFrame>()) {
+        _handleConnectionAckFrame(frame);
+      }
 
+      // --- Process RESET, STOP_SENDING, WINDOW_UPDATE immediately (not sequence-dependent) ---
+      for (final frame in udxPacket.frames) {
+        if (frame is ResetStreamFrame) {
+          final targetStreamId = udxPacket.destinationStreamId;
+          final stream = _registeredStreams[targetStreamId];
+          if (stream != null) {
+            stream.deliverReset(frame.errorCode);
+          }
+        } else if (frame is StopSendingFrame) {
+          final targetStreamId = udxPacket.destinationStreamId;
+          final stream = _registeredStreams[targetStreamId];
+          if (stream != null) {
+            stream.deliverStopSending(frame.errorCode);
+          }
+        } else if (frame is WindowUpdateFrame) {
+          final targetStreamId = udxPacket.destinationStreamId;
+          final stream = _registeredStreams[targetStreamId];
+          if (stream != null) {
+            stream.deliverWindowUpdate(frame.windowSize);
+          }
+        }
+      }
+
+      // --- Connection-level receive ordering ---
+      bool needsAck = false;
+      bool containsAckElicitingFrames = udxPacket.frames.any((f) => f is StreamFrame || f is PingFrame);
+      bool packetIsSequential = (udxPacket.sequence == _nextExpectedSeq);
+
+      if (packetIsSequential) {
+        _receivedPacketSequences.add(udxPacket.sequence);
+        _largestAckedPacketArrivalTime = DateTime.now();
+
+        _processPacketFrames(udxPacket, fromAddress, fromPort);
+        _nextExpectedSeq++;
+        _processConnectionReceiveBuffer(fromAddress, fromPort);
+
+        if (containsAckElicitingFrames) needsAck = true;
+      } else if (udxPacket.sequence > _nextExpectedSeq) {
+        // Future packet — buffer if it has stream data
+        bool hasStreamData = udxPacket.frames.any((f) => f is StreamFrame && (f.data.isNotEmpty || f.isFin || f.isSyn));
+        if (hasStreamData) {
+          _connectionReceiveBuffer[udxPacket.sequence] = udxPacket;
+        }
+        if (containsAckElicitingFrames) {
+          _receivedPacketSequences.add(udxPacket.sequence);
+          needsAck = true;
+        }
+      } else {
+        // Old/duplicate packet — still ACK
+        if (containsAckElicitingFrames) {
+          _receivedPacketSequences.add(udxPacket.sequence);
+          needsAck = true;
+        }
+      }
+
+      if (needsAck) {
+        _sendConnectionAck();
+      }
+    } catch (e) {
+      // Ignore invalid packets
+    }
+  }
+
+  /// Processes the frames of a packet that is in sequence order.
+  void _processPacketFrames(UDXPacket packet, InternetAddress fromAddress, int fromPort) {
+    final targetStreamId = packet.destinationStreamId;
+    final remoteStreamId = packet.sourceStreamId;
+
+    for (final frame in packet.frames) {
+      if (frame is StreamFrame) {
+        _connectionBytesReceived += frame.data.length;
+        _checkAndSendLocalMaxDataUpdate();
+
+        // Route to existing stream or create new one for SYN
+        UDXStream? stream = _registeredStreams[targetStreamId];
+
+        if (stream == null && frame.isSyn && remoteStreamId != 0) {
+          // Incoming stream via SYN
+          final currentIncomingStreams = _registeredStreams.values.where((s) => !s.isInitiator).length;
           if (currentIncomingStreams >= _localMaxStreams) {
-            // Reject the stream
-            final resetFrame = ResetStreamFrame(errorCode: 2); // STREAM_LIMIT_ERROR
-            final responsePacket = UDXPacket(
-              destinationCid: udxPacket.sourceCid,
-              sourceCid: udxPacket.destinationCid,
-              destinationStreamId: udxPacket.sourceStreamId,
-              sourceStreamId: targetStreamId,
-              sequence: 0,
-              frames: [resetFrame],
-            );
-            multiplexer.send(responsePacket.toBytes(), fromAddress, fromPort);
+            // Reject
+            sendStreamPacket(remoteStreamId, targetStreamId, [ResetStreamFrame(errorCode: 2)], trackForRetransmit: false);
             return;
           }
-
-          // Buffer the initial packet *before* creating the stream,
-          // so the stream's constructor can pop it.
-          _initialPacketBuffer[targetStreamId] = data;
 
           final newStream = UDXStream.createIncoming(
             udx,
             this,
             targetStreamId,
-            udxPacket.sourceStreamId,
+            remoteStreamId,
             fromAddress.address,
             fromPort,
-            initialSeq: udxPacket.sequence,
-            destinationCid: udxPacket.destinationCid,
-            sourceCid: udxPacket.sourceCid,
+            initialSeq: packet.sequence,
+            destinationCid: packet.destinationCid,
+            sourceCid: packet.sourceCid,
           );
-          
+
+          stream = newStream;
           emit('stream', newStream);
           _streamBuffer.add(newStream);
-        } else if (targetStreamId != 0) {
-          emit('unmatchedUDXPacket', {
-            'packet': udxPacket,
-            'remoteAddress': fromAddress,
-            'remotePort': fromPort,
-            'rawData': data,
-          });
+        }
+
+        if (stream == null) continue;
+
+        // Deliver data
+        if (frame.data.isNotEmpty) {
+          stream.deliverData(frame.data);
+        }
+        if (frame.isFin) {
+          stream.deliverFin();
+        }
+        if (frame.isSyn && stream.remoteId == null) {
+          // Set the remote ID from the SYN packet
+          stream.remoteId = remoteStreamId;
         }
       }
-    } catch (e) {
-      // //print('UDPSocket: Error processing incoming datagram: $e. From: ${fromAddress.address}:$fromPort');
     }
+  }
+
+  /// Processes the connection-level receive buffer for sequential packets.
+  void _processConnectionReceiveBuffer(InternetAddress fromAddress, int fromPort) {
+    while (_connectionReceiveBuffer.containsKey(_nextExpectedSeq)) {
+      final bufferedPacket = _connectionReceiveBuffer.remove(_nextExpectedSeq)!;
+      _receivedPacketSequences.add(bufferedPacket.sequence);
+      _largestAckedPacketArrivalTime = DateTime.now();
+
+      _processPacketFrames(bufferedPacket, fromAddress, fromPort);
+      _nextExpectedSeq++;
+    }
+  }
+
+  /// Handles an ACK frame at the connection level.
+  void _handleConnectionAckFrame(AckFrame frame) {
+    final newlySackedSequences = _packetManager.handleAckFrame(frame);
+    _everAckedSequencesByRemote.addAll(newlySackedSequences);
+
+    // Compute true cumulative ack
+    while (_everAckedSequencesByRemote.contains(_currentHighestCumulativeAckFromRemote + 1)) {
+      _currentHighestCumulativeAckFromRemote++;
+    }
+
+    bool advancesCcCumulativePoint = _currentHighestCumulativeAckFromRemote > _ccMirrorOfHighestProcessedCumulativeAck;
+    final int largestAckedInThisFrame = frame.largestAcked;
+
+    if (newlySackedSequences.isNotEmpty) {
+      for (final ackedSeq in newlySackedSequences) {
+        final sentPacketInfo = _sentPacketsForRtt.remove(ackedSeq);
+        if (sentPacketInfo != null) {
+          final (sentTime, ackedSize) = sentPacketInfo;
+
+          bool isNewCumulativeForCC = advancesCcCumulativePoint &&
+              ackedSeq > _ccMirrorOfHighestProcessedCumulativeAck &&
+              ackedSeq <= _currentHighestCumulativeAckFromRemote;
+
+          _congestionController.onPacketAcked(
+            ackedSize,
+            sentTime,
+            Duration(milliseconds: frame.ackDelay),
+            isNewCumulativeForCC,
+            largestAckedInThisFrame,
+          );
+
+          decrementConnectionBytesSent(ackedSize);
+          emit('ack', {'largestAcked': ackedSeq});
+        }
+      }
+    }
+
+    if (advancesCcCumulativePoint) {
+      _ccMirrorOfHighestProcessedCumulativeAck = _currentHighestCumulativeAckFromRemote;
+    } else {
+      _congestionController.processDuplicateAck(_ccMirrorOfHighestProcessedCumulativeAck);
+    }
+  }
+
+  /// The connection-level congestion controller, exposed for stream flow control checks.
+  CongestionController get congestionController => _congestionController;
+
+  /// The connection-level packet manager, exposed for sequence number access.
+  PacketManager get packetManager => _packetManager;
+
+  /// Sends a packet with the given frames on behalf of a stream.
+  /// Uses connection-level sequence numbers (per QUIC RFC 9000).
+  /// If [trackForRetransmit] is true, the packet is registered with the PacketManager
+  /// for retransmission and congestion control.
+  void sendStreamPacket(int dstStreamId, int srcStreamId, List<Frame> frames, {bool trackForRetransmit = true}) {
+    if (_closing) return;
+
+    final seq = _packetManager.nextSequence;
+    final packet = UDXPacket(
+      destinationCid: cids.remoteCid,
+      sourceCid: cids.localCid,
+      destinationStreamId: dstStreamId,
+      sourceStreamId: srcStreamId,
+      sequence: seq,
+      frames: frames,
+    );
+
+    // Calculate data size for congestion control
+    int dataSize = 0;
+    for (final frame in frames) {
+      if (frame is StreamFrame) dataSize += frame.data.length;
+    }
+
+    if (trackForRetransmit) {
+      _packetManager.sendPacket(packet);
+      _congestionController.onPacketSent(dataSize);
+      _sentPacketsForRtt[seq] = (DateTime.now(), dataSize);
+    }
+
+    send(packet.toBytes());
+
+    if (dataSize > 0) {
+      incrementConnectionBytesSent(dataSize);
+      _congestionController.pacingController.onPacketSent(packet.toBytes().length);
+    }
+  }
+
+  /// Sends a connection-level ACK for received packets.
+  void _sendConnectionAck() {
+    if (_closing || _receivedPacketSequences.isEmpty) return;
+
+    final sortedSequences = _receivedPacketSequences.toList()..sort();
+    final int largestAcked = sortedSequences.last;
+
+    int ackDelayMs = 0;
+    if (_largestAckedPacketArrivalTime != null) {
+      ackDelayMs = DateTime.now().difference(_largestAckedPacketArrivalTime!).inMilliseconds;
+      ackDelayMs = ackDelayMs.clamp(0, 65535);
+    }
+
+    // Build ACK ranges
+    List<AckRange> ackRanges = [];
+    int firstAckRangeLength = 0;
+
+    List<Map<String, int>> blocks = [];
+    if (sortedSequences.isNotEmpty) {
+      int blockStart = sortedSequences[0];
+      for (int i = 0; i < sortedSequences.length; i++) {
+        if (i + 1 < sortedSequences.length && sortedSequences[i + 1] == sortedSequences[i] + 1) {
+          // Continue current block
+        } else {
+          blocks.add({'start': blockStart, 'end': sortedSequences[i]});
+          if (i + 1 < sortedSequences.length) {
+            blockStart = sortedSequences[i + 1];
+          }
+        }
+      }
+    }
+
+    if (blocks.isNotEmpty) {
+      final lastBlock = blocks.removeLast();
+      firstAckRangeLength = lastBlock['end']! - lastBlock['start']! + 1;
+
+      int prevBlockStartSeq = lastBlock['start']!;
+      for (int i = blocks.length - 1; i >= 0; i--) {
+        final currentBlock = blocks[i];
+        final currentBlockStart = currentBlock['start']!;
+        final currentBlockEnd = currentBlock['end']!;
+        final int gap = prevBlockStartSeq - currentBlockEnd - 1;
+        final int rangeLength = currentBlockEnd - currentBlockStart + 1;
+        ackRanges.add(AckRange(gap: gap, ackRangeLength: rangeLength));
+        prevBlockStartSeq = currentBlockStart;
+      }
+    }
+
+    if (firstAckRangeLength == 0 && sortedSequences.isNotEmpty) {
+      firstAckRangeLength = 1;
+    }
+
+    final ackFrame = AckFrame(
+      largestAcked: largestAcked,
+      ackDelay: ackDelayMs,
+      firstAckRangeLength: firstAckRangeLength,
+      ackRanges: ackRanges,
+    );
+
+    // ACK-only packets reuse last sent sequence to avoid consuming new sequences
+    final ackSeq = _packetManager.lastSentPacketNumber >= 0
+        ? _packetManager.lastSentPacketNumber
+        : 0;
+
+    final ackPacket = UDXPacket(
+      destinationCid: cids.remoteCid,
+      sourceCid: cids.localCid,
+      destinationStreamId: 0,
+      sourceStreamId: 0,
+      sequence: ackSeq,
+      frames: [ackFrame],
+    );
+
+    send(ackPacket.toBytes());
+    _receivedPacketSequences.clear();
+    _largestAckedPacketArrivalTime = null;
   }
 
   /// Sends data to the peer via the multiplexer.
@@ -411,6 +702,9 @@ class UDPSocket with UDXEventEmitter {
 
       multiplexer.removeSocket(cids.localCid);
 
+      _packetManager.destroy();
+      _congestionController.destroy();
+
       emit('close', {'error': errorCode, 'reason': reason});
     } catch (e) {
       emit('error', e);
@@ -436,6 +730,9 @@ class UDPSocket with UDXEventEmitter {
       _registeredStreams.clear();
 
       multiplexer.removeSocket(cids.localCid);
+
+      _packetManager.destroy();
+      _congestionController.destroy();
 
       emit('close');
     } catch (e) {
@@ -639,7 +936,7 @@ class UDPSocket with UDXEventEmitter {
     if (_closing || closing) return false;
     
     // Send a packet containing just a PING frame
-    final pingSequence = _nextConnectionSeq++;
+    final pingSequence = _packetManager.nextSequence;
     final packet = UDXPacket(
       destinationCid: cids.remoteCid,
       sourceCid: cids.localCid,
@@ -702,7 +999,7 @@ class UDPSocket with UDXEventEmitter {
     }
 
     final (probePacket, sequence) = _pmtudController.buildProbePacket(
-        cids.remoteCid, cids.localCid, 0, 0, _nextConnectionSeq++);
+        cids.remoteCid, cids.localCid, 0, 0, _packetManager.nextSequence);
     
     send(probePacket.toBytes());
 

@@ -7,31 +7,26 @@ import 'events.dart';
 import 'udx.dart';
 import 'socket.dart';
 import 'packet.dart';
-import 'congestion.dart';
 
 /// Defines the directionality of a stream
 enum StreamType {
   /// Bidirectional stream - both ends can send and receive
   bidirectional,
-  
+
   /// Unidirectional stream - local endpoint sends, remote receives
   unidirectionalLocal,
-  
+
   /// Unidirectional stream - remote endpoint sends, local receives
   unidirectionalRemote,
 }
 
 /// Helper class for QUIC-style stream ID encoding
 class StreamIdHelper {
-  /// Extract stream type from stream ID based on QUIC encoding:
-  /// Bit 0: Initiator (0 = client, 1 = server)
-  /// Bit 1: Directionality (0 = bidirectional, 1 = unidirectional)
   static StreamType getStreamType(int streamId, bool isInitiator) {
     final isUnidirectional = (streamId & 0x02) != 0;
     if (!isUnidirectional) {
       return StreamType.bidirectional;
     }
-    // For unidirectional: check who initiated
     final initiatedByServer = (streamId & 0x01) != 0;
     if ((isInitiator && !initiatedByServer) || (!isInitiator && initiatedByServer)) {
       return StreamType.unidirectionalLocal;
@@ -39,17 +34,22 @@ class StreamIdHelper {
       return StreamType.unidirectionalRemote;
     }
   }
-  
-  /// Encode stream type into stream ID bits
+
   static int encodeStreamId(int baseId, bool isUnidirectional, bool isServer) {
-    int id = baseId << 2; // Shift to make room for flags
-    if (isServer) id |= 0x01; // Set initiator bit
-    if (isUnidirectional) id |= 0x02; // Set directionality bit
+    int id = baseId << 2;
+    if (isServer) id |= 0x01;
+    if (isUnidirectional) id |= 0x02;
     return id;
   }
 }
 
 /// A reliable, ordered stream over UDP.
+///
+/// With per-connection sequencing (QUIC RFC 9000), the stream no longer owns
+/// packet sequencing, congestion control, or receive ordering. Those are handled
+/// by the parent [UDPSocket]. The stream is a thin layer that:
+/// - Receives data via [deliverData]/[deliverFin]/[deliverReset] from the socket
+/// - Sends data via [socket.sendStreamPacket()]
 class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
   /// The UDX instance that created this stream
   final UDX udx;
@@ -64,7 +64,6 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
   final StreamType streamType;
 
   /// Priority for this stream (0-255, lower value = higher priority)
-  /// Default is 128 (medium priority)
   int priority = 128;
 
   /// The remote stream ID
@@ -85,16 +84,16 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
 
   /// Timestamp when the stream connected
   DateTime? connectedAt;
-  
+
   /// Total bytes read from the stream
   int bytesRead = 0;
-  
+
   /// Total bytes written to the stream
   int bytesWritten = 0;
 
   /// Whether the local write side has been closed (FIN sent)
   bool _localWriteClosed = false;
-  
+
   /// Whether the remote write side has been closed (FIN received)
   bool _remoteWriteClosed = false;
 
@@ -103,12 +102,8 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
 
   /// The maximum transmission unit (MTU)
   int get mtu => _mtu;
-  int _mtu = 1400; // Default MTU
+  int _mtu = 1400;
 
-  // Define a safe payload size, leaving room for headers (IP, UDP, UDX)
-  // UDXPacket header is 12 bytes, StreamFrame header is 4 bytes
-  // So we need to subtract 16 bytes from the max payload size
-  // This is now calculated dynamically based on the MTU
   int get _maxPayloadSize => _mtu - 16;
 
   /// Maximum number of retransmission attempts before considering packet lost
@@ -117,34 +112,25 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
   /// Total timeout tolerance for packet-level operations (in seconds)
   int packetTimeoutTolerance = 30;
 
-  /// Track retransmission attempts per packet
-  final Map<int, int> _retransmissionAttempts = {};
+  /// The round-trip time (from connection-level CC)
+  Duration get rtt => _socket?.congestionController.smoothedRtt ?? const Duration(milliseconds: 100);
 
-  /// The round-trip time
-  Duration get rtt => _congestionController.smoothedRtt;
+  /// The congestion window (from connection-level CC)
+  int get cwnd => _socket?.congestionController.cwnd ?? 65536;
 
-  /// The congestion window
-  int get cwnd => _congestionController.cwnd;
-
-  /// The number of bytes in flight
-  int get inflight => _congestionController.inflight;
+  /// The number of bytes in flight (from connection-level CC)
+  int get inflight => _socket?.congestionController.inflight ?? 0;
 
   /// The local receive window size
   int get receiveWindow => _receiveWindow;
-  int _receiveWindow = 65536; // Default receive window size
+  int _receiveWindow = 65536;
 
   /// The remote peer's receive window size
   int get remoteReceiveWindow => _remoteReceiveWindow;
-  int _remoteReceiveWindow = 65536; // Default remote receive window size
-
-  /// The congestion controller
-  late final CongestionController _congestionController;
-
-  /// The packet manager
-  late final PacketManager packetManager;
+  int _remoteReceiveWindow = 65536;
 
   /// The stream controller for data events
-  final _dataController = StreamController<Uint8List>.broadcast();
+  final _dataController = StreamController<Uint8List>();
 
   /// A completer that resolves when the stream can send more data.
   Completer<void>? _drain;
@@ -154,36 +140,8 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
   /// Whether the stream is in framed mode
   final bool framed;
 
-  /// The initial sequence number
+  /// The initial sequence number (kept for API compatibility but not used for per-stream ordering)
   final int initialSeq;
-
-  /// The next expected sequence number from the remote peer
-  late int _nextExpectedSeq;
-
-  /// A buffer for out-of-order packets
-  final Map<int, UDXPacket> _receiveBuffer = {};
-
-  /// Tracks sequence numbers of all unique, processed packets for ACK generation.
-  final Set<int> _receivedPacketSequences = {};
-
-  /// Timestamp of when the packet that is currently the largest acknowledged arrived.
-  DateTime? _largestAckedPacketArrivalTime;
-
-  /// Timestamp of when the last ACK was sent.
-  DateTime _lastAckSentTime = DateTime.now();
-
-  /// Tracks sent packets for RTT calculation. Maps sequence number to a tuple of (send time, packet size).
-  final Map<int, (DateTime, int)> _sentPackets = {};
-
-  /// Tracks all sequence numbers ever acknowledged by the remote peer.
-  final Set<int> _everAckedSequencesByRemote = {};
-
-  /// Stores the highest sequence number N such that all packets 0...N are confirmed acknowledged by the remote.
-  int _currentHighestCumulativeAckFromRemote = -1;
-
-  /// Mirrors the CongestionController's _highestProcessedCumulativeAck. Stores the largestAcked value
-  /// from the last ACK frame that advanced the CC's cumulative ACK point.
-  int _ccMirrorOfHighestProcessedCumulativeAck = -1;
 
   /// The firewall function
   final bool Function(UDPSocket socket, int port, String host)? firewall;
@@ -197,68 +155,18 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
     this.initialSeq = 0,
     this.firewall,
     int? initialCwnd,
-    CongestionController? congestionControllerForTest,
-    PacketManager? packetManagerForTest,
     this.isInitiator = false,
-  }) : _nextExpectedSeq = initialSeq {
-    // With the circular dependency broken, we can initialize cleanly.
-    // The order matters: PacketManager needs a CongestionController,
-    // and CongestionController needs a PacketManager.
-    // The new design is:
-    // 1. CC constructor takes a PM.
-    // 2. PM constructor takes an optional CC.
-    // 3. PM has a `late` CC property.
-
-    // This allows us to create the PM, then the CC, then link the CC back to the PM.
-    packetManager = packetManagerForTest ?? PacketManager();
-    _congestionController = congestionControllerForTest ??
-        CongestionController(
-            packetManager: packetManager, initialCwnd: initialCwnd);
-    
-    if (packetManagerForTest == null) {
-      packetManager.congestionController = _congestionController;
-    }
-
-    _congestionController.onProbe = () {
-      if (remoteId != null && _socket != null) {
-        packetManager.sendProbe(_socket!.cids.remoteCid, _socket!.cids.localCid, remoteId!, id);
-      }
-    };
-    _congestionController.onFastRetransmit = (sequence) {
-      packetManager.retransmitPacket(sequence);
-    };
-    // Note: Removed onPacketPermanentlyLost callback that was causing stream crashes.
-    // The QUIC-compliant PTO system in CongestionController now handles loss detection
-    // without arbitrary retry limits that would crash streams.
-  }
+  });
 
   void _handleRemoteConnectionWindowUpdate(UDXEvent event) {
-    final eventData = event.data as Map<String, dynamic>?;
-    final newMaxData = eventData?['maxData'] as int?;
-    ////print('[UDXStream ${this.id}._handleRemoteConnectionWindowUpdate] Received event. New maxData from event: $newMaxData. Current socket: ${_socket?.hashCode}');
-    if (_socket == null) {
-      ////print('[UDXStream ${this.id}._handleRemoteConnectionWindowUpdate] Socket is null, cannot proceed.');
-      return;
-    }
+    if (_socket == null) return;
     if (_drain != null && !_drain!.isCompleted) {
-      // Use a local variable to avoid multiple null checks
       final socket = _socket;
-      if (socket == null) {
-        ////print('[UDXStream ${this.id}._handleRemoteConnectionWindowUpdate] Socket became null after initial check, cannot proceed.');
-        return;
-      }
-
+      if (socket == null) return;
       final connWindowAvailable = socket.getAvailableConnectionSendWindow();
-      ////print('[UDXStream ${this.id}._handleRemoteConnectionWindowUpdate] Drain exists and not completed. connWin: $connWindowAvailable, remStrWin: $_remoteReceiveWindow, cwnd: $cwnd, inflight: $inflight');
-      // Check all conditions again, similar to other places where _drain is completed
       if (inflight < cwnd && inflight < _remoteReceiveWindow && connWindowAvailable > 0) {
-        ////print('[UDXStream ${this.id}._handleRemoteConnectionWindowUpdate] DEBUG: Unblocking by remoteConnectionWindowUpdate. connWin: $connWindowAvailable, remStrWin: $_remoteReceiveWindow, cwnd: $cwnd, inflight: $inflight');
         _drain!.complete();
-      } else {
-        ////print('[UDXStream ${this.id}._handleRemoteConnectionWindowUpdate] DEBUG: Conditions not met to unblock. inflight: $inflight, cwnd: $cwnd, _remoteReceiveWindow: $_remoteReceiveWindow, connWindowAvailable: $connWindowAvailable');
       }
-    } else {
-      ////print('[UDXStream ${this.id}._handleRemoteConnectionWindowUpdate] Drain is null or already completed. _drain: $_drain, isCompleted: ${_drain?.isCompleted}');
     }
   }
 
@@ -283,444 +191,70 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
     socket.registerStream(this);
     _remoteConnectionWindowUpdateSubscription?.cancel();
     _remoteConnectionWindowUpdateSubscription = _socket!.on('remoteConnectionWindowUpdate').listen(_handleRemoteConnectionWindowUpdate);
-    ////print('[UDXStream ${this.id} Subscribing to remoteConnectionWindowUpdate on socket: ${_socket.hashCode}]');
-    
-    // Propagate metrics observer and connection ID to congestion controller
-    _congestionController.metricsObserver = socket.metricsObserver;
-    _congestionController.connectionId = socket.cids.localCid;
-
-    packetManager.onRetransmit = (packet) {
-      //print('UDXStream ${this.id}: onRetransmit called for packet ${packet.sequence}');
-      if (!_connected || _socket == null || remotePort == null || remoteHost == null) {
-        //print('UDXStream ${this.id}: Cannot retransmit - not connected or missing socket/remote info');
-        return;
-      }
-      if (_socket!.closing) {
-        //print('UDXStream ${this.id}: Socket is closing, skipping packet retransmission.');
-        return;
-      }
-      //print('UDXStream ${this.id}: Sending retransmitted packet ${packet.sequence}');
-      _socket!.send(packet.toBytes());
-    };
-
-    packetManager.onSendProbe = (packet) {
-      if (!_connected || _socket == null || remotePort == null || remoteHost == null) return;
-      if (_socket!.closing) {
-        ////print('[UDXStream ${this.id}.onSendProbe] Socket is closing, skipping probe packet send.');
-        return;
-      }
-      _socket!.send(packet.toBytes());
-    };
-    
-    // Connect packet metrics to socket's observer
-    packetManager.onPacketRetransmitEvent = (sequence, attemptCount, rto) {
-      _socket?.metricsObserver?.onPacketRetransmit(
-        _socket!.cids.localCid,
-        sequence,
-        attemptCount,
-        rto,
-      );
-    };
-    
-    packetManager.onPacketLossEvent = (sequence, lossType) {
-      _socket?.metricsObserver?.onPacketLoss(
-        _socket!.cids.localCid,
-        sequence,
-        lossType,
-      );
-    };
 
     emit('connect');
   }
 
+  // --- Data delivery methods (called by UDPSocket) ---
+
+  /// Delivers data from the socket's connection-level receive ordering.
+  void deliverData(Uint8List data) {
+    if (data.isEmpty) return;
+    bytesRead += data.length;
+    if (!_dataController.isClosed) {
+      _dataController.add(data);
+    }
+    if (_socket != null) {
+      _socket!.onStreamDataProcessed(data.length);
+    }
+  }
+
+  /// Delivers FIN from the socket.
+  void deliverFin() {
+    _remoteWriteClosed = true;
+    if (!_dataController.isClosed) {
+      _dataController.close();
+    }
+    emit('end');
+    if (_localWriteClosed) {
+      _close();
+    }
+  }
+
+  /// Delivers RESET from the socket.
+  void deliverReset(int errorCode) {
+    addError(StreamResetError(errorCode));
+    _close(isReset: true);
+  }
+
+  /// Delivers STOP_SENDING from the socket.
+  void deliverStopSending(int errorCode) {
+    _localWriteClosed = true;
+    emit('stopSending', {'errorCode': errorCode});
+    if (_remoteWriteClosed) {
+      _close();
+    }
+  }
+
+  /// Delivers WINDOW_UPDATE from the socket.
+  void deliverWindowUpdate(int windowSize) {
+    _remoteReceiveWindow = windowSize;
+    if (_drain != null && !_drain!.isCompleted) {
+      final connWindowAvailable = _socket?.getAvailableConnectionSendWindow() ?? 0;
+      if (inflight < cwnd && inflight < _remoteReceiveWindow && connWindowAvailable > 0) {
+        _drain!.complete();
+      }
+    }
+    emit('drain');
+  }
+
   /// Handles an incoming socket event (datagram).
+  /// This is kept for backward compatibility but the socket now handles
+  /// connection-level sequencing and calls deliverData/deliverFin/deliverReset directly.
   void internalHandleSocketEvent(dynamic event) {
-    final Uint8List rawData = event['data'] as Uint8List;
-    final String sourceHost = event['address'] as String;
-    final int sourcePort = event['port'] as int;
-
-
-    if (remoteHost == null || remotePort == null) {
-      return;
-    }
-    if (sourceHost != remoteHost || sourcePort != remotePort) {
-      return;
-    }
-
-    UDXPacket packet;
-    try {
-      packet = UDXPacket.fromBytes(rawData);
-    } catch (e) {
-      return;
-    }
-
-    if (packet.destinationStreamId != id) {
-      return;
-    }
-
-    if (remoteId == null) {
-      return;
-    }
-    if (packet.sourceStreamId != remoteId) {
-      return;
-    }
-
-    bool needsAck = false;
-    bool packetIsSequential = (packet.sequence == _nextExpectedSeq);
-    bool containsAckElicitingFrames = packet.frames.any((f) => f is StreamFrame || f is PingFrame);
-
-    // Process ACK, RESET, STOP_SENDING, and WindowUpdate frames first, as they are not sequence-dependent.
-    // These frames carry critical state updates that should be processed even on duplicate/old packets.
-    for (final frame in packet.frames) {
-      if (frame is ResetStreamFrame) {
-        ////print('[UDXStream ${this.id}.internalHandleSocketEvent] Immediate ResetStreamFrame: ErrorCode=${frame.errorCode}');
-        addError(StreamResetError(frame.errorCode));
-        _close(isReset: true);
-        return; // Stop all further processing
-      }
-      if (frame is StopSendingFrame) {
-        // Peer wants us to stop sending - close our write side
-        ////print('[UDXStream ${this.id}.internalHandleSocketEvent] STOP_SENDING received: ErrorCode=${frame.errorCode}');
-        _localWriteClosed = true;
-        emit('stopSending', {'errorCode': frame.errorCode});
-        // If we've also received FIN, do full close (fire-and-forget)
-        if (_remoteWriteClosed) {
-          _close();
-        }
-        return;
-      }
-      if (frame is WindowUpdateFrame) {
-        // Update remote receive window and potentially unblock sender
-        ////print('[UDXStream ${this.id}.internalHandleSocketEvent] Immediate WindowUpdateFrame: Size=${frame.windowSize}');
-        _remoteReceiveWindow = frame.windowSize;
-        if (_drain != null && !_drain!.isCompleted) {
-          final connWindowAvailable = _socket?.getAvailableConnectionSendWindow() ?? 0;
-          if (inflight < cwnd && inflight < _remoteReceiveWindow && connWindowAvailable > 0) {
-            _drain!.complete();
-          }
-        }
-        emit('drain');
-      }
-      if (frame is AckFrame) {
-        // Let PacketManager update its internal state (_sentPackets, _retransmitTimers)
-        final List<int> newlySackedSequences = packetManager.handleAckFrame(frame);
-
-        // Track all acknowledged sequences for true cumulative ack calculation
-        _everAckedSequencesByRemote.addAll(newlySackedSequences);
-
-        // Compute the TRUE cumulative acknowledgment: the highest N where all packets 0..N are acked.
-        // This is different from largestAcked which is just the highest single packet acked.
-        int oldTrueCumulativeAck = _currentHighestCumulativeAckFromRemote;
-        while (_everAckedSequencesByRemote.contains(_currentHighestCumulativeAckFromRemote + 1)) {
-          _currentHighestCumulativeAckFromRemote++;
-        }
-
-        // Determine if this ACK frame advances the Congestion Controller's cumulative ACK point.
-        // This is based on the TRUE cumulative ack (contiguous range), not just largestAcked.
-        bool advancesCcCumulativePoint = _currentHighestCumulativeAckFromRemote > _ccMirrorOfHighestProcessedCumulativeAck;
-        // DIAGNOSTIC LOGGING START
-        // ////print('[UDXStream $id internalHandleSocketEvent] advancesCcCumulativePoint=$advancesCcCumulativePoint (_currentHighestCumulativeAckFromRemote=$_currentHighestCumulativeAckFromRemote > _ccMirrorOfHighestProcessedCumulativeAck=$_ccMirrorOfHighestProcessedCumulativeAck)');
-        // DIAGNOSTIC LOGGING END
-
-        // This is the largest value that the CC should consider as its new cumulative ACK point if advancesCcCumulativePoint is true.
-        // If not advancing, CC should use its old _ccMirrorOfHighestProcessedCumulativeAck for context.
-        // final int effectiveCumulativeAckForCC = advancesCcCumulativePoint ? _currentHighestCumulativeAckFromRemote : _ccMirrorOfHighestProcessedCumulativeAck; // Old logic
-        final int largestAckedInThisFrame = frame.largestAcked; // New logic: always pass frame.largestAcked as the 5th arg to onPacketAcked
-
-        if (newlySackedSequences.isNotEmpty) {
-          for (final ackedSeq in newlySackedSequences) {
-            final sentPacketInfo = _sentPackets.remove(ackedSeq);
-            if (sentPacketInfo != null) {
-              final (sentTime, ackedSize) = sentPacketInfo;
-
-              // A packet contributes to a new cumulative ACK for the CC if:
-              // 1. The CC's overall cumulative point is advancing in this frame (advancesCcCumulativePoint is true)
-              // 2. This specific packet (ackedSeq) falls within the range of this new advancement.
-              //    It must be greater than the CC's old mirror and less than or equal to the stream's new true cumulative ack.
-              bool isNewCumulativeForCCArg = advancesCcCumulativePoint &&
-                                          ackedSeq > _ccMirrorOfHighestProcessedCumulativeAck &&
-                                          ackedSeq <= _currentHighestCumulativeAckFromRemote;
-              // DIAGNOSTIC LOGGING START
-              // ////print('[UDXStream $id internalHandleSocketEvent] CALLING _congestionController.onPacketAcked: ackedSeq=$ackedSeq, ackedSize=$ackedSize, sentTime=$sentTime, ackDelayMs=${frame.ackDelay}, isNewCumulativeForCC=$isNewCumulativeForCCArg, currentFrameLargestAckedValueToPass=${largestAckedInThisFrame}');
-              // DIAGNOSTIC LOGGING END
-              _congestionController.onPacketAcked(
-                ackedSize,
-                sentTime,
-                Duration(milliseconds: frame.ackDelay),
-                isNewCumulativeForCCArg,
-                largestAckedInThisFrame // Pass frame.largestAcked as the 5th argument
-              );
-
-              // Update connection-level window accounting
-              if (_socket != null) {
-                _socket!.decrementConnectionBytesSent(ackedSize);
-              }
-
-              // Clean up retransmission attempt tracking for acknowledged packets
-              _retransmissionAttempts.remove(ackedSeq);
-
-              emit('ack', ackedSeq);
-
-              if (_drain != null && !_drain!.isCompleted) {
-                final connWindowAvailable = _socket?.getAvailableConnectionSendWindow() ?? 0;
-                if (inflight < cwnd && inflight < _remoteReceiveWindow && connWindowAvailable > 0) {
-                  _drain!.complete();
-                }
-              }
-            }
-          }
-        }
-
-        if (advancesCcCumulativePoint) {
-          _ccMirrorOfHighestProcessedCumulativeAck = _currentHighestCumulativeAckFromRemote;
-        } else {
-          // If the CC's cumulative point did not advance with this frame (advancesCcCumulativePoint is false),
-          // then this ACK frame, from the CC's perspective of its *own* cumulative progress,
-          // acts as a duplicate ACK for the sequence number it was expecting next (_ccMirrorOfHighestProcessedCumulativeAck + 1).
-          // We pass _ccMirrorOfHighestProcessedCumulativeAck to processDuplicateAck because that's the
-          // highest cumulative point the CC has processed so far.
-          // DIAGNOSTIC LOGGING START
-          // ////print('[UDXStream $id internalHandleSocketEvent] CALLING _congestionController.processDuplicateAck: _ccMirrorOfHighestProcessedCumulativeAck=$_ccMirrorOfHighestProcessedCumulativeAck (because CC cumulative point did not advance)');
-          // DIAGNOSTIC LOGGING END
-          _congestionController.processDuplicateAck(_ccMirrorOfHighestProcessedCumulativeAck);
-        }
-        // DIAGNOSTIC LOGGING START
-        // ////print('[UDXStream $id internalHandleSocketEvent] POST-ACK: _ccMirrorOfHighestProcessedCumulativeAck=$_ccMirrorOfHighestProcessedCumulativeAck');
-        // DIAGNOSTIC LOGGING END
-        // TODO: Handle ECN counts from ACK frame if ECN is implemented.
-      }
-    }
-
-    if (packetIsSequential) {
-      // This packet is the next expected one. Process its frames.
-      _receivedPacketSequences.add(packet.sequence); // Track for ACK generation
-      _largestAckedPacketArrivalTime = DateTime.now(); // Update arrival time for potential largest_acked
-
-      for (final frame in packet.frames) {
-        if (frame is StreamFrame) {
-          needsAck = true;
-          if (frame.data.isNotEmpty) {
-            bytesRead += frame.data.length;
-            _dataController.add(frame.data);
-            if (_socket != null && remoteHost != null && remotePort != null) {
-              _socket!.onStreamDataProcessed(frame.data.length);
-            }
-          }
-          if (frame.isFin) {
-            ////print('[DEBUG] UDXStream ${this.id} closing _dataController due to FIN flag');
-            _remoteWriteClosed = true;
-            _dataController.close();
-            emit('end');
-            // If we've also closed our write side, do full close
-            if (_localWriteClosed) {
-              _close();
-            }
-          }
-        } else if (frame is PingFrame) {
-          ////print('[UDXStream ${this.id}.internalHandleSocketEvent] Sequential PingFrame.');
-          needsAck = true;
-        } else if (frame is WindowUpdateFrame) {
-          // WindowUpdateFrame already processed in the immediate frame handling section above
-          ////print('[UDXStream ${this.id}.internalHandleSocketEvent] Sequential WindowUpdateFrame (already processed).');
-        } else if (frame is StreamDataBlockedFrame) {
-          // Peer is blocked on stream-level flow control
-          ////print('[UDXStream ${this.id}.internalHandleSocketEvent] STREAM_DATA_BLOCKED: maxStreamData=${frame.maxStreamData}');
-          emit('streamBlocked', {'maxStreamData': frame.maxStreamData});
-          // Application can listen to this event and potentially increase the window
-        } else if (frame is MaxDataFrame) {
-            ////print('[UDXStream ${this.id}.internalHandleSocketEvent] Sequential MaxDataFrame (unusual in stream context but handling): Size=${frame.maxData}');
-             if (_drain != null && !_drain!.isCompleted) {
-               final connWindowAvailable = _socket?.getAvailableConnectionSendWindow() ?? 0;
-                if (inflight < cwnd && inflight < _remoteReceiveWindow && connWindowAvailable > 0) {
-                  _drain!.complete();
-                }
-            }
-        }
-        // AckFrames and ResetStreamFrames are handled above and don't affect sequential processing here.
-      }
-      _nextExpectedSeq++; // Advance expected sequence *after* processing all frames in this sequential packet
-      _processReceiveBuffer(sourceHost, sourcePort);
-    } else if (packet.sequence > _nextExpectedSeq) {
-      // Packet is for the future. Buffer if it contains stream data.
-      bool hasStreamDataContent = packet.frames.any((f) => f is StreamFrame && (f.data.isNotEmpty || f.isFin));
-      if (hasStreamDataContent) {
-        _receiveBuffer[packet.sequence] = packet; // Buffer the whole packet
-      } else {
-        ////print('[UDXStream ${this.id}.internalHandleSocketEvent] Received out-of-order packet without StreamFrames (e.g. just ACK or future PING): Seq=${packet.sequence}. Processing relevant frames.');
-      }
-      // Always ACK out-of-order packets that might contain data or PINGs to help sender with loss detection/recovery.
-      // AckFrames themselves don't need this type of ACK.
-      if (containsAckElicitingFrames) {
-        _receivedPacketSequences.add(packet.sequence); // Add to sequences for SACKing
-        // _largestAckedPacketArrivalTime will be updated in _sendAck based on the full _receivedPacketSequences
-        needsAck = true;
-      }
-    } else { // packet.sequence < _nextExpectedSeq
-      // Packet is older than expected, likely a duplicate.
-      // Still ACK if it contained frames that would normally be ACKed (Stream, Ping)
-      // This ensures SACKs are sent even for duplicates, helping sender confirm receipt.
-      if (containsAckElicitingFrames) {
-        _receivedPacketSequences.add(packet.sequence); // Add to sequences for SACKing
-        needsAck = true;
-      }
-    }
-
-    if (needsAck) {
-      _sendAck();
-    }
-  }
-
-  void _processReceiveBuffer(String sourceHost, int sourcePort) {
-    while (_receiveBuffer.containsKey(_nextExpectedSeq)) {
-      final bufferedPacket = _receiveBuffer.remove(_nextExpectedSeq)!;
-      _receivedPacketSequences.add(bufferedPacket.sequence); // Track for ACK generation
-      _largestAckedPacketArrivalTime = DateTime.now(); // Update arrival time
-
-      for (final frame in bufferedPacket.frames) {
-        if (frame is StreamFrame) {
-          if (frame.data.isNotEmpty) {
-            ////print('[DEBUG] UDXStream ${this.id} _processReceiveBuffer adding data to _dataController: ${frame.data.length} bytes');
-            bytesRead += frame.data.length;
-            _dataController.add(frame.data);
-            if (_socket != null) {
-              _socket!.onStreamDataProcessed(frame.data.length);
-            }
-          }
-          if (frame.isFin) {
-            ////print('[DEBUG] UDXStream ${this.id} _processReceiveBuffer closing _dataController due to FIN flag');
-            _remoteWriteClosed = true;
-            _dataController.close();
-            emit('end');
-            // If we've also closed our write side, do full close
-            if (_localWriteClosed) {
-              _close();
-            }
-          }
-        }
-      }
-      _nextExpectedSeq++;
-    }
-  }
-
-  void _sendAck() {
-    if (!_connected || remotePort == null || remoteHost == null || remoteId == null) {
-      return;
-    }
-
-    // Use a local variable to avoid multiple null checks
-    final socket = _socket;
-    if (socket == null) {
-      ////print('[UDXStream ${this.id}._sendAck] Socket is null, cannot send ACK.');
-      return;
-    }
-
-    if (socket.closing) {
-      ////print('[UDXStream ${this.id}._sendAck] Socket is closing, skipping ACK send.');
-      return;
-    }
-
-    if (_receivedPacketSequences.isEmpty) {
-      return;
-    }
-
-    final sortedSequences = _receivedPacketSequences.toList()..sort();
-    if (sortedSequences.isEmpty) return;
-
-    final int largestAcked = sortedSequences.last;
-    int ackDelayMs = 0;
-    if (_largestAckedPacketArrivalTime != null) {
-      ackDelayMs = DateTime.now().difference(_largestAckedPacketArrivalTime!).inMilliseconds;
-      ackDelayMs = ackDelayMs.clamp(0, 65535); // Clamp to Uint16 range
-    }
-
-    List<AckRange> ackRanges = [];
-    int firstAckRangeLength = 0;
-
-    // Generate ranges based on QUIC ACK frame logic
-    // Convert sorted sequence numbers into {start, end} blocks
-    List<Map<String, int>> blocks = [];
-    if (sortedSequences.isNotEmpty) {
-      int blockStart = sortedSequences[0];
-      for (int i = 0; i < sortedSequences.length; i++) {
-        if (i + 1 < sortedSequences.length && sortedSequences[i + 1] == sortedSequences[i] + 1) {
-          // Continue current block
-        } else {
-          // End of a block
-          blocks.add({'start': blockStart, 'end': sortedSequences[i]});
-          if (i + 1 < sortedSequences.length) {
-            blockStart = sortedSequences[i + 1];
-          }
-        }
-      }
-    }
-
-    // Blocks are now [{start: S1, end: E1}, {start: S2, end: E2}, ...] sorted by sequence number
-    // The last block in `blocks` corresponds to the "Largest Acknowledged" range.
-    if (blocks.isNotEmpty) {
-      final lastBlock = blocks.removeLast(); // This is the block containing largestAcked
-      firstAckRangeLength = lastBlock['end']! - lastBlock['start']! + 1;
-      // largestAcked is already set to sortedSequences.last, which is lastBlock['end']
-
-      // Remaining blocks in `blocks` (if any) become the additional ACK ranges.
-      // These need to be ordered from highest sequence to lowest for the AckFrame.
-      // The `blocks` list is already sorted by increasing sequence, so iterate backwards.
-      int prevBlockStartSeq = lastBlock['start']!; // Start of the range just processed (firstAckRange)
-
-      for (int i = blocks.length - 1; i >= 0; i--) {
-        final currentBlock = blocks[i];
-        final currentBlockStart = currentBlock['start']!;
-        final currentBlockEnd = currentBlock['end']!;
-
-        // Gap = (start of previous higher-sequence block) - (end of current block) - 1
-        final int gap = prevBlockStartSeq - currentBlockEnd - 1;
-        final int rangeLength = currentBlockEnd - currentBlockStart + 1;
-
-        ackRanges.add(AckRange(gap: gap, ackRangeLength: rangeLength));
-        prevBlockStartSeq = currentBlockStart;
-      }
-    } else {
-      // Should not happen if sortedSequences was not empty, but as a fallback:
-      firstAckRangeLength = 0; // Or 1 if we consider largestAcked itself as a range of 1
-    }
-
-    // Ensure firstAckRangeLength is at least 1 if largestAcked is valid
-     if (firstAckRangeLength == 0 && sortedSequences.isNotEmpty) {
-        firstAckRangeLength = 1; // Smallest possible range for the largest_acked
-    }
-
-
-    final ackFrame = AckFrame(
-      largestAcked: largestAcked,
-      ackDelay: ackDelayMs,
-      firstAckRangeLength: firstAckRangeLength,
-      ackRanges: ackRanges,
-    );
-
-    // FIX: ACK-only packets should NOT consume new sequence numbers.
-    // ACKs are not retransmitted, don't need reliability guarantees, and don't carry
-    // ordered payload. Using new sequence numbers for ACKs causes sequence gaps at
-    // the receiver when ACKs are lost or arrive out-of-order, permanently blocking
-    // data delivery since the receiver's _nextExpectedSeq can never advance.
-    // Use the last sent sequence number (or 0 if none sent yet) instead.
-    final ackSequence = packetManager.lastSentPacketNumber >= 0 
-        ? packetManager.lastSentPacketNumber 
-        : 0;
-    
-    final ackPacket = UDXPacket(
-      destinationCid: _socket!.cids.remoteCid,
-      sourceCid: _socket!.cids.localCid,
-      destinationStreamId: remoteId!,
-      sourceStreamId: id,
-      sequence: ackSequence,
-      frames: [ackFrame],
-    );
-
-    socket.send(ackPacket.toBytes());
-    // ////print('[UDXStream ${this.id} SENT_ACK] LargestAcked: $largestAcked, Delay: $ackDelayMs, FirstRangeLen: $firstAckRangeLength, Ranges: ${ackRanges.map((r) => "G:${r.gap},L:${r.ackRangeLength}").toList()}');
-
-    _receivedPacketSequences.clear();
-    _lastAckSentTime = DateTime.now();
-    _largestAckedPacketArrivalTime = null; // Reset as the info is now sent
+    // With per-connection sequencing, the socket handles all receive ordering
+    // and calls deliverData/deliverFin/deliverReset directly.
+    // This method is kept as a no-op for any remaining callers.
   }
 
   @override
@@ -732,135 +266,70 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
     if (_socket == null) throw StateError('UDXStream ($id): Stream is not connected to a socket');
     if (_localWriteClosed) throw StateError('UDXStream ($id): Cannot write after closeWrite() has been called');
 
-    // DEBUG: Log window states at the beginning of add
-    if (_socket != null) {
-      // Use a local variable to avoid multiple null checks
-      final socket = _socket;
-      if (socket == null) {
-        ////print('[UDXStream ${this.id}.add] Socket became null after initial check, cannot proceed.');
-        throw StateError('UDXStream ($id): Socket became null during operation');
-      }
-      ////print('[UDXStream ${this.id} (${this.remoteHost}:${this.remotePort} rID:${this.remoteId}).add ENTRY] DEBUG: Initial available conn window: ${socket.getAvailableConnectionSendWindow()}, remoteStreamWindow: $_remoteReceiveWindow, cwnd: $cwnd, inflight: $inflight, data.length: ${data.length}');
-    }
     if (remoteId == null || remoteHost == null || remotePort == null) {
       throw StateError('UDXStream ($id): Remote peer details not set');
     }
-    if (data.isEmpty) {
-      return;
-    }
+    if (data.isEmpty) return;
 
-    // Fragment the data according to MTU size if needed
     final fragments = _fragmentData(data);
-
     for (final fragment in fragments) {
       await _sendFragment(fragment);
     }
-
     emit('send', data);
   }
 
-  // Helper method to fragment data according to MTU size
   List<Uint8List> _fragmentData(Uint8List data) {
     final fragments = <Uint8List>[];
     int offset = 0;
-
     while (offset < data.length) {
       final end = min(offset + _maxPayloadSize, data.length);
       final fragment = Uint8List.sublistView(data, offset, end);
       fragments.add(fragment);
       offset = end;
     }
-
     return fragments;
   }
 
-  // Helper method to send a single fragment
   Future<void> _sendFragment(Uint8List fragment) async {
-    // Check if socket is null before entering the loop
     final socket = _socket;
     if (socket == null) {
-      ////print('[UDXStream ${this.id}._sendFragment] Socket is null, cannot proceed.');
       throw StateError('UDXStream ($id): Socket is null during operation');
     }
 
-    // Wait for the handshake to complete with timeout tolerance
+    // Wait for handshake
     try {
       await socket.handshakeComplete.timeout(
         Duration(seconds: packetTimeoutTolerance),
-        onTimeout: () {
-          // Don't throw error, just log and continue - handshake timeouts should not kill the stream
-          ////print('[UDXStream ${this.id}._sendFragment] Handshake timeout after ${packetTimeoutTolerance}s, proceeding anyway');
-        },
+        onTimeout: () {},
       );
     } catch (e) {
-      // Handshake timeout or error - log but don't escalate to stream failure
-      ////print('[UDXStream ${this.id}._sendFragment] Handshake error: $e, proceeding with send attempt');
+      // Continue with send attempt
     }
 
-    // Add a timeout to prevent indefinite blocking
+    // Wait for send window
     final completer = Completer<void>();
     Timer? timeoutTimer;
 
-    // Non-blocking check with periodic retry
     void checkAndSend() {
       final connWindowAvailable = socket.getAvailableConnectionSendWindow();
-
-      // Log the current state for debugging
-      ////print('[UDXStream ${this.id}._sendFragment CHECK] connWin: $connWindowAvailable, remStrWin: $_remoteReceiveWindow, cwnd: $cwnd, inflight: $inflight');
-
-      if (inflight < cwnd && 
-          inflight < _remoteReceiveWindow && 
-          connWindowAvailable > 0) {
-        // Conditions met, proceed with sending
+      if (inflight < cwnd && inflight < _remoteReceiveWindow && connWindowAvailable > 0) {
         if (!completer.isCompleted) {
-          ////print('[UDXStream ${this.id}._sendFragment] Window conditions met, proceeding with send');
           completer.complete();
         }
       } else {
-        // Conditions not met, set up drain completer if needed
         if (_drain == null || _drain!.isCompleted) {
           _drain = Completer<void>();
-          ////print('[UDXStream ${this.id}._sendFragment BLOCKED] New _drain created. connWin: $connWindowAvailable, remStrWin: $_remoteReceiveWindow, cwnd: $cwnd, inflight: $inflight');
-          
-          // Send STREAM_DATA_BLOCKED if blocked by stream-level flow control
-          if (inflight >= _remoteReceiveWindow && remoteId != null) {
-            final blockedFrame = StreamDataBlockedFrame(
-              streamId: remoteId!,
-              maxStreamData: _remoteReceiveWindow,
-            );
-            final blockedSeq = packetManager.lastSentPacketNumber >= 0 
-                ? packetManager.lastSentPacketNumber 
-                : 0;
-            final blockedPacket = UDXPacket(
-              destinationCid: socket.cids.remoteCid,
-              sourceCid: socket.cids.localCid,
-              destinationStreamId: remoteId!,
-              sourceStreamId: id,
-              sequence: blockedSeq,
-              frames: [blockedFrame],
-            );
-            try {
-              socket.send(blockedPacket.toBytes());
-            } catch (e) {
-              // Ignore send errors for blocked frames
-            }
-          }
         }
-
-        // Retry after a short delay
         Timer(Duration(milliseconds: 50), checkAndSend);
       }
     }
 
-    // Start the timeout timer - use packet timeout tolerance instead of hard failure
     timeoutTimer = Timer(Duration(seconds: packetTimeoutTolerance), () {
       if (!completer.isCompleted) {
-        ////print('[UDXStream ${this.id}._sendFragment] Timed out waiting for send window after ${packetTimeoutTolerance}s. Proceeding with send attempt.');
         completer.complete();
       }
     });
 
-    // Start the check process
     checkAndSend();
 
     try {
@@ -869,79 +338,29 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
       timeoutTimer?.cancel();
     }
 
-    // After window checks pass, wait for the pacer with timeout
+    // Wait for pacer
     try {
-      await _congestionController.pacingController.waitUntilReady().timeout(
+      await socket.congestionController.pacingController.waitUntilReady().timeout(
         Duration(seconds: 5),
-        onTimeout: () {
-          // Pacing timeout - log but don't fail the stream
-          ////print('[UDXStream ${this.id}._sendFragment] Pacing timeout, proceeding without pacing');
-        },
+        onTimeout: () {},
       );
     } catch (e) {
-      // Pacing error - log but continue
-      ////print('[UDXStream ${this.id}._sendFragment] Pacing error: $e, proceeding without pacing');
+      // Continue without pacing
     }
 
-    // Check if socket is still valid before proceeding
     final currentSocket = _socket;
     if (currentSocket == null) {
-      ////print('[UDXStream ${this.id}._sendFragment] Socket became null after waiting, cannot proceed.');
       throw StateError('UDXStream ($id): Socket became null during operation');
     }
+    if (currentSocket.closing) return;
 
-    // DEBUG: Log when proceeding with send
-    ////print('[UDXStream ${this.id}._sendFragment SENDING] connWin: ${currentSocket.getAvailableConnectionSendWindow()}, remStrWin: $_remoteReceiveWindow, cwnd: $cwnd, inflight: $inflight');
-
-    // Create and send the packet
-    // //print( '[STRM $id] Sending fragment. Using remoteCid: ${_socket?.cids.remoteCid}, localCid: ${_socket?.cids.localCid}');
-    final packet = UDXPacket(
-      destinationCid: _socket!.cids.remoteCid,
-      sourceCid: _socket!.cids.localCid,
-      destinationStreamId: remoteId!,
-      sourceStreamId: id,
-      sequence: packetManager.nextSequence,
-      frames: [StreamFrame(data: fragment)],
+    // Send via socket's connection-level packet manager
+    bytesWritten += fragment.length;
+    currentSocket.sendStreamPacket(
+      remoteId!,
+      id,
+      [StreamFrame(data: fragment)],
     );
-
-    // Log the data packet being sent
-    //print('[UDXStream ${this.id} SENDING_PACKET] Seq=${packet.sequence}, FragmentLen=${fragment.length}, DestID=${packet.destinationStreamId}, SrcID=${packet.sourceStreamId}, HasSocket=${_socket != null}');
-
-    _sentPackets[packet.sequence] = (DateTime.now(), fragment.length);
-    // Initialize retransmission attempt counter for this packet
-    _retransmissionAttempts[packet.sequence] = 0;
-    
-    //print('[UDXStream ${this.id}] About to call packetManager.sendPacket for packet ${packet.sequence}');
-    packetManager.sendPacket(packet);
-    //print('[UDXStream ${this.id}] Called packetManager.sendPacket for packet ${packet.sequence}');
-    _congestionController.onPacketSent(fragment.length);
-
-    if (remotePort != null && remoteHost != null) {
-      // Check if socket is still valid before sending
-      final sendSocket = _socket;
-      if (sendSocket == null) {
-        ////print('[UDXStream ${this.id}._sendFragment] Socket became null before sending packet, cannot proceed.');
-        throw StateError('UDXStream ($id): Socket became null during operation');
-      }
-
-      if (sendSocket.closing) {
-        ////print('[UDXStream ${this.id}._sendFragment] Socket is closing, skipping data packet send.');
-        // Don't throw an error, just return and let the stream close gracefully
-        return;
-      }
-
-      try {
-        bytesWritten += fragment.length;
-        sendSocket.send(packet.toBytes());
-        sendSocket.incrementConnectionBytesSent(fragment.length);
-        // Inform the pacer that a packet was sent
-        _congestionController.pacingController.onPacketSent(packet.toBytes().length);
-      } catch (e) {
-        // Socket send error - log but don't escalate to stream failure
-        ////print('[UDXStream ${this.id}._sendFragment] Socket send error: $e, packet will be retransmitted by PTO system');
-        // The PTO system will handle retransmission, so we don't need to throw here
-      }
-    }
   }
 
   @override
@@ -964,173 +383,75 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
 
   void setWindow(int newSize) {
     _receiveWindow = newSize;
-    if (_connected && remoteId != null && remoteHost != null && remotePort != null) {
-      // Use a local variable to avoid multiple null checks
-      final socket = _socket;
-      if (socket == null) {
-        ////print('[UDXStream ${this.id}.setWindow] Socket is null, cannot send window update.');
-        return;
-      }
-
-      if (socket.closing) {
-        ////print('[UDXStream ${this.id}.setWindow] Socket is closing, skipping window update send.');
-        return;
-      }
-
-      // FIX: Window update packets should NOT consume new sequence numbers.
-      // Like ACKs, they are not retransmitted and don't need reliability.
-      // Using new sequence numbers can cause sequence gaps at the receiver.
-      final windowUpdateSeq = packetManager.lastSentPacketNumber >= 0 
-          ? packetManager.lastSentPacketNumber 
-          : 0;
-
-      final windowUpdatePacket = UDXPacket(
-        destinationCid: _socket!.cids.remoteCid,
-        sourceCid: _socket!.cids.localCid,
-        destinationStreamId: remoteId!,
-        sourceStreamId: id,
-        sequence: windowUpdateSeq,
-        frames: [WindowUpdateFrame(windowSize: _receiveWindow)],
+    if (_connected && remoteId != null && _socket != null && !_socket!.closing) {
+      _socket!.sendStreamPacket(
+        remoteId!,
+        id,
+        [WindowUpdateFrame(windowSize: _receiveWindow)],
+        trackForRetransmit: false,
       );
-      socket.send(windowUpdatePacket.toBytes());
     }
   }
 
-  /// Sets the priority for this stream.
-  /// Lower values indicate higher priority (0 = highest, 255 = lowest).
-  /// Default is 128 (medium priority).
   void setPriority(int newPriority) {
     priority = newPriority.clamp(0, 255);
     emit('priorityChanged', {'priority': priority});
   }
 
-  /// Abruptly terminates the stream by sending a RESET_STREAM frame.
   Future<void> reset(int errorCode) async {
     if (!_connected) return;
 
-    if (remoteId != null && remoteHost != null && remotePort != null) {
-      // Use a local variable to avoid multiple null checks
-      final socket = _socket;
-      if (socket == null) {
-        ////print('[UDXStream ${this.id}.reset] Socket is null, cannot send reset frame.');
-        // Continue with local close even if we can't send the reset frame
-      } else {
-        // FIX: Reset packets should NOT consume new sequence numbers.
-        // Like ACKs, they are fire-and-forget and not retransmitted.
-        // Using new sequence numbers can cause sequence gaps at the receiver.
-        final resetSeq = packetManager.lastSentPacketNumber >= 0 
-            ? packetManager.lastSentPacketNumber 
-            : 0;
-
-        final resetPacket = UDXPacket(
-          destinationCid: _socket!.cids.remoteCid,
-          sourceCid: _socket!.cids.localCid,
-          destinationStreamId: remoteId!,
-          sourceStreamId: id,
-          sequence: resetSeq,
-          frames: [ResetStreamFrame(errorCode: errorCode)],
-        );
-        try {
-          // This is a "fire-and-forget" send. We don't wait for an ACK.
-          socket.send(resetPacket.toBytes());
-        } catch (e) {
-          // Ignore errors during reset, as the stream is being torn down.
-        }
-      }
+    if (remoteId != null && _socket != null && !_socket!.closing) {
+      _socket!.sendStreamPacket(
+        remoteId!,
+        id,
+        [ResetStreamFrame(errorCode: errorCode)],
+        trackForRetransmit: false,
+      );
     }
 
-    // Immediately transition to a closed state locally.
     await _close(isReset: true);
   }
 
-  /// Sends a STOP_SENDING frame to request the peer to stop sending data.
-  /// This is used when the local endpoint is no longer interested in
-  /// receiving data on this stream.
   Future<void> stopReceiving(int errorCode) async {
     if (!_connected || _remoteWriteClosed) return;
-    
-    final socket = _socket;
-    if (socket == null || socket.closing) return;
-    
-    if (remoteId != null) {
-      final stopSendingFrame = StopSendingFrame(
-        streamId: remoteId!,
-        errorCode: errorCode,
+
+    if (remoteId != null && _socket != null && !_socket!.closing) {
+      _socket!.sendStreamPacket(
+        remoteId!,
+        id,
+        [StopSendingFrame(streamId: remoteId!, errorCode: errorCode)],
+        trackForRetransmit: false,
       );
-      
-      // STOP_SENDING is fire-and-forget, so use last sequence number
-      final stopSeq = packetManager.lastSentPacketNumber >= 0 
-          ? packetManager.lastSentPacketNumber 
-          : 0;
-      
-      final stopPacket = UDXPacket(
-        destinationCid: socket.cids.remoteCid,
-        sourceCid: socket.cids.localCid,
-        destinationStreamId: remoteId!,
-        sourceStreamId: id,
-        sequence: stopSeq,
-        frames: [stopSendingFrame],
-      );
-      
-      try {
-        socket.send(stopPacket.toBytes());
-      } catch (e) {
-        // Ignore errors - this is a best-effort signal
-      }
     }
-    
-    // Close the read side locally
+
     _remoteWriteClosed = true;
     if (!_dataController.isClosed) {
       _dataController.close();
     }
     emit('end');
-    
-    // If we've also closed our write side, do full close
+
     if (_localWriteClosed) {
       await _close();
     }
   }
 
-  /// Close the write side of the stream by sending a FIN packet.
-  /// The read side remains open until the remote peer sends FIN or close() is called.
-  /// This enables half-close semantics for bidirectional communication.
   Future<void> closeWrite() async {
     if (_localWriteClosed) return;
     _localWriteClosed = true;
-    
-    if (!_connected || remoteId == null || remoteHost == null || remotePort == null) {
-      // If not connected, just mark as closed
-      return;
-    }
-    
-    final socket = _socket;
-    if (socket == null || socket.closing) {
-      // Can't send FIN, but state is marked
-      return;
-    }
-    
-    // Send FIN packet
-    final finPacket = UDXPacket(
-      destinationCid: socket.cids.remoteCid,
-      sourceCid: socket.cids.localCid,
-      destinationStreamId: remoteId!,
-      sourceStreamId: id,
-      sequence: packetManager.nextSequence,
-      frames: [StreamFrame(data: Uint8List(0), isFin: true)],
+
+    if (!_connected || remoteId == null || _socket == null || _socket!.closing) return;
+
+    // Send FIN via socket
+    _socket!.sendStreamPacket(
+      remoteId!,
+      id,
+      [StreamFrame(data: Uint8List(0), isFin: true)],
     );
-    
-    try {
-      _sentPackets[finPacket.sequence] = (DateTime.now(), 0);
-      socket.send(finPacket.toBytes());
-      packetManager.sendPacket(finPacket);
-      // Small delay to ensure FIN is sent
-      await Future.delayed(Duration(milliseconds: 50));
-    } catch (e) {
-      // Ignore errors during FIN send
-    }
-    
-    // If remote has also closed their write side (we received FIN), do full close
+
+    // Small delay to ensure FIN is sent
+    await Future.delayed(Duration(milliseconds: 50));
+
     if (_remoteWriteClosed) {
       await _close();
     }
@@ -1141,46 +462,22 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
     await _close();
   }
 
-  /// Internal close logic, handling both graceful (FIN) and abrupt (reset) closures.
   Future<void> _close({bool isReset = false}) async {
     if (!_connected) return;
 
-    // Mark both sides as closed for full closure
     _localWriteClosed = true;
     _remoteWriteClosed = true;
 
-    if (!isReset && remoteId != null && remoteHost != null && remotePort != null) {
-      // Use a local variable to avoid multiple null checks
-      final socket = _socket;
-      if (socket == null) {
-        ////print('[UDXStream ${this.id}._close] Socket is null, cannot send FIN packet.');
-        // Continue with local close even if we can't send the FIN packet
-      } else {
-        final finPacket = UDXPacket(
-          destinationCid: _socket!.cids.remoteCid,
-          sourceCid: _socket!.cids.localCid,
-          destinationStreamId: remoteId!,
-          sourceStreamId: id,
-          sequence: packetManager.nextSequence,
-          frames: [StreamFrame(data: Uint8List(0), isFin: true)],
+    if (!isReset && remoteId != null && _socket != null && !_socket!.closing) {
+      try {
+        _socket!.sendStreamPacket(
+          remoteId!,
+          id,
+          [StreamFrame(data: Uint8List(0), isFin: true)],
         );
-        try {
-          ////print('[UDXStream ${this.id}._close] Sending FIN packet: Seq=${finPacket.sequence}');
-          _sentPackets[finPacket.sequence] = (DateTime.now(), 0); // FIN packet has 0 data size
-
-          // Check if socket is closing before attempting to send
-          if (!socket.closing) {
-            socket.send(finPacket.toBytes());
-            packetManager.sendPacket(finPacket);
-            // Add a small delay to ensure the FIN packet is sent before closing the stream
-            await Future.delayed(Duration(milliseconds: 50));
-          } else {
-            ////print('[UDXStream ${this.id}._close] Socket is closing, skipping FIN packet send.');
-          }
-        } catch (e) {
-          ////print('[UDXStream ${this.id}._close] Error sending FIN packet: $e');
-          // Ignore errors
-        }
+        await Future.delayed(Duration(milliseconds: 50));
+      } catch (e) {
+        // Ignore errors during close
       }
     }
 
@@ -1192,14 +489,8 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
       }
       _socket?.unregisterStream(id);
 
-      ////print('[UDXStream ${this.id} close] Attempting to cancel _remoteConnectionWindowUpdateSubscription: ${_remoteConnectionWindowUpdateSubscription?.hashCode}');
       await _remoteConnectionWindowUpdateSubscription?.cancel();
-      ////print('[UDXStream ${this.id} close] Called cancel on _remoteConnectionWindowUpdateSubscription: ${_remoteConnectionWindowUpdateSubscription?.hashCode}');
       _remoteConnectionWindowUpdateSubscription = null;
-
-      packetManager.destroy();
-      _congestionController.destroy();
-      _sentPackets.clear();
 
       emit('close');
     } catch (e) {
@@ -1240,13 +531,11 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
     }
     socket.incrementOutgoingStreams();
 
-
     final stream = UDXStream(
       udx,
       localId,
       streamType: streamType,
       isInitiator: true,
-      initialCwnd: initialCwnd,
       framed: framed,
       initialSeq: initialSeq,
       firewall: firewall,
@@ -1259,87 +548,23 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
     socket.registerStream(stream);
     stream._remoteConnectionWindowUpdateSubscription?.cancel();
     stream._remoteConnectionWindowUpdateSubscription = stream._socket!.on('remoteConnectionWindowUpdate').listen(stream._handleRemoteConnectionWindowUpdate);
-    ////print('[UDXStream ${stream.id} Subscribing to remoteConnectionWindowUpdate on socket: ${stream._socket.hashCode}]');
     stream._connected = true;
     stream.connectedAt = DateTime.now();
-    
-    // Propagate metrics observer and connection ID to congestion controller
-    stream._congestionController.metricsObserver = socket.metricsObserver;
-    stream._congestionController.connectionId = socket.cids.localCid;
-
-    stream.packetManager.onRetransmit = (packet) {
-      if (!stream.connected || stream._socket == null || stream.remotePort == null || stream.remoteHost == null) return;
-      if (stream._socket!.closing) {
-        ////print('[UDXStream ${stream.id}.onRetransmit] Socket is closing, skipping packet retransmission.');
-        return;
-      }
-      stream._socket!.send(packet.toBytes());
-    };
-    stream.packetManager.onSendProbe = (packet) {
-      if (!stream.connected || stream._socket == null || stream.remotePort == null || stream.remoteHost == null) return;
-      if (stream._socket!.closing) {
-        ////print('[UDXStream ${stream.id}.onSendProbe] Socket is closing, skipping probe packet send.');
-        return;
-      }
-      stream._socket!.send(packet.toBytes());
-    };
-    
-    // Connect packet metrics to socket's observer
-    stream.packetManager.onPacketRetransmitEvent = (sequence, attemptCount, rto) {
-      stream._socket?.metricsObserver?.onPacketRetransmit(
-        stream._socket!.cids.localCid,
-        sequence,
-        attemptCount,
-        rto,
-      );
-    };
-    
-    stream.packetManager.onPacketLossEvent = (sequence, lossType) {
-      stream._socket?.metricsObserver?.onPacketLoss(
-        stream._socket!.cids.localCid,
-        sequence,
-        lossType,
-      );
-    };
-
-    // //print( '[STRM $localId] Creating outgoing SYN packet. Using remoteCid: ${socket.cids.remoteCid}, localCid: ${socket.cids.localCid}');
-    final initialPacket = UDXPacket(
-      destinationCid: socket.cids.remoteCid,
-      sourceCid: socket.cids.localCid,
-      destinationStreamId: remoteId,
-      sourceStreamId: localId,
-      sequence: stream.packetManager.nextSequence,
-      frames: [StreamFrame(data: Uint8List(0), isSyn: true)],
-    );
-
-    // Log the initial packet being sent
-    ////print('[UDXStream ${stream.id} CREATE_OUTGOING_SENDING_INITIAL_PACKET] Seq=${initialPacket.sequence}, DestID=${initialPacket.destinationStreamId}, SrcID=${initialPacket.sourceStreamId}');
 
     try {
-      stream._sentPackets[initialPacket.sequence] = (DateTime.now(), 0); // SYN packet has 0 data size
-      if (stream._socket != null && stream.remotePort != null && stream.remoteHost != null) {
-        if (!stream._socket!.closing) {
-          stream._socket!.send(initialPacket.toBytes());
-        } else {
-          ////print('[UDXStream ${stream.id}.createOutgoing] Socket is closing, skipping initial packet send.');
-        }
-      }
-      stream.packetManager.sendPacket(initialPacket);
-      stream._congestionController.onPacketSent(0);
+      // Send SYN via socket's connection-level packet manager
+      socket.sendStreamPacket(
+        remoteId,
+        localId,
+        [StreamFrame(data: Uint8List(0), isSyn: true)],
+      );
 
-      if (stream._socket != null && stream.remoteHost != null && stream.remotePort != null) {
-        if (!stream._socket!.closing) {
-          await stream._socket!.sendMaxDataFrame(
-            UDPSocket.defaultInitialConnectionWindow
-          );
-          await stream._socket!.sendMaxStreamsFrame();
-          ////print('[UDXStream.createOutgoing] DEBUG: Attempted to send MaxDataFrame for stream ${stream.id} to ${stream.remoteHost}:${stream.remotePort}');
-        } else {
-          ////print('[UDXStream ${stream.id}.createOutgoing] Socket is closing, skipping MaxDataFrame send.');
-        }
+      if (!socket.closing) {
+        await socket.sendMaxDataFrame(UDPSocket.defaultInitialConnectionWindow);
+        await socket.sendMaxStreamsFrame();
       }
     } catch (e) {
-      await stream.close(); 
+      await stream.close();
       rethrow;
     }
 
@@ -1360,22 +585,17 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
     int initialSeq = 0,
     int? initialCwnd,
     bool Function(UDPSocket socket, int port, String host)? firewall,
-    StreamType streamType = StreamType.bidirectional,  // Default to bidirectional for initial/handshake streams
+    StreamType streamType = StreamType.bidirectional,
   }) {
     if (socket.closing) {
       throw StateError('UDXStream.createIncoming: Socket is closing');
     }
-    
-    // NOTE: We no longer derive stream type from the stream ID because UDX uses
-    // random stream IDs, not QUIC-style encoded IDs. The stream type is now
-    // explicitly passed as a parameter (defaulting to bidirectional).
-    
+
     final stream = UDXStream(
       udx,
       localId,
       streamType: streamType,
       isInitiator: false,
-      initialCwnd: initialCwnd,
       framed: framed,
       initialSeq: initialSeq,
       firewall: firewall,
@@ -1388,102 +608,20 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
     socket.registerStream(stream);
     stream._remoteConnectionWindowUpdateSubscription?.cancel();
     stream._remoteConnectionWindowUpdateSubscription = stream._socket!.on('remoteConnectionWindowUpdate').listen(stream._handleRemoteConnectionWindowUpdate);
-    ////print('[UDXStream ${stream.id} Subscribing to remoteConnectionWindowUpdate on socket: ${stream._socket.hashCode}]');
     stream._connected = true;
     stream.connectedAt = DateTime.now();
-    
-    // Propagate metrics observer and connection ID to congestion controller
-    stream._congestionController.metricsObserver = socket.metricsObserver;
-    stream._congestionController.connectionId = socket.cids.localCid;
 
-    // Manually process the initial SYN packet to send a SYN-ACK
-    final initialPacketBytes = socket.popInitialPacket(localId);
-    if (initialPacketBytes != null) {
-      try {
-        final synPacket = UDXPacket.fromBytes(initialPacketBytes);
-        // We received a SYN, so we must ACK it.
-        // The next expected sequence from the peer is their sequence + 1.
-        stream._nextExpectedSeq = synPacket.sequence + 1;
-        stream._receivedPacketSequences.add(synPacket.sequence);
-        stream._largestAckedPacketArrivalTime = DateTime.now();
+    // Send SYN-ACK via socket's connection-level packet manager
+    // The SYN has already been received and processed by the socket.
+    // We send our SYN back to establish the bidirectional stream.
+    socket.sendStreamPacket(
+      remoteId,
+      localId,
+      [StreamFrame(data: Uint8List(0), isSyn: true)],
+    );
 
-        // Construct and send the SYN-ACK packet immediately.
-        final synAckPacket = UDXPacket(
-          destinationCid: sourceCid, // The incoming packet's source is our destination
-          sourceCid: destinationCid, // Our source is the incoming packet's destination
-          destinationStreamId: remoteId,
-          sourceStreamId: localId,
-          sequence: stream.packetManager.nextSequence,
-          frames: [
-            // The SYN part of the SYN-ACK
-            StreamFrame(data: Uint8List(0), isSyn: true),
-            // The ACK part of the SYN-ACK
-            AckFrame(
-              largestAcked: synPacket.sequence,
-              ackDelay: 0,
-              firstAckRangeLength: 1,
-              ackRanges: [],
-            ),
-          ],
-        );
-
-        // Send the packet and register it for potential retransmission
-        stream._sentPackets[synAckPacket.sequence] = (DateTime.now(), 0); // SYN-ACK has 0 data size
-        socket.send(synAckPacket.toBytes());
-        stream.packetManager.sendPacket(synAckPacket);
-        stream._congestionController.onPacketSent(0);
-
-      } catch (e) {
-        // If parsing fails, close the stream with an error.
-        stream.addError(StateError('Failed to parse initial SYN packet: $e'));
-        stream.close();
-      }
-    }
-
-    stream.packetManager.onRetransmit = (packet) {
-      if (!stream.connected || stream._socket == null || stream.remotePort == null || stream.remoteHost == null) return;
-      if (stream._socket!.closing) {
-        ////print('[UDXStream ${stream.id}.onRetransmit] Socket is closing, skipping packet retransmission.');
-        return;
-      }
-      stream._socket!.send(packet.toBytes());
-    };
-    stream.packetManager.onSendProbe = (packet) {
-      if (!stream.connected || stream._socket == null || stream.remotePort == null || stream.remoteHost == null) return;
-      if (stream._socket!.closing) {
-        ////print('[UDXStream ${stream.id}.onSendProbe] Socket is closing, skipping probe packet send.');
-        return;
-      }
-      stream._socket!.send(packet.toBytes());
-    };
-    
-    // Connect packet metrics to socket's observer
-    stream.packetManager.onPacketRetransmitEvent = (sequence, attemptCount, rto) {
-      stream._socket?.metricsObserver?.onPacketRetransmit(
-        stream._socket!.cids.localCid,
-        sequence,
-        attemptCount,
-        rto,
-      );
-    };
-    
-    stream.packetManager.onPacketLossEvent = (sequence, lossType) {
-      stream._socket?.metricsObserver?.onPacketLoss(
-        stream._socket!.cids.localCid,
-        sequence,
-        lossType,
-      );
-    };
-
-    if (stream._socket != null && stream.remoteHost != null && stream.remotePort != null) {
-      if (!stream._socket!.closing) {
-        stream._socket!.sendMaxDataFrame(
-          UDPSocket.defaultInitialConnectionWindow
-        );
-        ////print('[UDXStream.createIncoming] DEBUG: Attempted to send MaxDataFrame for stream ${stream.id} to ${stream.remoteHost}:${stream.remotePort}');
-      } else {
-        ////print('[UDXStream ${stream.id}.createIncoming] Socket is closing, skipping MaxDataFrame send.');
-      }
+    if (!socket.closing) {
+      socket.sendMaxDataFrame(UDPSocket.defaultInitialConnectionWindow);
     }
 
     stream.emit('accepted');
@@ -1491,12 +629,11 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
   }
 
   // --- Test Hooks ---
-  Map<int, (DateTime, int)> getSentPacketsTestHook() => _sentPackets;
-  // Calculate max payload size based on default MTU (1400) minus headers (16)
-  static int getMaxPayloadSizeTestHook() => 1400 - 16;
-
   /// Sets the internal socket. For testing purposes only.
   void setSocketForTest(UDPSocket? socket) {
     _socket = socket;
   }
+
+  // Calculate max payload size based on default MTU (1400) minus headers (16)
+  static int getMaxPayloadSizeTestHook() => 1400 - 16;
 }
