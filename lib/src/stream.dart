@@ -124,6 +124,7 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
   /// The local receive window size
   int get receiveWindow => _receiveWindow;
   int _receiveWindow = 65536;
+  int _bytesReceivedSinceWindowUpdate = 0;
 
   /// The remote peer's receive window size
   int get remoteReceiveWindow => _remoteReceiveWindow;
@@ -206,6 +207,22 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
     }
     if (_socket != null) {
       _socket!.onStreamDataProcessed(data.length);
+    }
+    // Send stream-level window update when 25% of receive window consumed.
+    // Without this, the peer's stream flow controller blocks after exhausting
+    // the initial 64KB window — killing the entire yamux mux on this stream.
+    _bytesReceivedSinceWindowUpdate += data.length;
+    if (_bytesReceivedSinceWindowUpdate > _receiveWindow ~/ 4) {
+      _receiveWindow += _bytesReceivedSinceWindowUpdate;
+      _bytesReceivedSinceWindowUpdate = 0;
+      if (_connected && remoteId != null && _socket != null && !_socket!.closing) {
+        _socket!.sendStreamPacket(
+          remoteId!,
+          id,
+          [WindowUpdateFrame(windowSize: _receiveWindow)],
+          trackForRetransmit: false,
+        );
+      }
     }
   }
 
