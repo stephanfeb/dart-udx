@@ -327,32 +327,44 @@ class UDPSocket with UDXEventEmitter {
       // --- Connection-level receive ordering ---
       bool needsAck = false;
       bool containsAckElicitingFrames = udxPacket.frames.any((f) => f is StreamFrame || f is PingFrame);
-      bool packetIsSequential = (udxPacket.sequence == _nextExpectedSeq);
+      bool hasStreamData = udxPacket.frames.any((f) => f is StreamFrame && (f.data.isNotEmpty || f.isFin || f.isSyn));
 
-      if (packetIsSequential) {
-        _receivedPacketSequences.add(udxPacket.sequence);
-        _largestAckedPacketArrivalTime = DateTime.now();
-
+      // Control-only packets (ACKs, window updates) are processed immediately
+      // without advancing _nextExpectedSeq. They don't carry ordered stream
+      // data, so they must not consume sequence numbers. The Go UDX sends
+      // control packets with seq=0 to avoid creating sequence gaps, but even
+      // if a peer uses non-zero sequences for controls, we handle it safely.
+      if (!hasStreamData) {
         _processPacketFrames(udxPacket, fromAddress, fromPort);
-        _nextExpectedSeq++;
-        _processConnectionReceiveBuffer(fromAddress, fromPort);
-
-        if (containsAckElicitingFrames) needsAck = true;
-      } else if (udxPacket.sequence > _nextExpectedSeq) {
-        // Future packet — buffer if it has stream data
-        bool hasStreamData = udxPacket.frames.any((f) => f is StreamFrame && (f.data.isNotEmpty || f.isFin || f.isSyn));
-        if (hasStreamData) {
-          _connectionReceiveBuffer[udxPacket.sequence] = udxPacket;
-        }
         if (containsAckElicitingFrames) {
           _receivedPacketSequences.add(udxPacket.sequence);
           needsAck = true;
         }
       } else {
-        // Old/duplicate packet — still ACK
-        if (containsAckElicitingFrames) {
+        bool packetIsSequential = (udxPacket.sequence == _nextExpectedSeq);
+
+        if (packetIsSequential) {
           _receivedPacketSequences.add(udxPacket.sequence);
-          needsAck = true;
+          _largestAckedPacketArrivalTime = DateTime.now();
+
+          _processPacketFrames(udxPacket, fromAddress, fromPort);
+          _nextExpectedSeq++;
+          _processConnectionReceiveBuffer(fromAddress, fromPort);
+
+          if (containsAckElicitingFrames) needsAck = true;
+        } else if (udxPacket.sequence > _nextExpectedSeq) {
+          // Future data packet — buffer for later
+          _connectionReceiveBuffer[udxPacket.sequence] = udxPacket;
+          if (containsAckElicitingFrames) {
+            _receivedPacketSequences.add(udxPacket.sequence);
+            needsAck = true;
+          }
+        } else {
+          // Old/duplicate data packet — still ACK
+          if (containsAckElicitingFrames) {
+            _receivedPacketSequences.add(udxPacket.sequence);
+            needsAck = true;
+          }
         }
       }
 
