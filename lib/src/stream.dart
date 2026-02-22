@@ -4,6 +4,7 @@ import 'dart:typed_data';
 
 import 'cid.dart';
 import 'events.dart';
+import 'logging.dart';
 import 'udx.dart';
 import 'socket.dart';
 import 'packet.dart';
@@ -123,7 +124,8 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
 
   /// The local receive window size
   int get receiveWindow => _receiveWindow;
-  int _receiveWindow = 65536;
+  static const int _initialReceiveWindow = 65536;
+  int _receiveWindow = _initialReceiveWindow;
   int _bytesReceivedSinceWindowUpdate = 0;
 
   /// The remote peer's receive window size
@@ -202,17 +204,24 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
   void deliverData(Uint8List data) {
     if (data.isEmpty) return;
     bytesRead += data.length;
+    if (UdxLogging.verbose) {
+      UdxLogging.infoLog('[UDX-STREAM $id] deliverData: ${data.length} bytes, totalBytesRead=$bytesRead');
+    }
     if (!_dataController.isClosed) {
       _dataController.add(data);
     }
     if (_socket != null) {
       _socket!.onStreamDataProcessed(data.length);
     }
-    // Send stream-level window update when 25% of receive window consumed.
-    // Without this, the peer's stream flow controller blocks after exhausting
-    // the initial 64KB window — killing the entire yamux mux on this stream.
+    // Send stream-level window update when 25% of the INITIAL window has been
+    // received since the last update. Using the initial window size as the
+    // threshold (not the current growing window) prevents a flow control
+    // deadlock: as _receiveWindow grows, threshold = _receiveWindow/4 also
+    // grows, but the increment between updates stays roughly constant. When
+    // the increment becomes smaller than the threshold, the peer blocks
+    // waiting for a window update that never comes.
     _bytesReceivedSinceWindowUpdate += data.length;
-    if (_bytesReceivedSinceWindowUpdate > _receiveWindow ~/ 4) {
+    if (_bytesReceivedSinceWindowUpdate > _initialReceiveWindow ~/ 4) {
       _receiveWindow += _bytesReceivedSinceWindowUpdate;
       _bytesReceivedSinceWindowUpdate = 0;
       if (_connected && remoteId != null && _socket != null && !_socket!.closing) {
