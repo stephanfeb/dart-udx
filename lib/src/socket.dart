@@ -501,7 +501,22 @@ class UDPSocket with UDXEventEmitter {
   void sendStreamPacket(int dstStreamId, int srcStreamId, List<Frame> frames, {bool trackForRetransmit = true}) {
     if (_closing) return;
 
-    final seq = _packetManager.nextSequence;
+    // Determine if this packet carries stream data (data, SYN, or FIN).
+    // Control-only packets (WindowUpdate, ACK, etc.) use seq=0 to avoid
+    // consuming sequence numbers that create gaps in the receiver's ordered
+    // delivery. This matches the Go UDX sendPacket() logic.
+    bool hasData = false;
+    int dataSize = 0;
+    for (final frame in frames) {
+      if (frame is StreamFrame) {
+        dataSize += frame.data.length;
+        if (frame.data.isNotEmpty || frame.isSyn || frame.isFin) {
+          hasData = true;
+        }
+      }
+    }
+
+    final seq = hasData ? _packetManager.nextSequence : 0;
     final packet = UDXPacket(
       destinationCid: cids.remoteCid,
       sourceCid: cids.localCid,
@@ -511,13 +526,7 @@ class UDPSocket with UDXEventEmitter {
       frames: frames,
     );
 
-    // Calculate data size for congestion control
-    int dataSize = 0;
-    for (final frame in frames) {
-      if (frame is StreamFrame) dataSize += frame.data.length;
-    }
-
-    if (trackForRetransmit) {
+    if (hasData && trackForRetransmit) {
       _packetManager.sendPacket(packet);
       _congestionController.onPacketSent(dataSize);
       _sentPacketsForRtt[seq] = (DateTime.now(), dataSize);
