@@ -13,6 +13,7 @@ import 'congestion.dart';
 import 'multiplexer.dart';
 import 'pmtud.dart';
 import 'metrics_observer.dart';
+import 'logging.dart';
 import 'version.dart';
 
 /// Custom error for when a stream creation attempt exceeds the peer's advertised limit.
@@ -260,6 +261,10 @@ class UDPSocket with UDXEventEmitter {
 
     try {
       final udxPacket = UDXPacket.fromBytes(data);
+
+      if (UdxLogging.info) {
+        UdxLogging.infoLog('[DIAG-UDX-RECV] seq=${udxPacket.sequence} frames=${udxPacket.frames.length} from=${fromAddress.address}:$fromPort');
+      }
 
       // --- Path Migration Logic ---
       final pathHasChanged = remoteAddress.address != fromAddress.address || remotePort != fromPort;
@@ -545,6 +550,10 @@ class UDPSocket with UDXEventEmitter {
     if (_closing || _receivedPacketSequences.isEmpty) return;
 
     final sortedSequences = _receivedPacketSequences.toList()..sort();
+
+    if (UdxLogging.info) {
+      UdxLogging.infoLog('[DIAG-UDX-ACK-OUT] seqs=${sortedSequences.length} largest=${sortedSequences.last}');
+    }
     final int largestAcked = sortedSequences.last;
 
     int ackDelayMs = 0;
@@ -635,20 +644,37 @@ class UDPSocket with UDXEventEmitter {
       _bytesSentBeforeValidation += data.length;
     }
     
-    multiplexer.send(data, remoteAddress, remotePort);
+    if (UdxLogging.info) {
+      UdxLogging.infoLog('[DIAG-UDX-SEND] ${data.length}B to=${remoteAddress.address}:$remotePort');
+    }
+
+    try {
+      multiplexer.send(data, remoteAddress, remotePort);
+    } on SocketException catch (e) {
+      emit('error', {'error': e, 'message': 'Send failed: ${e.message}'});
+      close();
+      rethrow;
+    }
   }
 
   /// Called when the peer's address has been validated.
   /// Flushes any packets that were queued due to amplification limits.
   void _onAddressValidated() {
     if (_addressValidated) return;
-    
+
     _addressValidated = true;
     emit('addressValidated');
-    
+
     // Flush all pending packets
     for (final packet in _pendingPackets) {
-      multiplexer.send(packet, remoteAddress, remotePort);
+      try {
+        multiplexer.send(packet, remoteAddress, remotePort);
+      } on SocketException catch (e) {
+        emit('error', {'error': e, 'message': 'Flush failed: ${e.message}'});
+        _pendingPackets.clear();
+        close();
+        return;
+      }
     }
     _pendingPackets.clear();
   }

@@ -207,6 +207,9 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
     if (UdxLogging.verbose) {
       UdxLogging.infoLog('[UDX-STREAM $id] deliverData: ${data.length} bytes, totalBytesRead=$bytesRead');
     }
+    if (UdxLogging.info && data.length <= 128) {
+      UdxLogging.infoLog('[DIAG-UDX-STREAM] id=$id ${data.length}B delivered');
+    }
     if (!_dataController.isClosed) {
       _dataController.add(data);
     }
