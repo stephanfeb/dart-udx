@@ -116,7 +116,25 @@ void main() {
       expect(deserialized.data, equals(data));
       expect(deserialized.isFin, isTrue);
       expect(deserialized.isSyn, isFalse);
-      expect(deserialized.length, 1 + 1 + 2 + data.length);
+      // Type (1) + Flags (1) + Offset (8) + Length (2) + Data
+      expect(deserialized.length, 1 + 1 + 8 + 2 + data.length);
+    });
+
+    test('a STREAM frame round-trips its byte offset', () {
+      // The offset is what the receiver reassembles on, so it has to survive
+      // the wire exactly — including values above 32 bits, which is the whole
+      // reason the field is eight bytes wide rather than four.
+      final data = Uint8List.fromList([9, 8, 7]);
+      for (final offset in [0, 1, 65535, 0xFFFFFFFF, 0x100000000, 0x7FFFFFFFFFFF]) {
+        final frame = StreamFrame(data: data, offset: offset);
+        final bytes = frame.toBytes();
+        final view = ByteData.view(bytes.buffer);
+        final deserialized = Frame.fromBytes(view, 0) as StreamFrame;
+
+        expect(deserialized.offset, equals(offset),
+            reason: 'offset $offset did not survive serialization');
+        expect(deserialized.data, equals(data));
+      }
     });
 
     test('serializes and deserializes a STREAM frame with SYN flag', () {
