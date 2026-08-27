@@ -122,11 +122,26 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
   /// The number of bytes in flight (from connection-level CC)
   int get inflight => _socket?.congestionController.inflight ?? 0;
 
-  /// The local receive window size
+  /// The local receive window size, in bytes. Auto-tuned upward for streams
+  /// that actually move bulk data, capped at [_maxReceiveWindow].
+  ///
+  /// This is a window *size*. What goes on the wire is an absolute offset,
+  /// [_lastAdvertised], computed as bytesConsumed + this window.
   int get receiveWindow => _receiveWindow;
   static const int _initialReceiveWindow = 65536;
+  static const int _maxReceiveWindow = 4 * 1024 * 1024;
   int _receiveWindow = _initialReceiveWindow;
-  int _bytesReceivedSinceWindowUpdate = 0;
+
+  /// Cumulative bytes handed to the application, and the absolute offset last
+  /// advertised to the peer.
+  ///
+  /// Flow control is anchored to *consumption*, not receipt. Advertising on
+  /// receipt grants credit whether or not anyone is reading, which is no
+  /// back-pressure at all: a fast sender against a slow reader grows this
+  /// stream's buffer without bound. The peer's matching accounting lives in
+  /// go-udx's StreamFlowController.
+  int _bytesConsumed = 0;
+  int _lastAdvertised = _initialReceiveWindow;
 
   /// The remote peer's receive window size
   int get remoteReceiveWindow => _remoteReceiveWindow;
@@ -218,29 +233,49 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
     if (_socket != null) {
       _socket!.onStreamDataProcessed(data.length);
     }
-    // Send stream-level window update when 25% of the INITIAL window has been
-    // received since the last update. Using the initial window size as the
-    // threshold (not the current growing window) prevents a flow control
-    // deadlock: as _receiveWindow grows, threshold = _receiveWindow/4 also
-    // grows, but the increment between updates stays roughly constant. When
-    // the increment becomes smaller than the threshold, the peer blocks
-    // waiting for a window update that never comes.
-    _bytesReceivedSinceWindowUpdate += data.length;
-    if (_bytesReceivedSinceWindowUpdate > _initialReceiveWindow ~/ 4) {
-      _receiveWindow += _bytesReceivedSinceWindowUpdate;
-      _bytesReceivedSinceWindowUpdate = 0;
-      if (_connected && remoteId != null && _socket != null && !_socket!.closing) {
-        _socket!.sendStreamPacket(
-          remoteId!,
-          id,
-          // _receiveWindow is an absolute offset and grows without bound; the
-          // frame field is a uint32, so send it modulo 2^32. The peer
-          // reconstructs the full value (see deliverWindowUpdate). Masking
-          // explicitly rather than relying on setUint32 truncation.
-          [WindowUpdateFrame(windowSize: _receiveWindow & 0xFFFFFFFF)],
-          trackForRetransmit: false,
-        );
-      }
+    // No window update here. Receipt only buffers; the window reopens in
+    // _onDataConsumed, when the application actually takes the bytes.
+  }
+
+  /// Records bytes handed to the application and reopens the receive window.
+  ///
+  /// An update is sent once the peer's remaining credit under our last
+  /// advertisement falls below half the window. That threshold is stable under
+  /// growth: each update grants at least half a window of fresh credit and the
+  /// next threshold is measured against the same window, so the grant can never
+  /// fall behind the threshold.
+  ///
+  /// The earlier scheme granted roughly a quarter window per update while
+  /// raising the trigger along with the window, which diverged and stalled the
+  /// stream outright — the deadlock this class previously worked around by
+  /// pinning the trigger to the initial window size.
+  void _onDataConsumed(int n) {
+    _bytesConsumed += n;
+
+    if (_lastAdvertised - _bytesConsumed >= _receiveWindow ~/ 2) return;
+
+    // Auto-tune: a stream that keeps draining its window earns a bigger one.
+    // Because an update only fires after half a window is drained, a stream has
+    // to genuinely move this much data before reaching the cap.
+    if (_receiveWindow < _maxReceiveWindow) {
+      _receiveWindow *= 2;
+      if (_receiveWindow > _maxReceiveWindow) _receiveWindow = _maxReceiveWindow;
+    }
+
+    final limit = _bytesConsumed + _receiveWindow;
+    if (limit > _lastAdvertised) _lastAdvertised = limit;
+
+    if (_connected && remoteId != null && _socket != null && !_socket!.closing) {
+      _socket!.sendStreamPacket(
+        remoteId!,
+        id,
+        // The offset grows without bound; the frame field is a uint32, so send
+        // it modulo 2^32 and let the peer reconstruct the full value (see
+        // deliverWindowUpdate). Masking explicitly rather than relying on
+        // setUint32 truncation.
+        [WindowUpdateFrame(windowSize: _lastAdvertised & 0xFFFFFFFF)],
+        trackForRetransmit: false,
+      );
     }
   }
 
@@ -451,14 +486,22 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
   @override
   Future<void> get done => _dataController.done;
 
+  /// Sets the receive window *size* and re-advertises.
+  ///
+  /// Note this cannot revoke credit already granted: what goes on the wire is
+  /// bytesConsumed + newSize, and the peer applies offsets monotonically. A
+  /// size smaller than the outstanding grant simply takes effect once the peer
+  /// catches up to the offset it already holds.
   void setWindow(int newSize) {
     _receiveWindow = newSize;
+    final limit = _bytesConsumed + _receiveWindow;
+    if (limit > _lastAdvertised) _lastAdvertised = limit;
     if (_connected && remoteId != null && _socket != null && !_socket!.closing) {
       _socket!.sendStreamPacket(
         remoteId!,
         id,
-        // See _deliverDataInternal: sent modulo 2^32, reconstructed by the peer.
-        [WindowUpdateFrame(windowSize: _receiveWindow & 0xFFFFFFFF)],
+        // See _onDataConsumed: sent modulo 2^32, reconstructed by the peer.
+        [WindowUpdateFrame(windowSize: _lastAdvertised & 0xFFFFFFFF)],
         trackForRetransmit: false,
       );
     }
@@ -572,7 +615,20 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
     }
   }
 
-  Stream<Uint8List> get data => _dataController.stream;
+  /// Data received on this stream.
+  ///
+  /// Bytes are counted as consumed at the moment they are delivered to the
+  /// subscriber, which is what drives the receive window. If nobody is
+  /// listening, or the subscription is paused, events sit in the controller,
+  /// nothing is counted, the advertised offset stops advancing and the sender
+  /// stalls — which is the back-pressure. Cached because _dataController is
+  /// single-subscription, so the mapped view must be a single stable object.
+  Stream<Uint8List> get data => _consumedData ??=
+      _dataController.stream.map((chunk) {
+        _onDataConsumed(chunk.length);
+        return chunk;
+      });
+  Stream<Uint8List>? _consumedData;
   Stream<void> get end => on('end').map((_) => null);
   Stream<void> get drain => on('drain').map((_) => null);
   Stream<int> get ack => on('ack').map((event) => event.data as int);
