@@ -167,7 +167,9 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
       final socket = _socket;
       if (socket == null) return;
       final connWindowAvailable = socket.getAvailableConnectionSendWindow();
-      if (inflight < cwnd && inflight < _remoteReceiveWindow && connWindowAvailable > 0) {
+      if (inflight < cwnd &&
+          bytesWritten < _remoteReceiveWindow &&
+          connWindowAvailable > 0) {
         _drain!.complete();
       }
     }
@@ -231,7 +233,11 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
         _socket!.sendStreamPacket(
           remoteId!,
           id,
-          [WindowUpdateFrame(windowSize: _receiveWindow)],
+          // _receiveWindow is an absolute offset and grows without bound; the
+          // frame field is a uint32, so send it modulo 2^32. The peer
+          // reconstructs the full value (see deliverWindowUpdate). Masking
+          // explicitly rather than relying on setUint32 truncation.
+          [WindowUpdateFrame(windowSize: _receiveWindow & 0xFFFFFFFF)],
           trackForRetransmit: false,
         );
       }
@@ -266,11 +272,38 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
   }
 
   /// Delivers WINDOW_UPDATE from the socket.
+  ///
+  /// [windowSize] is an ABSOLUTE OFFSET: the highest cumulative byte position
+  /// the peer will accept on this stream, not a count of bytes that may be
+  /// outstanding. Both implementations already advertise it this way — see
+  /// _deliverDataInternal below, which sends _receiveWindow as
+  /// initialWindow + cumulative bytes received.
+  ///
+  /// The value arrives modulo 2^32 because the frame field is a uint32, so
+  /// recover the full offset by choosing the candidate nearest the limit we
+  /// already hold (RFC 1982 serial-number arithmetic). This is unambiguous
+  /// because the true offset is always within one receive window of the
+  /// current limit, and the window is orders of magnitude below 2^32.
   void deliverWindowUpdate(int windowSize) {
-    _remoteReceiveWindow = windowSize;
+    const modulus = 1 << 32;
+    final base = _remoteReceiveWindow & ~(modulus - 1);
+    var candidate = base + windowSize;
+    for (final alt in [candidate - modulus, candidate + modulus]) {
+      if ((alt - _remoteReceiveWindow).abs() <
+          (candidate - _remoteReceiveWindow).abs()) {
+        candidate = alt;
+      }
+    }
+    // Monotonic: a stale or reordered frame must never revoke granted credit.
+    if (candidate > _remoteReceiveWindow) {
+      _remoteReceiveWindow = candidate;
+    }
+
     if (_drain != null && !_drain!.isCompleted) {
       final connWindowAvailable = _socket?.getAvailableConnectionSendWindow() ?? 0;
-      if (inflight < cwnd && inflight < _remoteReceiveWindow && connWindowAvailable > 0) {
+      if (inflight < cwnd &&
+          bytesWritten < _remoteReceiveWindow &&
+          connWindowAvailable > 0) {
         _drain!.complete();
       }
     }
@@ -341,7 +374,15 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
 
     void checkAndSend() {
       final connWindowAvailable = socket.getAvailableConnectionSendWindow();
-      if (inflight < cwnd && inflight < _remoteReceiveWindow && connWindowAvailable > 0) {
+      // bytesWritten is this stream's cumulative sent total, which is what the
+      // peer's advertised offset bounds. Comparing `inflight` here instead
+      // stopped binding as soon as the offset outgrew one window's worth of
+      // outstanding bytes, leaving cwnd as the only limit — and `inflight` is
+      // the connection-level counter, so it was the wrong quantity for a
+      // per-stream limit regardless.
+      if (inflight < cwnd &&
+          bytesWritten + fragment.length <= _remoteReceiveWindow &&
+          connWindowAvailable > 0) {
         if (!completer.isCompleted) {
           completer.complete();
         }
@@ -416,7 +457,8 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
       _socket!.sendStreamPacket(
         remoteId!,
         id,
-        [WindowUpdateFrame(windowSize: _receiveWindow)],
+        // See _deliverDataInternal: sent modulo 2^32, reconstructed by the peer.
+        [WindowUpdateFrame(windowSize: _receiveWindow & 0xFFFFFFFF)],
         trackForRetransmit: false,
       );
     }

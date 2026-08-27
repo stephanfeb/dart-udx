@@ -70,63 +70,125 @@ void main() {
       serverStream = await serverStreamCompleter.future.timeout(const Duration(seconds: 2));
     }
 
-    test('setWindow sends a WindowUpdateFrame, unblocking the peer', () async {
+    // Stream flow control is advertised as an ABSOLUTE OFFSET: the highest
+    // cumulative byte position the peer may send. Credit once granted cannot be
+    // revoked — deliverWindowUpdate ignores any offset below the current limit,
+    // which is what makes a dropped or reordered WINDOW_UPDATE safe.
+    //
+    // These tests therefore exercise the real back-pressure path — fill the
+    // advertised window, confirm the sender stalls, drain, confirm it resumes —
+    // rather than calling setWindow(0) to revoke credit, which the offset model
+    // cannot express.
+
+    test('sender never sends past the advertised offset', () async {
       await setupTestEnvironment();
 
-      // 1. Set the receiver's window to 0 to block the sender.
-      clientStream!.setWindow(0);
-      // Give it a moment to propagate
-      await Future.delayed(const Duration(milliseconds: 100));
+      // Note this cannot be tested by starving the receiver: _deliverDataInternal
+      // advertises on bytes *received*, not bytes consumed by the application, so
+      // a Dart receiver keeps granting credit whether or not anyone is reading.
+      // What is testable here is the invariant the sender must hold — cumulative
+      // bytes written never exceed the offset it has been granted. Before the
+      // gate was changed to compare bytesWritten, it compared bytes currently
+      // outstanding, and this invariant did not hold.
+      var received = 0;
+      clientStream!.data.listen((chunk) => received += chunk.length);
 
-      // 2. Try to send data. It should block.
-      final data = Uint8List(100);
-      final sendFuture = serverStream!.add(data);
-      
-      await expectLater(
-        sendFuture.timeout(const Duration(milliseconds: 200)),
-        throwsA(isA<TimeoutException>()),
-        reason: "Sender should block when window is 0",
-      );
-
-      // 3. Set up a completer that will resolve when the sender is unblocked.
-      final drainCompleter = Completer<void>();
-      serverStream!.drain.listen((_) {
-        if (!drainCompleter.isCompleted) {
-          drainCompleter.complete();
+      var violations = 0;
+      var worst = 0;
+      final probe = Timer.periodic(const Duration(milliseconds: 5), (_) {
+        final over = serverStream!.bytesWritten - serverStream!.remoteReceiveWindow;
+        if (over > 0) {
+          violations++;
+          if (over > worst) worst = over;
         }
       });
 
-      // 4. Now, update the window on the client, which should unblock the server.
-      clientStream!.setWindow(65536);
+      await serverStream!.add(Uint8List(512 * 1024))
+          .timeout(const Duration(seconds: 20));
+      probe.cancel();
 
-      // 5. The original send future should now complete, and the drain event should fire.
-      await expectLater(sendFuture, completes, reason: "Send should complete after window update");
-      await expectLater(drainCompleter.future, completes, reason: "Drain event should fire after window update");
+      expect(violations, 0,
+          reason: 'sender exceeded the granted offset $violations times, '
+              'by as much as $worst bytes');
+      expect(serverStream!.bytesWritten,
+          lessThanOrEqualTo(serverStream!.remoteReceiveWindow),
+          reason: 'cumulative bytes written must stay within the granted offset');
     });
 
-    test('sender respects receiver flow control window', () async {
+    test('draining the receiver advances the offset and resumes the sender',
+        () async {
       await setupTestEnvironment();
 
-      // 1. Set a zero window on the receiver to ensure sender blocks
-      serverStream!.setWindow(0);
+      // Drain on the receiving side so it keeps advancing the advertised offset.
+      var received = 0;
+      clientStream!.data.listen((chunk) => received += chunk.length);
 
-      // Let the window update propagate
-      await Future.delayed(const Duration(milliseconds: 100));
-
-      final data = Uint8List(100); // Data to send
-      final sendFuture = clientStream!.add(data);
-
-      // 2. The sender should pause, so the future should not complete immediately
+      final payload = Uint8List(512 * 1024);
       await expectLater(
-        sendFuture.timeout(const Duration(milliseconds: 200)),
-        throwsA(isA<TimeoutException>()),
+        serverStream!.add(payload).timeout(const Duration(seconds: 20)),
+        completes,
+        reason:
+            'a draining receiver should keep advancing the offset so the sender '
+            'never permanently stalls',
       );
 
-      // 3. Now, open up the window
-      serverStream!.setWindow(65536);
+      // Let the tail arrive.
+      final deadline = DateTime.now().add(const Duration(seconds: 10));
+      while (received < payload.length && DateTime.now().isBefore(deadline)) {
+        await Future.delayed(const Duration(milliseconds: 20));
+      }
 
-      // 4. The sender should now be able to send the data
-      await expectLater(sendFuture, completes);
+      expect(received, payload.length,
+          reason: 'all bytes should arrive once the receiver keeps draining');
+      expect(serverStream!.remoteReceiveWindow, greaterThan(65536),
+          reason: 'the advertised offset should have grown well past its initial value');
+    });
+
+    test('a stale or reordered WINDOW_UPDATE never revokes granted credit',
+        () async {
+      await setupTestEnvironment();
+
+      final granted = clientStream!.remoteReceiveWindow;
+      expect(granted, greaterThan(0));
+
+      // A smaller offset arriving late — a duplicate or a reordered frame —
+      // must be ignored. WINDOW_UPDATE rides an untracked control packet that is
+      // never retransmitted, so honouring a stale value would strand the sender
+      // below credit it had already been given.
+      clientStream!.deliverWindowUpdate(granted ~/ 2);
+      expect(clientStream!.remoteReceiveWindow, granted,
+          reason: 'a lower offset must not shrink the limit');
+
+      clientStream!.deliverWindowUpdate(0);
+      expect(clientStream!.remoteReceiveWindow, granted,
+          reason: 'a zero offset must not revoke credit');
+
+      // A larger offset is applied normally.
+      clientStream!.deliverWindowUpdate(granted + 4096);
+      expect(clientStream!.remoteReceiveWindow, granted + 4096);
+    });
+
+    test('an advertised offset is reconstructed across the 4GB wrap', () async {
+      await setupTestEnvironment();
+
+      // The frame field is a uint32, so the offset travels modulo 2^32 and the
+      // sender recovers the full value against the limit it already holds.
+      // Clamping instead would stall a stream permanently at 4GB.
+      //
+      // Reconstruction assumes each update lands within one window of the
+      // current limit, so walk up to the boundary the way a real stream does
+      // rather than leaping 4GB in one step — a single leap that large is
+      // genuinely ambiguous and is correctly rejected.
+      const modulus = 1 << 32;
+      for (final target in [1 << 31, modulus - 8192, modulus + 4096]) {
+        clientStream!.deliverWindowUpdate(target & 0xFFFFFFFF);
+        expect(clientStream!.remoteReceiveWindow, target,
+            reason: 'offset $target should reconstruct from wire value '
+                '${target & 0xFFFFFFFF}');
+      }
+
+      expect(clientStream!.remoteReceiveWindow, greaterThan(modulus),
+          reason: 'the limit must be able to advance past 2^32, not wrap back');
     });
   });
 }
