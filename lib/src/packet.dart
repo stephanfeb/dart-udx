@@ -6,6 +6,7 @@ import 'package:collection/collection.dart';
 
 import 'cid.dart';
 import 'congestion.dart';
+import 'version.dart';
 
 // --- Frame Definitions ---
 
@@ -249,13 +250,32 @@ class AckFrame extends Frame {
 class StreamFrame extends Frame {
   final bool isFin;
   final bool isSyn;
+
+  /// Position of [data] within this stream's own byte sequence.
+  ///
+  /// This is what the receiver reassembles on. Delivery order used to come from
+  /// the packet's sequence number, which is allocated per connection, so a gap
+  /// anywhere stalled every stream sharing that connection rather than only the
+  /// one actually missing bytes. Addressing the bytes directly decouples them.
+  ///
+  /// On a FIN the offset is the stream's final size, so a FIN that overtakes
+  /// data still in flight does not truncate the tail.
+  final int offset;
+
   final Uint8List data;
 
-  StreamFrame({this.isFin = false, this.isSyn = false, required this.data}) : super(FrameType.stream);
+  StreamFrame({
+    this.isFin = false,
+    this.isSyn = false,
+    this.offset = 0,
+    required this.data,
+  }) : super(FrameType.stream);
 
-  // Type (1) + Flags (1) + Length (2) + Data (variable)
+  /// Type (1) + Flags (1) + Offset (8) + Length (2) + Data (variable)
+  static const int headerLength = 12;
+
   @override
-  int get length => 1 + 1 + 2 + data.length;
+  int get length => headerLength + data.length;
 
   @override
   Uint8List toBytes() {
@@ -266,8 +286,9 @@ class StreamFrame extends Frame {
     if (isFin) flags |= 0x01;
     if (isSyn) flags |= 0x02;
     view.setUint8(1, flags);
-    view.setUint16(2, data.length, Endian.big);
-    buffer.setAll(4, data);
+    view.setUint64(2, offset, Endian.big);
+    view.setUint16(10, data.length, Endian.big);
+    buffer.setAll(headerLength, data);
     return buffer;
   }
 
@@ -275,9 +296,12 @@ class StreamFrame extends Frame {
     final flags = view.getUint8(offset + 1);
     final isFin = (flags & 0x01) != 0;
     final isSyn = (flags & 0x02) != 0;
-    final dataLength = view.getUint16(offset + 2, Endian.big);
-    final data = Uint8List.view(view.buffer, view.offsetInBytes + offset + 4, dataLength);
-    return StreamFrame(isFin: isFin, isSyn: isSyn, data: data);
+    final streamOffset = view.getUint64(offset + 2, Endian.big);
+    final dataLength = view.getUint16(offset + 10, Endian.big);
+    final data = Uint8List.view(
+        view.buffer, view.offsetInBytes + offset + headerLength, dataLength);
+    return StreamFrame(
+        isFin: isFin, isSyn: isSyn, offset: streamOffset, data: data);
   }
 }
 
@@ -948,8 +972,13 @@ class UDXPacket {
   /// Whether the packet has been acknowledged
   bool isAcked = false;
 
-  /// The current UDX protocol version
-  static const int currentVersion = 0x00000002;
+  /// The current UDX protocol version.
+  ///
+  /// Aliased to [UdxVersion.current] rather than repeated. This was a second
+  /// hardcoded copy of the version number, and the two silently disagreed the
+  /// moment one of them was bumped: every outgoing packet still claimed v2
+  /// while the receiver required v3, so the handshake never completed.
+  static const int currentVersion = UdxVersion.current;
 
   /// Creates a new UDX packet
   UDXPacket({

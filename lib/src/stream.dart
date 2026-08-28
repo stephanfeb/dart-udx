@@ -132,6 +132,11 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
   static const int _maxReceiveWindow = 4 * 1024 * 1024;
   int _receiveWindow = _initialReceiveWindow;
 
+  /// Backstop on bytes held out of order. Flow control is what actually bounds
+  /// the buffer; this only catches a peer ignoring its limit, so it sits above
+  /// the largest window rather than at it.
+  static const int _maxOutOfOrderBytes = 2 * _maxReceiveWindow;
+
   /// Cumulative bytes handed to the application, and the absolute offset last
   /// advertised to the peer.
   ///
@@ -217,24 +222,117 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
 
   // --- Data delivery methods (called by UDPSocket) ---
 
-  /// Delivers data from the socket's connection-level receive ordering.
-  void deliverData(Uint8List data) {
+  /// Bytes that arrived ahead of a gap, keyed by their offset.
+  final Map<int, Uint8List> _recvOOO = {};
+
+  /// Total bytes handed to the application so far, and therefore the offset the
+  /// next contiguous chunk must start at.
+  int _recvOffset = 0;
+
+  /// Bytes currently held in [_recvOOO], so the buffer can be bounded.
+  int _oooBytes = 0;
+
+  /// Where the stream ends, once the peer has told us. A FIN can overtake data
+  /// still in flight, so arrival is not the same as completion.
+  int? _finalSize;
+
+  /// Delivers a chunk at its offset in the stream, releasing whatever has
+  /// become contiguous.
+  ///
+  /// Ordering is per stream, on these offsets. It used to happen at the socket,
+  /// on the connection's packet sequence number, which meant a gap belonging to
+  /// one stream stalled delivery on all of them.
+  void deliverData(int offset, Uint8List data) {
     if (data.isEmpty) return;
+
+    final end = offset + data.length;
+
+    // Already delivered. A retransmission of bytes the application has seen
+    // arrives here, and must not be handed over twice — that corrupts the byte
+    // stream, and the Noise layer above fails its MAC rather than merely
+    // reading duplicates.
+    if (end <= _recvOffset) return;
+
+    // Partly delivered: keep only the tail that is new.
+    if (offset < _recvOffset) {
+      data = Uint8List.sublistView(data, _recvOffset - offset);
+      offset = _recvOffset;
+    }
+
+    if (offset > _recvOffset) {
+      // Ahead of a gap. Hold it until the missing bytes arrive.
+      //
+      // Flow control is the real bound here; the backstop below only catches a
+      // peer ignoring its limit, which is why it sits above the largest window
+      // rather than at it. Discarding is never safe: the packet was
+      // acknowledged on arrival, so the sender has already stopped tracking it
+      // and will never send those bytes again, stranding the stream at this
+      // offset for good. A backstop equal to the maximum window fires during
+      // legitimate transfers, because a stream whose window has grown to the
+      // maximum can have that whole window sitting out of order.
+      if (_recvOOO.containsKey(offset)) return;
+      if (_oooBytes + data.length > _maxOutOfOrderBytes) {
+        addError(StreamResetError(2)); // flow control violation
+        _close(isReset: true);
+        return;
+      }
+      _recvOOO[offset] = Uint8List.fromList(data);
+      _oooBytes += data.length;
+      _accountReceived(data.length);
+      return;
+    }
+
+    _emitContiguous(data);
+
+    // Release anything that was waiting on the bytes just delivered.
+    while (true) {
+      final next = _recvOOO.remove(_recvOffset);
+      if (next == null) break;
+      _oooBytes -= next.length;
+      _emitContiguous(next, alreadyAccounted: true);
+    }
+
+    _checkFinished();
+  }
+
+  /// Hands a contiguous chunk to the application and advances the offset.
+  void _emitContiguous(Uint8List data, {bool alreadyAccounted = false}) {
+    _recvOffset += data.length;
     bytesRead += data.length;
     if (UdxLogging.verbose) {
-      UdxLogging.infoLog('[UDX-STREAM $id] deliverData: ${data.length} bytes, totalBytesRead=$bytesRead');
-    }
-    if (UdxLogging.info && data.length <= 128) {
-      UdxLogging.infoLog('[DIAG-UDX-STREAM] id=$id ${data.length}B delivered');
+      UdxLogging.infoLog(
+          '[UDX-STREAM $id] deliverData: ${data.length} bytes, totalBytesRead=$bytesRead');
     }
     if (!_dataController.isClosed) {
       _dataController.add(data);
     }
+    if (!alreadyAccounted) _accountReceived(data.length);
+  }
+
+  /// Records bytes as received for connection-level accounting. Bytes waiting
+  /// out of order count too — they are buffered either way.
+  void _accountReceived(int n) {
     if (_socket != null) {
-      _socket!.onStreamDataProcessed(data.length);
+      _socket!.onStreamDataProcessed(n);
     }
     // No window update here. Receipt only buffers; the window reopens in
     // _onDataConsumed, when the application actually takes the bytes.
+  }
+
+  /// Completes the stream once every byte up to the final size has arrived.
+  void _checkFinished() {
+    final finalSize = _finalSize;
+    if (finalSize == null || _remoteWriteClosed || _recvOffset < finalSize) {
+      return;
+    }
+    _remoteWriteClosed = true;
+    if (!_dataController.isClosed) {
+      _dataController.close();
+    }
+    emit('end');
+    if (_localWriteClosed) {
+      _close();
+    }
   }
 
   /// Records bytes handed to the application and reopens the receive window.
@@ -279,16 +377,16 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
     }
   }
 
-  /// Delivers FIN from the socket.
-  void deliverFin() {
-    _remoteWriteClosed = true;
-    if (!_dataController.isClosed) {
-      _dataController.close();
-    }
-    emit('end');
-    if (_localWriteClosed) {
-      _close();
-    }
+  /// Records where the stream ends. [finalSize] is the offset one past the
+  /// peer's last byte.
+  ///
+  /// A FIN is a flag on a frame that can overtake data still in flight, so
+  /// closing the stream on its arrival would silently truncate whatever had not
+  /// caught up. The stream finishes when the delivered bytes reach [finalSize],
+  /// which may be now or may be several packets away.
+  void deliverFin(int finalSize) {
+    _finalSize = finalSize;
+    _checkFinished();
   }
 
   /// Delivers RESET from the socket.
@@ -459,12 +557,15 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
     }
     if (currentSocket.closing) return;
 
-    // Send via socket's connection-level packet manager
+    // Send via socket's connection-level packet manager. The fragment's
+    // position in the stream is where the write had reached before it, which is
+    // what the peer reassembles on.
+    final fragmentOffset = bytesWritten;
     bytesWritten += fragment.length;
     currentSocket.sendStreamPacket(
       remoteId!,
       id,
-      [StreamFrame(data: fragment)],
+      [StreamFrame(data: fragment, offset: fragmentOffset)],
     );
   }
 
@@ -560,7 +661,11 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
     _socket!.sendStreamPacket(
       remoteId!,
       id,
-      [StreamFrame(data: Uint8List(0), isFin: true)],
+      // A FIN carries no data, so its offset is this stream's final size. The
+      // peer needs that to know when it has everything: a FIN can overtake data
+      // still in flight, and treating its arrival as the end would truncate the
+      // tail.
+      [StreamFrame(data: Uint8List(0), isFin: true, offset: bytesWritten)],
     );
 
     // Small delay to ensure FIN is sent
@@ -587,7 +692,11 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
         _socket!.sendStreamPacket(
           remoteId!,
           id,
-          [StreamFrame(data: Uint8List(0), isFin: true)],
+          // A FIN carries no data, so its offset is this stream's final size. The
+      // peer needs that to know when it has everything: a FIN can overtake data
+      // still in flight, and treating its arrival as the end would truncate the
+      // tail.
+      [StreamFrame(data: Uint8List(0), isFin: true, offset: bytesWritten)],
         );
         await Future.delayed(Duration(milliseconds: 50));
       } catch (e) {

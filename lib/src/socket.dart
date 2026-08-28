@@ -78,12 +78,6 @@ class UDPSocket with UDXEventEmitter {
   /// Connection-level congestion controller.
   late final CongestionController _congestionController;
 
-  /// Connection-level receive ordering: next expected sequence number.
-  int _nextExpectedSeq = 0;
-
-  /// Connection-level receive buffer for out-of-order packets.
-  final Map<int, UDXPacket> _connectionReceiveBuffer = {};
-
   /// Tracks received packet sequences for ACK generation.
   final Set<int> _receivedPacketSequences = {};
 
@@ -262,6 +256,12 @@ class UDPSocket with UDXEventEmitter {
     try {
       final udxPacket = UDXPacket.fromBytes(data);
 
+      // v3 moved the STREAM frame's data length behind an eight-byte offset, so
+      // an older peer's frame parses without error into nonsense. Drop anything
+      // that is not the current version: a mismatch has to look like an
+      // unreachable peer, which is diagnosable, rather than corrupt data.
+      if (udxPacket.version != UdxVersion.current) return;
+
       if (UdxLogging.info) {
         UdxLogging.infoLog('[DIAG-UDX-RECV] seq=${udxPacket.sequence} frames=${udxPacket.frames.length} from=${fromAddress.address}:$fromPort');
       }
@@ -329,51 +329,30 @@ class UDPSocket with UDXEventEmitter {
         }
       }
 
-      // --- Connection-level receive ordering ---
-      bool needsAck = false;
-      bool containsAckElicitingFrames = udxPacket.frames.any((f) => f is StreamFrame || f is PingFrame);
-      bool hasStreamData = udxPacket.frames.any((f) => f is StreamFrame && (f.data.isNotEmpty || f.isFin || f.isSyn));
+      // Every frame is handled on arrival. Nothing waits for an earlier packet:
+      // STREAM frames carry their own byte offset, so each stream places its
+      // own bytes and is held up only by its own gaps.
+      //
+      // This used to reorder whole packets here, on the connection's sequence
+      // number, before any stream saw them. That made a gap anywhere stall
+      // every stream on the connection — one lossy stream held up all its
+      // siblings — and it was the only thing keeping the byte stream contiguous,
+      // so it could not simply be removed. Offsets replace it.
+      bool containsAckElicitingFrames =
+          udxPacket.frames.any((f) => f is StreamFrame || f is PingFrame);
+      bool hasStreamData = udxPacket.frames
+          .any((f) => f is StreamFrame && (f.data.isNotEmpty || f.isFin || f.isSyn));
 
-      // Control-only packets (ACKs, window updates) are processed immediately
-      // without advancing _nextExpectedSeq. They don't carry ordered stream
-      // data, so they must not consume sequence numbers. The Go UDX sends
-      // control packets with seq=0 to avoid creating sequence gaps, but even
-      // if a peer uses non-zero sequences for controls, we handle it safely.
-      if (!hasStreamData) {
-        _processPacketFrames(udxPacket, fromAddress, fromPort);
-        if (containsAckElicitingFrames) {
-          _receivedPacketSequences.add(udxPacket.sequence);
-          needsAck = true;
-        }
-      } else {
-        bool packetIsSequential = (udxPacket.sequence == _nextExpectedSeq);
-
-        if (packetIsSequential) {
-          _receivedPacketSequences.add(udxPacket.sequence);
-          _largestAckedPacketArrivalTime = DateTime.now();
-
-          _processPacketFrames(udxPacket, fromAddress, fromPort);
-          _nextExpectedSeq++;
-          _processConnectionReceiveBuffer(fromAddress, fromPort);
-
-          if (containsAckElicitingFrames) needsAck = true;
-        } else if (udxPacket.sequence > _nextExpectedSeq) {
-          // Future data packet — buffer for later
-          _connectionReceiveBuffer[udxPacket.sequence] = udxPacket;
-          if (containsAckElicitingFrames) {
-            _receivedPacketSequences.add(udxPacket.sequence);
-            needsAck = true;
-          }
-        } else {
-          // Old/duplicate data packet — still ACK
-          if (containsAckElicitingFrames) {
-            _receivedPacketSequences.add(udxPacket.sequence);
-            needsAck = true;
-          }
-        }
+      if (hasStreamData) {
+        _largestAckedPacketArrivalTime = DateTime.now();
       }
+      _processPacketFrames(udxPacket, fromAddress, fromPort);
 
-      if (needsAck) {
+      if (containsAckElicitingFrames) {
+        // ACKs reflect receipt, not delivery. A packet whose bytes are waiting
+        // on an earlier gap has still arrived, and saying so lets the peer
+        // retransmit only what is genuinely missing.
+        _receivedPacketSequences.add(udxPacket.sequence);
         _sendConnectionAck();
       }
     } catch (e) {
@@ -391,11 +370,39 @@ class UDPSocket with UDXEventEmitter {
         _connectionBytesReceived += frame.data.length;
         _checkAndSendLocalMaxDataUpdate();
 
-        // Route to existing stream or create new one for SYN
+        // Route to an existing stream, or open one on first reference.
         UDXStream? stream = _registeredStreams[targetStreamId];
 
-        if (stream == null && frame.isSyn && remoteStreamId != 0) {
-          // Incoming stream via SYN
+        // Fall back to matching on the sender's own stream id. A peer that has
+        // not yet learned our local id addresses its first packets to 0, so the
+        // same stream can arrive under two different destination ids; without
+        // this the second one opens a duplicate stream.
+        if (stream == null && remoteStreamId != 0) {
+          for (final candidate in _registeredStreams.values) {
+            if (candidate.remoteId == remoteStreamId) {
+              stream = candidate;
+              break;
+            }
+          }
+        }
+
+        if (stream == null &&
+            remoteStreamId != 0 &&
+            (frame.isSyn || frame.data.isNotEmpty)) {
+          // Data opens the stream too, not just SYN.
+          //
+          // Requiring SYN was safe only while the socket reordered packets
+          // before delivery, which guaranteed the SYN — the lowest sequence
+          // number — arrived first. Now that frames are handled on arrival a
+          // reordered data packet can beat it, and there would be nothing to
+          // attach the bytes to: they would be dropped despite having been
+          // acknowledged, so the peer would never re-send them and the stream
+          // would stall at that offset forever.
+          //
+          // A bare FIN or RESET is deliberately not enough. It carries nothing
+          // to deliver, so conjuring a stream for one only invents a stream the
+          // application never had — which is exactly what a FIN arriving for an
+          // already-closed stream would do.
           final currentIncomingStreams = _registeredStreams.values.where((s) => !s.isInitiator).length;
           if (currentIncomingStreams >= _localMaxStreams) {
             // Reject
@@ -422,30 +429,20 @@ class UDPSocket with UDXEventEmitter {
 
         if (stream == null) continue;
 
-        // Deliver data
+        // Deliver data at its offset; the stream orders its own bytes.
         if (frame.data.isNotEmpty) {
-          stream.deliverData(frame.data);
+          stream.deliverData(frame.offset, frame.data);
         }
         if (frame.isFin) {
-          stream.deliverFin();
+          // The stream ends one past this frame's last byte, which is the
+          // frame's own offset when the FIN carries no data of its own.
+          stream.deliverFin(frame.offset + frame.data.length);
         }
         if (frame.isSyn && stream.remoteId == null) {
           // Set the remote ID from the SYN packet
           stream.remoteId = remoteStreamId;
         }
       }
-    }
-  }
-
-  /// Processes the connection-level receive buffer for sequential packets.
-  void _processConnectionReceiveBuffer(InternetAddress fromAddress, int fromPort) {
-    while (_connectionReceiveBuffer.containsKey(_nextExpectedSeq)) {
-      final bufferedPacket = _connectionReceiveBuffer.remove(_nextExpectedSeq)!;
-      _receivedPacketSequences.add(bufferedPacket.sequence);
-      _largestAckedPacketArrivalTime = DateTime.now();
-
-      _processPacketFrames(bufferedPacket, fromAddress, fromPort);
-      _nextExpectedSeq++;
     }
   }
 

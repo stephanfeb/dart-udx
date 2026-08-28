@@ -10,11 +10,25 @@ class UdxVersion {
   /// Version 2 - Variable-length CIDs, enhanced QUIC compliance
   static const int v2 = 0x00000002;
 
-  /// The current version used by this implementation
-  static const int current = v2;
+  /// Version 3 - STREAM frames carry a byte offset, and are reassembled per
+  /// stream rather than in connection sequence order.
+  ///
+  /// Not compatible with v2. The eight offset bytes sit where a v2 parser
+  /// expects the data length, so a v2 peer does not fail on a v3 frame — it
+  /// reads a plausible wrong length and hands nonsense to the application.
+  /// Packets carrying an unsupported version are therefore dropped rather than
+  /// parsed; a version mismatch has to look like an unreachable peer, not
+  /// corruption.
+  static const int v3 = 0x00000003;
 
-  /// List of all supported versions (in preference order)
-  static const List<int> supportedVersions = [v2, v1];
+  /// The current version used by this implementation
+  static const int current = v3;
+
+  /// List of all supported versions (in preference order).
+  ///
+  /// v1 and v2 remain listed for version negotiation, which reports what this
+  /// build could speak. They are not accepted on the data path.
+  static const List<int> supportedVersions = [v3, v2, v1];
 
   /// Checks if a version is supported
   static bool isSupported(int version) {
