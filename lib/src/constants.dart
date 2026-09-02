@@ -136,16 +136,8 @@ const int statelessResetTokenLength = 16;
 /// Minimum packet size for stateless reset
 const int minStatelessResetPacketSize = 39;
 
-// =============================================================================
-// Version Numbers
-// =============================================================================
-
-/// UDX Protocol Version 1 (original with fixed 8-byte CIDs)
-const int udxVersionV1 = 0x00000001;
-
-/// UDX Protocol Version 2 (variable CIDs, enhanced QUIC compliance)
-const int udxVersionV2 = 0x00000002;
-
-/// Current UDX protocol version
-const int udxVersionCurrent = udxVersionV2;
+// Version numbers are defined once, canonically, in `UdxVersion` (version.dart).
+// A second copy lived here and had drifted to v2 while the wire moved to v3,
+// which is exactly the kind of contradiction a duplicate invites. Use
+// `UdxVersion.current` / `UdxVersion.supportedVersions`.
 

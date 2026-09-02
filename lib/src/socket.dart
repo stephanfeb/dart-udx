@@ -15,6 +15,7 @@ import 'pmtud.dart';
 import 'metrics_observer.dart';
 import 'logging.dart';
 import 'version.dart';
+import 'constants.dart' show maxIdleTimeout, errorConnectionTimeout;
 
 /// Custom error for when a stream creation attempt exceeds the peer's advertised limit.
 class StreamLimitExceededError extends StateError {
@@ -138,6 +139,17 @@ class UDPSocket with UDXEventEmitter {
   int _recvBufferSize = 0;
   int _sendBufferSize = 0;
 
+  /// Idle timeout (RFC 9000 section 10.1). [_lastActivity] is stamped on every
+  /// received datagram; a self-rearming watchdog closes the connection once it
+  /// has been silent longer than [_idleTimeout]. This is the backstop that ends
+  /// a dead path now that retransmission never gives up on its own.
+  DateTime _lastActivity = DateTime.now();
+  Timer? _idleTimer;
+
+  /// How often the watchdog wakes to test for silence — a poll granularity, not
+  /// the timeout itself.
+  static const Duration _idleCheckInterval = Duration(seconds: 1);
+
   /// Creates a new UDX connection socket.
   UDPSocket({
     required this.udx,
@@ -198,10 +210,71 @@ class UDPSocket with UDXEventEmitter {
       cids.remoteCid,
       '${remoteAddress.address}:$remotePort',
     );
+
+    _lastActivity = DateTime.now();
+    _armIdleCheck();
+  }
+
+  /// The silence a connection tolerates before it is closed. RFC 9000 section
+  /// 10.1 requires at least three PTOs, so loss recovery always gets a chance
+  /// before the path is declared dead; the RTO is capped, so the 30s floor wins
+  /// in practice, and the max() keeps it correct if that cap ever rises.
+  Duration get _idleTimeout {
+    final threePto = _packetManager.retransmitTimeout * 3;
+    final floorMs = maxIdleTimeout.inMilliseconds;
+    return Duration(milliseconds: threePto > floorMs ? threePto : floorMs);
+  }
+
+  void _armIdleCheck() {
+    if (_closing) return;
+    _idleTimer = Timer(_idleCheckInterval, _onIdleCheck);
+  }
+
+  void _onIdleCheck() {
+    if (_closing) return;
+    if (DateTime.now().difference(_lastActivity) >= _idleTimeout) {
+      // Silent close (RFC 9000 section 10.1): no CONNECTION_CLOSE — there may be
+      // nothing left on the path to hear it. Blocked readers and writers are
+      // still woken through the stream resets.
+      _closeIdle();
+      return;
+    }
+    _armIdleCheck();
+  }
+
+  Future<void> _closeIdle() async {
+    if (_closing) return;
+    _closing = true;
+    _idleTimer?.cancel();
+    UdxLogging.warn(
+        'socket idle-timeout close: cid=${cids.localCid} peer=${remoteAddress.address}:$remotePort '
+        'idleTimeout=${_idleTimeout.inSeconds}s lastActivity=$_lastActivity streams=${_registeredStreams.length}');
+
+    try {
+      final streamIds = List<int>.from(_registeredStreams.keys);
+      for (final streamId in streamIds) {
+        _registeredStreams[streamId]?.deliverReset(errorConnectionTimeout);
+      }
+      _registeredStreams.clear();
+
+      multiplexer.removeSocket(cids.localCid);
+      _packetManager.destroy();
+      _congestionController.destroy();
+
+      emit('close', {'error': errorConnectionTimeout, 'reason': 'idle timeout'});
+    } catch (e) {
+      emit('error', e);
+    } finally {
+      super.close();
+    }
   }
 
   /// Processes an incoming datagram from the multiplexer.
   Future<void> handleIncomingDatagram(Uint8List data, InternetAddress fromAddress, int fromPort) async {
+    // Any datagram is proof the path is alive; restart the idle clock (RFC 9000
+    // section 10.1: the timer resets on receiving and processing a packet).
+    _lastActivity = DateTime.now();
+
     // Track received bytes for anti-amplification
     if (!_addressValidated) {
       _bytesReceivedBeforeValidation += data.length;
@@ -709,6 +782,10 @@ class UDPSocket with UDXEventEmitter {
   Future<void> closeWithError(int errorCode, String reason, {int frameType = 0}) async {
     if (_closing) return;
     _closing = true;
+    _idleTimer?.cancel();
+    UdxLogging.warn(
+        'socket closeWithError: code=$errorCode reason="$reason" '
+        'cid=${cids.localCid} peer=${remoteAddress.address}:$remotePort streams=${_registeredStreams.length}');
 
     try {
       // Send CONNECTION_CLOSE frame
@@ -762,6 +839,10 @@ class UDPSocket with UDXEventEmitter {
   Future<void> close() async {
     if (_closing) return;
     _closing = true;
+    _idleTimer?.cancel();
+    UdxLogging.warn(
+        'socket close(): cid=${cids.localCid} peer=${remoteAddress.address}:$remotePort '
+        'streams=${_registeredStreams.length}');
 
     try {
       final streamIds = List<int>.from(_registeredStreams.keys);

@@ -960,17 +960,30 @@ class UDXPacket {
   /// The ID of the stream at the source
   final int sourceStreamId;
 
-  /// The sequence number
-  final int sequence;
+  /// The sequence number.
+  ///
+  /// Mutable because a retransmission re-keys the packet under a FRESH sequence
+  /// (PacketManager.retransmit), QUIC-style — a lost packet's bytes are re-sent
+  /// under a new number rather than the old one, so loss can never exhaust a
+  /// per-packet budget and strand the stream.
+  int sequence;
 
   /// The list of frames in the packet
   final List<Frame> frames;
 
-  /// The time the packet was sent
+  /// The ORIGINAL send time, set once and not moved by a retransmission — its
+  /// only reader, persistent-congestion detection, measures how long the packet
+  /// has gone undelivered. Per-retransmission timing lives in [lastRetransmit].
   DateTime? sentTime;
 
   /// Whether the packet has been acknowledged
   bool isAcked = false;
+
+  /// How many times this packet has been retransmitted, and when it last was.
+  /// Used to space attempts and to collapse a near-simultaneous RTO timer and
+  /// fast-retransmit into a single re-send.
+  int retransmitCount = 0;
+  DateTime? lastRetransmit;
 
   /// The current UDX protocol version.
   ///
@@ -1143,11 +1156,10 @@ class PacketManager {
     return rto.clamp(200, 5000); // Clamp to a reasonable range (increased min)
   }
 
-  /// The retransmission timers
+  /// The retransmission timers, keyed by each packet's CURRENT sequence number
+  /// and re-keyed alongside it: one live timer per unacked packet, following it
+  /// across renumberings.
   final Map<int, Timer> _retransmitTimers = {};
-
-  /// Track retransmission attempts per packet for metrics
-  final Map<int, int> _retransmitAttempts = {};
 
   /// Creates a new packet manager
   PacketManager({CongestionController? congestionController}) {
@@ -1267,79 +1279,126 @@ class PacketManager {
     onSendProbe?.call(probePacket);
   }
 
-  /// Retransmits a specific packet by its sequence number.
+  /// The floor and ceiling on the wait between retransmission attempts. The
+  /// ceiling is a cap, not a fixed interval, and never applies below the current
+  /// RTO — retransmitting faster than the round trip just piles duplicates onto
+  /// a path that has not had time to answer.
+  static const int minRetransmitBackoffMs = 200;
+  static const int maxRetransmitBackoffMs = 2000;
+
+  /// The wait before the given (1-based) attempt: exponential from the RTO up to
+  /// the ceiling, with the ceiling never below the RTO itself.
+  int _retransmitBackoffMs(int attempt) {
+    final rto = retransmitTimeout;
+    var ceiling = maxRetransmitBackoffMs;
+    if (ceiling < rto) ceiling = rto;
+
+    var backoff = ceiling;
+    final shift = attempt - 1;
+    if (shift < 31) {
+      final scaled = rto * (1 << shift);
+      if (scaled < ceiling) backoff = scaled;
+    }
+    if (backoff < minRetransmitBackoffMs) backoff = minRetransmitBackoffMs;
+    return backoff;
+  }
+
+  /// Re-sends a still-unacked packet under a FRESH sequence number, returning
+  /// the new sequence (or null when nothing should be sent).
+  ///
+  /// Reusing the original number is what made loss fatal: the retry budget rode
+  /// on the packet, so exhausting it left a hole the stream could never fill and
+  /// the packet was silently dropped, stalling the stream. QUIC never reuses a
+  /// packet number (RFC 9000 section 12.3); it re-frames lost data into a new
+  /// packet, bounded by the connection's idle timeout rather than a per-packet
+  /// count. Both v3 stacks reassemble streams on byte offsets, so a fresh number
+  /// is safe here — a duplicate is discarded by its offset, and the
+  /// retransmission is acknowledged unambiguously (no Karn ambiguity, because
+  /// sentTime is reset to the resend).
+  ///
+  /// The re-key moves the tracking entry and the retransmit timer from the old
+  /// number to the new. It leaves congestion accounting alone: the bytes stay in
+  /// flight across the re-key (onRetransmit never calls onPacketSent), so they
+  /// are counted once, from the original send until the packet is acknowledged.
+  ///
+  /// Returns null when the packet was already acknowledged, or was retransmitted
+  /// within the last RTO — collapsing a near-simultaneous RTO timer and
+  /// fast-retransmit into one send.
+  int? retransmit(UDXPacket packet) {
+    final oldSeq = packet.sequence;
+    if (!_sentPackets.containsKey(oldSeq)) {
+      _retransmitTimers[oldSeq]?.cancel();
+      _retransmitTimers.remove(oldSeq);
+      return null;
+    }
+
+    final now = DateTime.now();
+    if (packet.retransmitCount > 0 &&
+        packet.lastRetransmit != null &&
+        now.difference(packet.lastRetransmit!).inMilliseconds < retransmitTimeout) {
+      return null;
+    }
+
+    final newSeq = nextSequence;
+
+    _retransmitTimers[oldSeq]?.cancel();
+    _retransmitTimers.remove(oldSeq);
+    _sentPackets.remove(oldSeq);
+
+    packet.sequence = newSeq;
+    packet.retransmitCount++;
+    packet.lastRetransmit = now;
+    // Deliberately NOT touching sentTime. It is the ORIGINAL send time, and the
+    // only reader is persistent-congestion detection, which measures how long a
+    // packet has gone undelivered — that clock must not restart on a resend. RTT
+    // is sampled from a separate per-sequence map in the socket, and a
+    // retransmit's fresh sequence is simply absent from it, so a retransmitted
+    // packet yields no RTT sample (Karn's algorithm) without any special-casing.
+    lastSentPacketNumber = newSeq;
+    _sentPackets[newSeq] = packet;
+
+    final backoff = _retransmitBackoffMs(packet.retransmitCount);
+    _retransmitTimers[newSeq] = Timer(
+      Duration(milliseconds: backoff),
+      () => _onRetransmitTimer(packet),
+    );
+
+    return newSeq;
+  }
+
+  /// Retransmits a specific packet identified by its (current) sequence number.
+  /// Used by fast-retransmit; the sequence may already have been retired by an
+  /// RTO-driven re-key, in which case there is nothing to do.
   void retransmitPacket(int sequence) {
     final packet = _sentPackets[sequence];
-    if (packet != null) {
+    if (packet == null) return;
+    final newSeq = retransmit(packet);
+    if (newSeq != null) {
       onRetransmit?.call(packet);
     }
   }
 
-  /// Schedules a retransmission for a packet
-  /// Note: This provides basic timeout-based retransmission. The QUIC-compliant
-  /// PTO system in CongestionController handles sophisticated loss detection.
-  void _scheduleRetransmission(UDXPacket packet) {
-    // print('PacketManager: Scheduling retransmission for packet ${packet.sequence}, timeout: ${retransmitTimeout}ms');
-
-    int retryCount = 0;
-    const maxRetries = 10; // Maximum retransmission attempts before giving up on this packet
-
-    void retransmit() {
-      // If the packet has been acknowledged, stop the retransmission cycle.
-      if (!_sentPackets.containsKey(packet.sequence)) {
-        // print('PacketManager: Packet ${packet.sequence} already acknowledged, stopping retransmission');
-        _retransmitTimers[packet.sequence]?.cancel();
-        _retransmitTimers.remove(packet.sequence);
-        return;
-      }
-
-      retryCount++;
-      
-      if (retryCount <= maxRetries) {
-        // print('PacketManager: Retransmitting packet ${packet.sequence} (attempt $retryCount/$maxRetries)');
-        
-        // Track the retransmit attempt and notify observer
-        _retransmitAttempts[packet.sequence] = retryCount;
-        final rto = Duration(milliseconds: retransmitTimeout);
-        onPacketRetransmitEvent?.call(packet.sequence, retryCount, rto);
-        
-        // Invoke the callback to perform the actual retransmission
-        if (onRetransmit != null) {
-          onRetransmit!(packet);
-          // print('PacketManager: Called onRetransmit for packet ${packet.sequence}');
-        } else {
-          // print('PacketManager: ERROR - onRetransmit callback is null for packet ${packet.sequence}');
-        }
-
-        // Reschedule the next retransmission with exponential backoff
-        // The PTO system in CongestionController handles sophisticated loss detection
-        final backoffTimeout = retransmitTimeout * (1 << (retryCount - 1)); // Exponential backoff: 1x, 2x, 4x, 8x, etc.
-        _retransmitTimers[packet.sequence] = Timer(
-          Duration(milliseconds: backoffTimeout.clamp(200, 30000)), // Clamp between 200ms and 30s
-          retransmit,
-        );
-      } else {
-        // Exceeded max retries - give up on this packet but don't escalate to connection failure
-        // print('PacketManager: Giving up on packet ${packet.sequence} after $maxRetries attempts');
-        _retransmitTimers[packet.sequence]?.cancel();
-        _retransmitTimers.remove(packet.sequence);
-        
-        // Notify observer of packet loss
-        onPacketLossEvent?.call(packet.sequence, 'timeout');
-        
-        // Remove from sent packets to prevent further retransmission attempts
-        _sentPackets.remove(packet.sequence);
-        _retransmitAttempts.remove(packet.sequence);
-        
-        // Note: We don't call onPacketPermanentlyLost as that was causing stream crashes
-        // The QUIC-compliant PTO system will handle loss detection gracefully
-      }
+  /// Fires when a packet's RTO elapses without an ACK: re-key under a fresh
+  /// sequence (which also arms the next timer) and put it back on the wire.
+  /// There is no per-packet retry cap — a genuinely dead path is ended by the
+  /// socket's idle timeout closing the whole connection, not by abandoning one
+  /// packet's bytes.
+  void _onRetransmitTimer(UDXPacket packet) {
+    final newSeq = retransmit(packet);
+    if (newSeq != null) {
+      onPacketRetransmitEvent?.call(
+          newSeq, packet.retransmitCount, Duration(milliseconds: retransmitTimeout));
+      onRetransmit?.call(packet);
     }
+  }
 
-    // Schedule the first retransmission
+  /// Schedules the first retransmission timer for a freshly-sent packet. Every
+  /// later timer is armed by [retransmit] as it re-keys the packet, so there is
+  /// exactly one live timer per unacked packet, following it across renumberings.
+  void _scheduleRetransmission(UDXPacket packet) {
     _retransmitTimers[packet.sequence] = Timer(
       Duration(milliseconds: retransmitTimeout),
-      retransmit,
+      () => _onRetransmitTimer(packet),
     );
   }
 
