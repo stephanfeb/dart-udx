@@ -21,6 +21,15 @@ UDX is a QUIC-inspired, UDP-based transport protocol that provides reliable, ord
 - **Stream Multiplexing** - Multiple concurrent streams per connection
 - **Event-Driven Architecture** - Responsive, asynchronous I/O
 
+### What's New in v3.0 (Per-Stream Reassembly)
+
+- **Byte-offset STREAM frames** - Each stream reassembles its own bytes, so a gap on one stream no longer stalls delivery on the others sharing a connection
+- **Sized FIN** - A stream ends when its delivered bytes reach the final size the FIN carries, instead of closing on arrival and truncating data still in flight
+- **Real stream-level back-pressure** - Flow control is anchored to what the application has consumed, in both directions, so a slow reader throttles its sender
+- **QUIC-style loss recovery** - Retransmits are re-keyed under a fresh sequence number, with an idle-timeout backstop
+
+**v3 does not interoperate with v2.** Both ends of a connection must be upgraded together; a version mismatch is dropped and looks like an unreachable peer. See [CHANGELOG.md](CHANGELOG.md) for the details.
+
 ### What's New in v2.0 (Enhanced QUIC Compliance)
 
 - **Variable-Length Connection IDs** - Flexible CID sizes (0-20 bytes) for improved privacy
@@ -43,7 +52,7 @@ Add this package to your `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  dart_udx: ^0.3.0
+  dart_udx: ^3.0.0
 ```
 
 Then run:

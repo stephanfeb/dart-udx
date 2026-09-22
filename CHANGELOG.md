@@ -5,6 +5,33 @@ All notable changes to dart-udx will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.0] - 2026-09-23
+
+### Breaking
+
+- **Wire protocol v3: STREAM frames carry a byte offset and each stream reassembles its own bytes.** Ordering used to happen at the socket, on the connection's packet sequence number, so a gap belonging to one stream stalled delivery on every other stream sharing the connection. That matters here more than in Go, because dart-libp2p uses UDX directly as its libp2p stream multiplexer, so concurrent streams are the normal case.
+  **v3 does not interoperate with v2 (2.0.x), and both ends must be upgraded together.** The eight offset bytes sit where a v2 parser expects the data length, so a v2 peer does not fail on a v3 frame: it reads a plausible wrong length and hands nonsense to the application. The version is therefore checked on receive and packets of an unsupported version are dropped, which makes a mismatch look like an unreachable peer rather than corruption. go-udx carries the matching change; the two are a flag day.
+- **FIN carries the stream's final size.** FIN is a flag on a frame that can overtake data still in flight, so closing on its arrival truncated the tail. A stream now ends when its delivered bytes reach that size.
+- **`UDXStream.data` counts consumption, and a slow reader now throttles the sender.** The getter returns a cached mapped view of the underlying stream that counts each chunk as it is delivered. With no listener, or a paused subscription, events sit in the controller, nothing is counted, the advertised offset stops advancing and the sender stalls. That is the point: inbound transfers previously had no stream-level back-pressure at all.
+- **`setWindow` sets a window size rather than an absolute offset.** It cannot revoke credit already granted: it advertises `bytesConsumed + newSize`, and because the peer applies offsets monotonically, a smaller size takes effect only once the peer catches up to the offset it already holds.
+
+### Fixed
+
+- **Stream flow control did not bind on upload.** WINDOW_UPDATE carries an absolute offset, the highest cumulative byte position the peer will accept, but the sender compared it against `inflight`, the bytes currently outstanding, which also happens to be the connection-level counter. Against an offset that grows for the life of the stream, that comparison stops binding almost immediately, leaving the congestion window as the only limit. Measured against a peer with a deliberately slow reader, the sender ran 3.9x past the offset it had been granted. It now gates on the per-stream `bytesWritten`.
+- **Offsets survive the 4GB wrap.** The frame field is a uint32, so an offset is transmitted modulo 2^32. The receiver recovers the full value by choosing the candidate nearest the limit it already holds (RFC 1982 serial-number arithmetic), which is unambiguous because the true offset is always within one receive window of the current limit. Clamping instead would stall a stream permanently at 4GB. Updates are applied monotonically, so a stale or reordered frame can never revoke granted credit.
+- **The receive window tracked bytes received rather than bytes consumed**, so a receiver kept granting credit whether or not the application was reading. A sender pushing 16MB at a reader sleeping 25ms between chunks had all 16,777,216 bytes accepted while the application had consumed 143,740. The window is now anchored to consumption, advertised as an absolute offset, and doubles per update up to 4MB. The same push now moves 361,980 bytes against 151,972 consumed. This supersedes the fixed-threshold workaround added in 2.0.3's line of development.
+- **Loss recovery follows QUIC.** A retransmitted packet is re-keyed under a fresh sequence number and the give-up cap is removed, mirroring the go-udx fix. `sentTime` is deliberately not reset, since it is read only for persistent-congestion detection and RTT sampling uses a separate map, so retransmits correctly take no RTT sample.
+- **Idle connections are now closed by a backstop timeout** of `max(maxIdleTimeout, 3xPTO)`, self-rearming, which resets streams silently and logs the close reason.
+- **A stream is opened by a data frame, not only by SYN.** Opening on SYN alone was safe only while socket-level ordering guaranteed the SYN arrived first. A bare FIN deliberately still does not open one, since it carries nothing to deliver.
+- **Packets are routed by the sender's stream id when the destination id is unknown.** A peer that has not yet learned our local id addresses its first packets to 0, so the same stream could arrive under two ids and open twice.
+- **`UDXPacket.currentVersion` was a second hardcoded copy of the version number** that silently disagreed with `UdxVersion.current` the moment either was bumped. It now aliases it.
+- **The out-of-order buffer's backstop sits above the largest receive window** rather than at it, and overrunning it fails the stream rather than silently dropping bytes that were already acknowledged and so will never be re-sent.
+- **SocketException from the multiplexer is handled**: the error is emitted as an event and the socket closes gracefully instead of throwing out of the send path.
+
+### Added
+
+- Diagnostic logging points for packet receive, ACK generation, send and small-payload delivery, gated behind `UdxLogging.info` and off by default.
+
 ## [2.0.3] - 2026-02-22
 
 ### Fixed
