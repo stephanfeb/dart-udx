@@ -56,6 +56,12 @@ class UDPSocket with UDXEventEmitter {
   /// A future that completes when the handshake is successful.
   Future<void> get handshakeComplete => _handshakeCompleter.future;
 
+  /// Whether anything has been received from the peer yet.
+  bool get isHandshakeCompleted => _handshakeCompleted;
+
+  /// Whether this socket was created for an inbound connection.
+  final bool isServer;
+
   /// Metrics observer for this socket (optional).
   UdxMetricsObserver? metricsObserver;
 
@@ -158,7 +164,7 @@ class UDPSocket with UDXEventEmitter {
     required this.remotePort,
     required this.cids,
     this.metricsObserver,
-    bool isServer = false,
+    this.isServer = false,
   }) {
     _localConnectionMaxData = defaultInitialConnectionWindow;
     _remoteConnectionMaxData = defaultInitialConnectionWindow;
