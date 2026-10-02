@@ -8,7 +8,7 @@ void main() {
     test('serializes and deserializes a PADDING frame', () {
       final frame = PaddingFrame();
       final bytes = frame.toBytes();
-      expect(bytes, equals(Uint8List.fromList([FrameType.padding.index])));
+      expect(bytes, equals(Uint8List.fromList([FrameType.padding.code])));
 
       final view = ByteData.view(bytes.buffer);
       final deserialized = Frame.fromBytes(view, 0);
@@ -19,7 +19,7 @@ void main() {
     test('serializes and deserializes a PING frame', () {
       final frame = PingFrame();
       final bytes = frame.toBytes();
-      expect(bytes, equals(Uint8List.fromList([FrameType.ping.index])));
+      expect(bytes, equals(Uint8List.fromList([FrameType.ping.code])));
 
       final view = ByteData.view(bytes.buffer);
       final deserialized = Frame.fromBytes(view, 0);

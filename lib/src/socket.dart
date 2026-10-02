@@ -56,6 +56,12 @@ class UDPSocket with UDXEventEmitter {
   /// A future that completes when the handshake is successful.
   Future<void> get handshakeComplete => _handshakeCompleter.future;
 
+  /// Whether anything has been received from the peer yet.
+  bool get isHandshakeCompleted => _handshakeCompleted;
+
+  /// Whether this socket was created for an inbound connection.
+  final bool isServer;
+
   /// Metrics observer for this socket (optional).
   UdxMetricsObserver? metricsObserver;
 
@@ -158,7 +164,7 @@ class UDPSocket with UDXEventEmitter {
     required this.remotePort,
     required this.cids,
     this.metricsObserver,
-    bool isServer = false,
+    this.isServer = false,
   }) {
     _localConnectionMaxData = defaultInitialConnectionWindow;
     _remoteConnectionMaxData = defaultInitialConnectionWindow;
@@ -379,26 +385,20 @@ class UDPSocket with UDXEventEmitter {
         _handleConnectionAckFrame(frame);
       }
 
-      // --- Process RESET, STOP_SENDING, WINDOW_UPDATE immediately (not sequence-dependent) ---
+      // --- Process RESET, STOP_SENDING, WINDOW_UPDATE, STREAM_DATA_BLOCKED immediately (not sequence-dependent) ---
       for (final frame in udxPacket.frames) {
         if (frame is ResetStreamFrame) {
-          final targetStreamId = udxPacket.destinationStreamId;
-          final stream = _registeredStreams[targetStreamId];
-          if (stream != null) {
-            stream.deliverReset(frame.errorCode);
-          }
+          _findStream(udxPacket.destinationStreamId, udxPacket.sourceStreamId)
+              ?.deliverReset(frame.errorCode);
         } else if (frame is StopSendingFrame) {
-          final targetStreamId = udxPacket.destinationStreamId;
-          final stream = _registeredStreams[targetStreamId];
-          if (stream != null) {
-            stream.deliverStopSending(frame.errorCode);
-          }
+          _findStream(udxPacket.destinationStreamId, udxPacket.sourceStreamId)
+              ?.deliverStopSending(frame.errorCode);
         } else if (frame is WindowUpdateFrame) {
-          final targetStreamId = udxPacket.destinationStreamId;
-          final stream = _registeredStreams[targetStreamId];
-          if (stream != null) {
-            stream.deliverWindowUpdate(frame.windowSize);
-          }
+          _findStream(udxPacket.destinationStreamId, udxPacket.sourceStreamId)
+              ?.deliverWindowUpdate(frame.windowSize);
+        } else if (frame is StreamDataBlockedFrame) {
+          _findStream(udxPacket.destinationStreamId, udxPacket.sourceStreamId)
+              ?.deliverStreamDataBlocked();
         }
       }
 
@@ -624,59 +624,13 @@ class UDPSocket with UDXEventEmitter {
     if (UdxLogging.info) {
       UdxLogging.infoLog('[DIAG-UDX-ACK-OUT] seqs=${sortedSequences.length} largest=${sortedSequences.last}');
     }
-    final int largestAcked = sortedSequences.last;
-
     int ackDelayMs = 0;
     if (_largestAckedPacketArrivalTime != null) {
       ackDelayMs = DateTime.now().difference(_largestAckedPacketArrivalTime!).inMilliseconds;
       ackDelayMs = ackDelayMs.clamp(0, 65535);
     }
 
-    // Build ACK ranges
-    List<AckRange> ackRanges = [];
-    int firstAckRangeLength = 0;
-
-    List<Map<String, int>> blocks = [];
-    if (sortedSequences.isNotEmpty) {
-      int blockStart = sortedSequences[0];
-      for (int i = 0; i < sortedSequences.length; i++) {
-        if (i + 1 < sortedSequences.length && sortedSequences[i + 1] == sortedSequences[i] + 1) {
-          // Continue current block
-        } else {
-          blocks.add({'start': blockStart, 'end': sortedSequences[i]});
-          if (i + 1 < sortedSequences.length) {
-            blockStart = sortedSequences[i + 1];
-          }
-        }
-      }
-    }
-
-    if (blocks.isNotEmpty) {
-      final lastBlock = blocks.removeLast();
-      firstAckRangeLength = lastBlock['end']! - lastBlock['start']! + 1;
-
-      int prevBlockStartSeq = lastBlock['start']!;
-      for (int i = blocks.length - 1; i >= 0; i--) {
-        final currentBlock = blocks[i];
-        final currentBlockStart = currentBlock['start']!;
-        final currentBlockEnd = currentBlock['end']!;
-        final int gap = prevBlockStartSeq - currentBlockEnd - 1;
-        final int rangeLength = currentBlockEnd - currentBlockStart + 1;
-        ackRanges.add(AckRange(gap: gap, ackRangeLength: rangeLength));
-        prevBlockStartSeq = currentBlockStart;
-      }
-    }
-
-    if (firstAckRangeLength == 0 && sortedSequences.isNotEmpty) {
-      firstAckRangeLength = 1;
-    }
-
-    final ackFrame = AckFrame(
-      largestAcked: largestAcked,
-      ackDelay: ackDelayMs,
-      firstAckRangeLength: firstAckRangeLength,
-      ackRanges: ackRanges,
-    );
+    final ackFrame = AckFrame.fromReceived(sortedSequences, ackDelay: ackDelayMs);
 
     // ACK-only packets reuse last sent sequence to avoid consuming new sequences
     final ackSeq = _packetManager.lastSentPacketNumber >= 0
@@ -878,6 +832,19 @@ class UDPSocket with UDXEventEmitter {
   }
 
   /// Registers a UDXStream with this socket.
+  /// The stream a packet is for: by our local id (the packet's destination
+  /// stream id), falling back to the sender's id. go-udx and js-udx never learn
+  /// the peer's id for a stream they opened, so they address it to 0 and
+  /// identify it by their own id alone, as STREAM frames are already routed.
+  UDXStream? _findStream(int destinationStreamId, int sourceStreamId) {
+    final stream = _registeredStreams[destinationStreamId];
+    if (stream != null || sourceStreamId == 0) return stream;
+    for (final candidate in _registeredStreams.values) {
+      if (candidate.remoteId == sourceStreamId) return candidate;
+    }
+    return null;
+  }
+
   void registerStream(UDXStream stream) {
     if (_closing) {
       return;
