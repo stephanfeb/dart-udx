@@ -618,59 +618,13 @@ class UDPSocket with UDXEventEmitter {
     if (UdxLogging.info) {
       UdxLogging.infoLog('[DIAG-UDX-ACK-OUT] seqs=${sortedSequences.length} largest=${sortedSequences.last}');
     }
-    final int largestAcked = sortedSequences.last;
-
     int ackDelayMs = 0;
     if (_largestAckedPacketArrivalTime != null) {
       ackDelayMs = DateTime.now().difference(_largestAckedPacketArrivalTime!).inMilliseconds;
       ackDelayMs = ackDelayMs.clamp(0, 65535);
     }
 
-    // Build ACK ranges
-    List<AckRange> ackRanges = [];
-    int firstAckRangeLength = 0;
-
-    List<Map<String, int>> blocks = [];
-    if (sortedSequences.isNotEmpty) {
-      int blockStart = sortedSequences[0];
-      for (int i = 0; i < sortedSequences.length; i++) {
-        if (i + 1 < sortedSequences.length && sortedSequences[i + 1] == sortedSequences[i] + 1) {
-          // Continue current block
-        } else {
-          blocks.add({'start': blockStart, 'end': sortedSequences[i]});
-          if (i + 1 < sortedSequences.length) {
-            blockStart = sortedSequences[i + 1];
-          }
-        }
-      }
-    }
-
-    if (blocks.isNotEmpty) {
-      final lastBlock = blocks.removeLast();
-      firstAckRangeLength = lastBlock['end']! - lastBlock['start']! + 1;
-
-      int prevBlockStartSeq = lastBlock['start']!;
-      for (int i = blocks.length - 1; i >= 0; i--) {
-        final currentBlock = blocks[i];
-        final currentBlockStart = currentBlock['start']!;
-        final currentBlockEnd = currentBlock['end']!;
-        final int gap = prevBlockStartSeq - currentBlockEnd - 1;
-        final int rangeLength = currentBlockEnd - currentBlockStart + 1;
-        ackRanges.add(AckRange(gap: gap, ackRangeLength: rangeLength));
-        prevBlockStartSeq = currentBlockStart;
-      }
-    }
-
-    if (firstAckRangeLength == 0 && sortedSequences.isNotEmpty) {
-      firstAckRangeLength = 1;
-    }
-
-    final ackFrame = AckFrame(
-      largestAcked: largestAcked,
-      ackDelay: ackDelayMs,
-      firstAckRangeLength: firstAckRangeLength,
-      ackRanges: ackRanges,
-    );
+    final ackFrame = AckFrame.fromReceived(sortedSequences, ackDelay: ackDelayMs);
 
     // ACK-only packets reuse last sent sequence to avoid consuming new sequences
     final ackSeq = _packetManager.lastSentPacketNumber >= 0

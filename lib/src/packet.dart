@@ -177,6 +177,56 @@ class AckFrame extends Frame {
     this.ceCount,
   }) : super(FrameType.ack);
 
+  /// The largest gap the one-byte gap field can carry.
+  static const int maxGap = 255;
+
+  /// The most additional ranges the one-byte range count can carry.
+  static const int maxRanges = 255;
+
+  /// Builds the ACK for a set of received sequences: the run ending at the
+  /// largest, then (gap, run) pairs walking down.
+  ///
+  /// It stops at a gap wider than [maxGap] or after [maxRanges] ranges, leaving
+  /// the older ranges out. Leaving a range out only costs the sender a
+  /// retransmission; encoding it truncated (a 290-packet gap written as 34)
+  /// acknowledges sequences that never arrived, so the sender stops tracking
+  /// them and never re-sends them.
+  factory AckFrame.fromReceived(Iterable<int> sequences, {int ackDelay = 0}) {
+    final sorted = sequences.toSet().toList()..sort();
+    if (sorted.isEmpty) {
+      throw ArgumentError('An ACK needs at least one received sequence');
+    }
+    // Contiguous runs, highest first.
+    final runs = <List<int>>[]; // [start, end]
+    var end = sorted.last;
+    var start = end;
+    for (var i = sorted.length - 2; i >= 0; i--) {
+      if (sorted[i] == start - 1) {
+        start = sorted[i];
+      } else {
+        runs.add([start, end]);
+        end = sorted[i];
+        start = end;
+      }
+    }
+    runs.add([start, end]);
+
+    final ranges = <AckRange>[];
+    var prevStart = runs.first[0];
+    for (final run in runs.skip(1)) {
+      final gap = prevStart - run[1] - 1;
+      if (gap > maxGap || ranges.length == maxRanges) break;
+      ranges.add(AckRange(gap: gap, ackRangeLength: run[1] - run[0] + 1));
+      prevStart = run[0];
+    }
+    return AckFrame(
+      largestAcked: sorted.last,
+      ackDelay: ackDelay,
+      firstAckRangeLength: runs.first[1] - runs.first[0] + 1,
+      ackRanges: ranges,
+    );
+  }
+
   @override
   int get length {
     // Type (1)
@@ -213,6 +263,11 @@ class AckFrame extends Frame {
     view.setUint16(offset, ackDelay, Endian.big);
     offset += 2;
 
+    // One-byte fields: a value that doesn't fit would be truncated into an ACK
+    // for sequences that never arrived, so refuse it (see fromReceived).
+    if (ackRanges.length > maxRanges || ackRanges.any((r) => r.gap > maxGap)) {
+      throw ArgumentError('ACK range count or gap does not fit its one-byte field');
+    }
     view.setUint8(offset, ackRanges.length); // Count of *additional* ranges
     offset += 1;
 
