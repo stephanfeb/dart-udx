@@ -54,6 +54,8 @@ void main() {
 
       // 2. Stub the popInitialPacket method to return our fake SYN packet.
       when(mockSocket.popInitialPacket(101)).thenReturn(incomingSynBytes);
+      // The peer named our id (101) and it's free, so the stream keeps it.
+      when(mockSocket.allocateIncomingStreamId(101)).thenReturn(101);
 
       // 3. When the stream is created, it should now process the packet and send a SYN-ACK.
       final newStream = UDXStream.createIncoming(

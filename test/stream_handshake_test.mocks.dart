@@ -182,6 +182,12 @@ class MockUDPSocket extends _i1.Mock implements _i8.UDPSocket {
       );
 
   @override
+  bool get isServer => (super.noSuchMethod(
+        Invocation.getter(#isServer),
+        returnValue: false,
+      ) as bool);
+
+  @override
   set metricsObserver(_i9.UdxMetricsObserver? _metricsObserver) =>
       super.noSuchMethod(
         Invocation.setter(
@@ -196,6 +202,12 @@ class MockUDPSocket extends _i1.Mock implements _i8.UDPSocket {
         Invocation.getter(#handshakeComplete),
         returnValue: _i10.Future<void>.value(),
       ) as _i10.Future<void>);
+
+  @override
+  bool get isHandshakeCompleted => (super.noSuchMethod(
+        Invocation.getter(#isHandshakeCompleted),
+        returnValue: false,
+      ) as bool);
 
   @override
   bool get closing => (super.noSuchMethod(
@@ -363,6 +375,15 @@ class MockUDPSocket extends _i1.Mock implements _i8.UDPSocket {
         returnValue: _i10.Future<void>.value(),
         returnValueForMissingStub: _i10.Future<void>.value(),
       ) as _i10.Future<void>);
+
+  @override
+  int allocateIncomingStreamId(int? requested) => (super.noSuchMethod(
+        Invocation.method(
+          #allocateIncomingStreamId,
+          [requested],
+        ),
+        returnValue: 0,
+      ) as int);
 
   @override
   void registerStream(_i11.UDXStream? stream) => super.noSuchMethod(
