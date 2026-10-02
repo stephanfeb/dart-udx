@@ -587,6 +587,25 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
   @override
   Future<void> get done => _dataController.done;
 
+  /// The peer is out of send credit (STREAM_DATA_BLOCKED). Re-advertise the
+  /// current limit without growing the window, as go-udx does. WINDOW_UPDATE
+  /// is never retransmitted, so this is what repairs a stream whose update was
+  /// lost; not growing the window means a peer can't inflate our receive
+  /// buffer just by claiming to be blocked.
+  void deliverStreamDataBlocked() {
+    final limit = _bytesConsumed + _receiveWindow;
+    if (limit > _lastAdvertised) _lastAdvertised = limit;
+    if (_connected && remoteId != null && _socket != null && !_socket!.closing) {
+      _socket!.sendStreamPacket(
+        remoteId!,
+        id,
+        // See _onDataConsumed: sent modulo 2^32, reconstructed by the peer.
+        [WindowUpdateFrame(windowSize: _lastAdvertised & 0xFFFFFFFF)],
+        trackForRetransmit: false,
+      );
+    }
+  }
+
   /// Sets the receive window *size* and re-advertises.
   ///
   /// Note this cannot revoke credit already granted: what goes on the wire is

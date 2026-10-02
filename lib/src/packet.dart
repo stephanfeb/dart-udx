@@ -10,25 +10,43 @@ import 'version.dart';
 
 // --- Frame Definitions ---
 
-/// Enum for different frame types.
+/// Frame types and their type bytes on the wire.
+///
+/// The codes are explicit and match go-udx, which leaves 0x0c unused. They
+/// used to be the enum's index, which has no gap, so every type from
+/// stopSending up was one lower than go-udx's: go-udx and js-udx rejected
+/// this side's STOP_SENDING, and this side misread their STREAM_DATA_BLOCKED
+/// (0x0f) as NEW_CONNECTION_ID and dropped the packet, losing the recovery
+/// for a dropped WINDOW_UPDATE.
 enum FrameType {
-  padding,
-  ping,
-  ack,
-  stream,
-  windowUpdate,
-  maxData, // New frame type for connection-level flow control
-  resetStream, // New frame type for abrupt stream termination
-  maxStreams,
-  mtuProbe, // New frame type for Path MTU Discovery
-  pathChallenge,
-  pathResponse,
-  connectionClose, // Graceful connection termination with error details
-  stopSending, // Request peer to stop sending on a stream
-  dataBlocked, // Connection-level flow control blocked
-  streamDataBlocked, // Stream-level flow control blocked
-  newConnectionId, // Provides a new CID that the peer can use
-  retireConnectionId, // Requests retirement of a previously issued CID
+  padding(0x00),
+  ping(0x01),
+  ack(0x02),
+  stream(0x03),
+  windowUpdate(0x04),
+  maxData(0x05), // Connection-level flow control
+  resetStream(0x06), // Abrupt stream termination
+  maxStreams(0x07),
+  mtuProbe(0x08), // Path MTU Discovery
+  pathChallenge(0x09),
+  pathResponse(0x0a),
+  connectionClose(0x0b), // Graceful connection termination with error details
+  // 0x0c is unused.
+  stopSending(0x0d), // Request peer to stop sending on a stream
+  dataBlocked(0x0e), // Connection-level flow control blocked
+  streamDataBlocked(0x0f), // Stream-level flow control blocked
+  newConnectionId(0x10), // Provides a new CID that the peer can use
+  retireConnectionId(0x11); // Requests retirement of a previously issued CID
+
+  const FrameType(this.code);
+
+  /// The type byte on the wire.
+  final int code;
+
+  static final Map<int, FrameType> _byCode = {for (final t in values) t.code: t};
+
+  /// The frame type for a type byte, or null if there is none.
+  static FrameType? fromCode(int code) => _byCode[code];
 }
 
 /// Base class for all UDX frames.
@@ -45,11 +63,12 @@ abstract class Frame {
 
   /// A factory constructor to deserialize a frame from bytes.
   static Frame fromBytes(ByteData view, int offset) {
-    final type = view.getUint8(offset);
-    if (type >= FrameType.values.length) {
-      throw ArgumentError('Unknown frame type: $type');
+    final code = view.getUint8(offset);
+    final type = FrameType.fromCode(code);
+    if (type == null) {
+      throw ArgumentError('Unknown frame type: $code');
     }
-    switch (FrameType.values[type]) {
+    switch (type) {
       case FrameType.padding:
         return PaddingFrame.fromBytes(view, offset);
       case FrameType.ping:
@@ -98,7 +117,7 @@ class PaddingFrame extends Frame {
 
   @override
   Uint8List toBytes() {
-    return Uint8List.fromList([FrameType.padding.index]);
+    return Uint8List.fromList([FrameType.padding.code]);
   }
 
   static PaddingFrame fromBytes(ByteData view, int offset) {
@@ -116,7 +135,7 @@ class PingFrame extends Frame {
 
   @override
   Uint8List toBytes() {
-    return Uint8List.fromList([FrameType.ping.index]);
+    return Uint8List.fromList([FrameType.ping.code]);
   }
 
   static PingFrame fromBytes(ByteData view, int offset) {
@@ -185,7 +204,7 @@ class AckFrame extends Frame {
     final view = ByteData.view(buffer.buffer);
     int offset = 0;
 
-    view.setUint8(offset, FrameType.ack.index);
+    view.setUint8(offset, FrameType.ack.code);
     offset += 1;
 
     view.setUint32(offset, largestAcked, Endian.big);
@@ -281,7 +300,7 @@ class StreamFrame extends Frame {
   Uint8List toBytes() {
     final buffer = Uint8List(length);
     final view = ByteData.view(buffer.buffer);
-    view.setUint8(0, FrameType.stream.index);
+    view.setUint8(0, FrameType.stream.code);
     int flags = 0;
     if (isFin) flags |= 0x01;
     if (isSyn) flags |= 0x02;
@@ -319,7 +338,7 @@ class WindowUpdateFrame extends Frame {
   Uint8List toBytes() {
     final buffer = Uint8List(length);
     final view = ByteData.view(buffer.buffer);
-    view.setUint8(0, FrameType.windowUpdate.index);
+    view.setUint8(0, FrameType.windowUpdate.code);
     view.setUint32(1, windowSize, Endian.big);
     return buffer;
   }
@@ -344,7 +363,7 @@ class MaxDataFrame extends Frame {
   Uint8List toBytes() {
     final buffer = Uint8List(length);
     final view = ByteData.view(buffer.buffer);
-    view.setUint8(0, FrameType.maxData.index);
+    view.setUint8(0, FrameType.maxData.code);
     view.setUint64(1, maxData, Endian.big);
     return buffer;
   }
@@ -373,7 +392,7 @@ class ResetStreamFrame extends Frame {
   Uint8List toBytes() {
     final buffer = Uint8List(length);
     final view = ByteData.view(buffer.buffer);
-    view.setUint8(0, FrameType.resetStream.index);
+    view.setUint8(0, FrameType.resetStream.code);
     view.setUint32(1, errorCode, Endian.big);
     return buffer;
   }
@@ -398,7 +417,7 @@ class MaxStreamsFrame extends Frame {
   Uint8List toBytes() {
     final buffer = Uint8List(length);
     final view = ByteData.view(buffer.buffer);
-    view.setUint8(0, FrameType.maxStreams.index);
+    view.setUint8(0, FrameType.maxStreams.code);
     view.setUint32(1, maxStreamCount, Endian.big);
     return buffer;
   }
@@ -424,7 +443,7 @@ class MtuProbeFrame extends Frame {
   Uint8List toBytes() {
     final buffer = Uint8List(length);
     final view = ByteData.view(buffer.buffer);
-    view.setUint8(0, FrameType.mtuProbe.index);
+    view.setUint8(0, FrameType.mtuProbe.code);
     // The rest of the frame is padding, which is implicitly zeros.
     return buffer;
   }
@@ -456,7 +475,7 @@ class PathChallengeFrame extends Frame {
   @override
   Uint8List toBytes() {
     final buffer = Uint8List(length);
-    buffer[0] = FrameType.pathChallenge.index;
+    buffer[0] = FrameType.pathChallenge.code;
     buffer.setAll(1, data);
     return buffer;
   }
@@ -485,7 +504,7 @@ class PathResponseFrame extends Frame {
   @override
   Uint8List toBytes() {
     final buffer = Uint8List(length);
-    buffer[0] = FrameType.pathResponse.index;
+    buffer[0] = FrameType.pathResponse.code;
     buffer.setAll(1, data);
     return buffer;
   }
@@ -548,7 +567,7 @@ class ConnectionCloseFrame extends Frame {
     final view = ByteData.view(buffer.buffer);
     
     int offset = 0;
-    view.setUint8(offset, FrameType.connectionClose.index);
+    view.setUint8(offset, FrameType.connectionClose.code);
     offset += 1;
     
     view.setUint32(offset, errorCode, Endian.big);
@@ -615,7 +634,7 @@ class StopSendingFrame extends Frame {
     final buffer = Uint8List(length);
     final view = ByteData.view(buffer.buffer);
     
-    view.setUint8(0, FrameType.stopSending.index);
+    view.setUint8(0, FrameType.stopSending.code);
     view.setUint32(1, streamId, Endian.big);
     view.setUint32(5, errorCode, Endian.big);
     
@@ -652,7 +671,7 @@ class DataBlockedFrame extends Frame {
     final buffer = Uint8List(length);
     final view = ByteData.view(buffer.buffer);
     
-    view.setUint8(0, FrameType.dataBlocked.index);
+    view.setUint8(0, FrameType.dataBlocked.code);
     view.setUint64(1, maxData, Endian.big);
     
     return buffer;
@@ -685,7 +704,7 @@ class StreamDataBlockedFrame extends Frame {
     final buffer = Uint8List(length);
     final view = ByteData.view(buffer.buffer);
     
-    view.setUint8(0, FrameType.streamDataBlocked.index);
+    view.setUint8(0, FrameType.streamDataBlocked.code);
     view.setUint32(1, streamId, Endian.big);
     view.setUint64(5, maxStreamData, Endian.big);
     
@@ -731,7 +750,7 @@ class NewConnectionIdFrame extends Frame {
     final view = ByteData.view(buffer.buffer);
     
     int offset = 0;
-    view.setUint8(offset, FrameType.newConnectionId.index);
+    view.setUint8(offset, FrameType.newConnectionId.code);
     offset += 1;
     
     view.setUint64(offset, sequenceNumber, Endian.big);
@@ -806,7 +825,7 @@ class RetireConnectionIdFrame extends Frame {
     final buffer = Uint8List(length);
     final view = ByteData.view(buffer.buffer);
     
-    view.setUint8(0, FrameType.retireConnectionId.index);
+    view.setUint8(0, FrameType.retireConnectionId.code);
     view.setUint64(1, sequenceNumber, Endian.big);
     
     return buffer;

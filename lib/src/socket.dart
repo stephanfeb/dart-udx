@@ -379,26 +379,20 @@ class UDPSocket with UDXEventEmitter {
         _handleConnectionAckFrame(frame);
       }
 
-      // --- Process RESET, STOP_SENDING, WINDOW_UPDATE immediately (not sequence-dependent) ---
+      // --- Process RESET, STOP_SENDING, WINDOW_UPDATE, STREAM_DATA_BLOCKED immediately (not sequence-dependent) ---
       for (final frame in udxPacket.frames) {
         if (frame is ResetStreamFrame) {
-          final targetStreamId = udxPacket.destinationStreamId;
-          final stream = _registeredStreams[targetStreamId];
-          if (stream != null) {
-            stream.deliverReset(frame.errorCode);
-          }
+          _findStream(udxPacket.destinationStreamId, udxPacket.sourceStreamId)
+              ?.deliverReset(frame.errorCode);
         } else if (frame is StopSendingFrame) {
-          final targetStreamId = udxPacket.destinationStreamId;
-          final stream = _registeredStreams[targetStreamId];
-          if (stream != null) {
-            stream.deliverStopSending(frame.errorCode);
-          }
+          _findStream(udxPacket.destinationStreamId, udxPacket.sourceStreamId)
+              ?.deliverStopSending(frame.errorCode);
         } else if (frame is WindowUpdateFrame) {
-          final targetStreamId = udxPacket.destinationStreamId;
-          final stream = _registeredStreams[targetStreamId];
-          if (stream != null) {
-            stream.deliverWindowUpdate(frame.windowSize);
-          }
+          _findStream(udxPacket.destinationStreamId, udxPacket.sourceStreamId)
+              ?.deliverWindowUpdate(frame.windowSize);
+        } else if (frame is StreamDataBlockedFrame) {
+          _findStream(udxPacket.destinationStreamId, udxPacket.sourceStreamId)
+              ?.deliverStreamDataBlocked();
         }
       }
 
@@ -878,6 +872,19 @@ class UDPSocket with UDXEventEmitter {
   }
 
   /// Registers a UDXStream with this socket.
+  /// The stream a packet is for: by our local id (the packet's destination
+  /// stream id), falling back to the sender's id. go-udx and js-udx never learn
+  /// the peer's id for a stream they opened, so they address it to 0 and
+  /// identify it by their own id alone, as STREAM frames are already routed.
+  UDXStream? _findStream(int destinationStreamId, int sourceStreamId) {
+    final stream = _registeredStreams[destinationStreamId];
+    if (stream != null || sourceStreamId == 0) return stream;
+    for (final candidate in _registeredStreams.values) {
+      if (candidate.remoteId == sourceStreamId) return candidate;
+    }
+    return null;
+  }
+
   void registerStream(UDXStream stream) {
     if (_closing) {
       return;
