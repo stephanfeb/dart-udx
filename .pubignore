@@ -1,0 +1,8 @@
+# Replaces .gitignore for `dart pub publish`, so it repeats its rules.
+.dart_tool/
+pubspec.lock
+.iml
+.idea
+
+# Agent and issue-tracker scaffolding, not part of the package.
+AGENTS.md

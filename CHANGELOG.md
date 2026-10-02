@@ -5,6 +5,27 @@ All notable changes to dart-udx will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.0] - 2026-10-02
+
+Interoperability fixes found while porting UDX to TypeScript (js-udx), checked
+against go-udx and js-udx over real UDP.
+
+### Fixed
+
+- **Several streams on one connection no longer collapse into the first.** A stream a peer opened was registered under the destination id the peer used. go-udx and js-udx never learn our id for a stream they open and address it to 0 throughout, as does dart-udx's own dialer, so every such stream became stream 0: a second one, concurrent or opened while the first was still closing, was routed into the first, its packets acknowledged and its bytes dropped, and it hung until the idle timeout. A stream a peer opens now gets the id the peer named if that is free (dart-libp2p names both ids of its first stream), or else the next free even id, as a go-udx acceptor would; its SYN-ACK carries that id.
+- **Frame types use go-udx's wire codes.** They were written as the `FrameType` enum's index, which has no gap at 0x0c, so every type from STOP_SENDING up was one below go-udx's and js-udx's. Those peers rejected our STOP_SENDING, and we misread their STREAM_DATA_BLOCKED (0x0f) as NEW_CONNECTION_ID and dropped the packet. `FrameType` now carries an explicit `code` (`FrameType.fromCode`).
+- **STREAM_DATA_BLOCKED is answered**, as go-udx does, by re-advertising the stream's current limit. It is how go-udx and js-udx recover a stream whose WINDOW_UPDATE was lost. RESET_STREAM, STOP_SENDING, WINDOW_UPDATE and STREAM_DATA_BLOCKED are routed like STREAM frames, falling back to the sender's stream id.
+- **ACK frames never overflow their one-byte gap and range counts.** `AckFrame.fromReceived` stops at a gap over 255 or at 255 ranges, and `toBytes` throws rather than silently truncating.
+- **Connections from the same address stay apart.** go-udx and js-udx dial every connection from one shared socket. An inbound SYN from an address with an existing connection joined that connection unless it was a genuine simultaneous open; it now gets its own socket, keyed by connection id.
+
+### Added
+
+- `UDPSocket.isServer`, `UDPSocket.isHandshakeCompleted`, `UDPSocket.allocateIncomingStreamId`, `UDXStream.deliverStreamDataBlocked`, `AckFrame.fromReceived`, `FrameType.code` and `FrameType.fromCode`.
+
+### Compatibility
+
+The wire version is still 3. Between 3.1.0 and 3.0.0 peers, STOP_SENDING (sent by `UDXStream.stopReceiving`) is lost in both directions, since the two number it differently; nothing else dart-udx sends changed. go-udx and js-udx interoperate fully only with 3.1.0.
+
 ## [3.0.0] - 2026-09-23
 
 ### Breaking
