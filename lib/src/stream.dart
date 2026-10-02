@@ -848,7 +848,7 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
 
     final stream = UDXStream(
       udx,
-      localId,
+      socket.allocateIncomingStreamId(localId),
       streamType: streamType,
       isInitiator: false,
       framed: framed,
@@ -871,7 +871,7 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
     // We send our SYN back to establish the bidirectional stream.
     socket.sendStreamPacket(
       remoteId,
-      localId,
+      stream.id,
       [StreamFrame(data: Uint8List(0), isSyn: true)],
     );
 

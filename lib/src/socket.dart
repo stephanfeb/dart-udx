@@ -443,21 +443,10 @@ class UDPSocket with UDXEventEmitter {
         _connectionBytesReceived += frame.data.length;
         _checkAndSendLocalMaxDataUpdate();
 
-        // Route to an existing stream, or open one on first reference.
-        UDXStream? stream = _registeredStreams[targetStreamId];
-
-        // Fall back to matching on the sender's own stream id. A peer that has
-        // not yet learned our local id addresses its first packets to 0, so the
-        // same stream can arrive under two different destination ids; without
-        // this the second one opens a duplicate stream.
-        if (stream == null && remoteStreamId != 0) {
-          for (final candidate in _registeredStreams.values) {
-            if (candidate.remoteId == remoteStreamId) {
-              stream = candidate;
-              break;
-            }
-          }
-        }
+        // Route to an existing stream, or open one on first reference. A peer
+        // that has not learned our local id (go-udx and js-udx never do)
+        // addresses its packets to 0, so match on the sender's own id too.
+        UDXStream? stream = _findStream(targetStreamId, remoteStreamId);
 
         if (stream == null &&
             remoteStreamId != 0 &&
@@ -838,11 +827,34 @@ class UDPSocket with UDXEventEmitter {
   /// identify it by their own id alone, as STREAM frames are already routed.
   UDXStream? _findStream(int destinationStreamId, int sourceStreamId) {
     final stream = _registeredStreams[destinationStreamId];
-    if (stream != null || sourceStreamId == 0) return stream;
+    // A stream the peer opened is the peer's stream [sourceStreamId]; a hit on
+    // our id for a different one of its streams is a collision, not a match.
+    if (stream != null &&
+        (sourceStreamId == 0 || stream.isInitiator || stream.remoteId == sourceStreamId)) {
+      return stream;
+    }
+    if (sourceStreamId == 0) return null;
     for (final candidate in _registeredStreams.values) {
       if (candidate.remoteId == sourceStreamId) return candidate;
     }
     return null;
+  }
+
+  int _nextIncomingStreamId = 2;
+
+  /// The local id for a stream the peer is opening. A peer that names one
+  /// (dart-libp2p picks both ids of its first stream) gets it if it's free.
+  /// go-udx and js-udx never learn our id for a stream they open: they address
+  /// it to 0 throughout and identify it by their own id. Those, and any id
+  /// already taken, get the next free even id, as a go-udx acceptor would.
+  int allocateIncomingStreamId(int requested) {
+    if (requested != 0 && !_registeredStreams.containsKey(requested)) return requested;
+    while (_nextIncomingStreamId == 0 || _registeredStreams.containsKey(_nextIncomingStreamId)) {
+      _nextIncomingStreamId = (_nextIncomingStreamId + 2) & 0xFFFFFFFF;
+    }
+    final id = _nextIncomingStreamId;
+    _nextIncomingStreamId = (id + 2) & 0xFFFFFFFF;
+    return id;
   }
 
   void registerStream(UDXStream stream) {
