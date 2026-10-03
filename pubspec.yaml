@@ -1,6 +1,6 @@
 name: dart_udx
 description: A Dart implementation of UDX - reliable, multiplexed, and congestion-controlled streams over UDP
-version: 3.1.0
+version: 4.0.0
 homepage: https://github.com/stephanfeb/dart-udx
 repository: https://github.com/stephanfeb/dart-udx
 issue_tracker: https://github.com/stephanfeb/dart-udx/issues

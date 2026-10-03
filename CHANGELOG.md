@@ -5,7 +5,10 @@ All notable changes to dart-udx will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [4.0.0] - 2026-10-04
+
+One breaking change: crossing dials stay two connections, as with go-udx and
+js-udx, so a hole punch between dart-udx and go-libp2p peers completes.
 
 ### Changed
 
@@ -15,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **A dial no longer reuses a connection the peer opened.** `createSocket` returned any socket for the address, including one accepted from the peer, so a dial made after the peer's SYN arrived was sent over the peer's connection. Only dials are reused by address now.
 - `handleIncomingDatagramForTest` routes through the same code as received datagrams; it had its own, older copy.
+
+### Compatibility
+
+The wire version is still 3. A 3.x peer still folds a crossing dial into its own, so a simultaneous open between a 3.x peer and a 4.0.0 peer can fail as it did with go-udx; dial in one direction, or upgrade both ends.
 
 ## [3.1.0] - 2026-10-02
 

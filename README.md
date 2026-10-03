@@ -52,7 +52,7 @@ Add this package to your `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  dart_udx: ^3.1.0
+  dart_udx: ^4.0.0
 ```
 
 Then run:
