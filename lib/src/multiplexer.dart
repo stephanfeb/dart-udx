@@ -50,92 +50,86 @@ class UDXMultiplexer {
         final datagram = socket.receive();
         if (datagram == null) return;
 
-        final data = datagram.data;
-        // New packet format minimum: version(4) + dcidLen(1) + scidLen(1) + seq(4) + destId(4) + srcId(4) = 18 bytes
-        if (data.length < 18) return; // Not a valid UDX packet
+        _route(datagram.data, datagram.address, datagram.port);
+      }
+    });
+  }
 
-        // Check if this might be a stateless reset packet
-        if (data.length >= StatelessResetPacket.minPacketSize) {
-          final resetPacket = StatelessResetPacket.tryParse(data);
-          if (resetPacket != null) {
-            // Check if we have this token registered
-            for (final entry in _resetTokens.entries) {
-              if (entry.value == resetPacket.token) {
-                // Valid stateless reset received
-                final socket = socketsByCid[entry.key];
-                if (socket != null) {
-                  // Close the socket due to stateless reset
-                  socket.closeWithError(
-                    UdxErrorCode.internalError,
-                    'Received stateless reset from peer',
-                  );
-                }
-                return;
-              }
+  /// Routes one datagram to its connection by destination CID, or opens a
+  /// connection for a SYN with a CID not seen before.
+  ///
+  /// Every new CID is its own connection, even from an address this side is
+  /// dialing at the same moment. Folding such a SYN into the pending dial
+  /// (treating the two as one connection opened from both ends) only works
+  /// when the peer folds too; go-udx and js-udx never do, and keep both
+  /// connections. The joined socket then answered whichever of the peer's
+  /// two connections had last sent it a packet, so neither one worked. A hole
+  /// punch therefore leaves two connections, one each way, as it does over
+  /// go-udx, and libp2p keeps whichever completes.
+  void _route(Uint8List data, InternetAddress address, int port) {
+    // New packet format minimum: version(4) + dcidLen(1) + scidLen(1) + seq(4) + destId(4) + srcId(4) = 18 bytes
+    if (data.length < 18) return; // Not a valid UDX packet
+
+    // Check if this might be a stateless reset packet
+    if (data.length >= StatelessResetPacket.minPacketSize) {
+      final resetPacket = StatelessResetPacket.tryParse(data);
+      if (resetPacket != null) {
+        // Check if we have this token registered
+        for (final entry in _resetTokens.entries) {
+          if (entry.value == resetPacket.token) {
+            // Valid stateless reset received
+            final socket = socketsByCid[entry.key];
+            if (socket != null) {
+              // Close the socket due to stateless reset
+              socket.closeWithError(
+                UdxErrorCode.internalError,
+                'Received stateless reset from peer',
+              );
             }
-          }
-        }
-
-        // Extract the destination CID from the new packet header format
-        // New format: version(4) + dcidLen(1) + dcid(0-20) + ...
-        ConnectionId destinationCid;
-        try {
-          final dcidLength = data[4]; // Byte at offset 4 is destination CID length
-          if (dcidLength > 20 || data.length < 5 + dcidLength) {
-            return; // Invalid packet
-          }
-          destinationCid = ConnectionId(data.sublist(5, 5 + dcidLength));
-        } catch (e) {
-          return; // Failed to parse CID, ignore packet
-        }
-
-        // Route the packet to the correct socket
-        final socketConnection = socketsByCid[destinationCid];
-        
-        if (socketConnection != null) {
-          // print('[MUX] Forwarding packet to existing UDPSocket');
-          socketConnection.handleIncomingDatagram(datagram.data, datagram.address, datagram.port);
-        } else {
-          try {
-            final packet = UDXPacket.fromBytes(data);
-            final isNewConnection = packet.frames
-                .whereType<StreamFrame>()
-                .any((frame) => frame.isSyn);
-            
-            if (isNewConnection) {
-              // A new connection, identified by the CID the dialer chose for
-              // us. A socket this side created for the same address with
-              // createSocket, and which hasn't heard from the peer yet, is the
-              // same connection being opened from both ends (simultaneous
-              // open), so the SYN joins it. Anything else is a separate
-              // connection and gets its own socket: go-udx and js-udx dial
-              // several connections from one shared socket, and mapping a new
-              // CID onto an existing connection made the two cross-talk.
-              final peerKey = '${datagram.address.address}:${datagram.port}';
-              final pending = socketsByPeer[peerKey];
-              final UDPSocket newSocket;
-              if (pending != null && !pending.isServer && !pending.isHandshakeCompleted) {
-                newSocket = pending;
-                socketsByCid[destinationCid] = newSocket;
-              } else {
-                newSocket = _newSocket(
-                  UDX(),
-                  datagram.address.address,
-                  datagram.port,
-                  localCid: destinationCid,
-                  remoteCid: packet.sourceCid,
-                  isServer: true,
-                );
-              }
-              _connectionsController.add(newSocket);
-              newSocket.handleIncomingDatagram(datagram.data, datagram.address, datagram.port);
-            }
-          } catch (e) {
-            // Not a valid UDX packet, ignore.
+            return;
           }
         }
       }
-    });
+    }
+
+    // Extract the destination CID from the new packet header format
+    // New format: version(4) + dcidLen(1) + dcid(0-20) + ...
+    ConnectionId destinationCid;
+    try {
+      final dcidLength = data[4]; // Byte at offset 4 is destination CID length
+      if (dcidLength > 20 || data.length < 5 + dcidLength) {
+        return; // Invalid packet
+      }
+      destinationCid = ConnectionId(data.sublist(5, 5 + dcidLength));
+    } catch (e) {
+      return; // Failed to parse CID, ignore packet
+    }
+
+    final socketConnection = socketsByCid[destinationCid];
+    if (socketConnection != null) {
+      socketConnection.handleIncomingDatagram(data, address, port);
+      return;
+    }
+
+    try {
+      final packet = UDXPacket.fromBytes(data);
+      final isNewConnection =
+          packet.frames.whereType<StreamFrame>().any((frame) => frame.isSyn);
+      if (!isNewConnection) return;
+
+      final newSocket = _newSocket(
+        UDX(),
+        address.address,
+        port,
+        localCid: destinationCid, // the CID the dialer chose for us
+        remoteCid: packet.sourceCid,
+        isServer: true,
+      );
+      _connectionsController.add(newSocket);
+      newSocket.handleIncomingDatagram(data, address, port);
+    } catch (e) {
+      // Not a valid UDX packet, ignore.
+    }
   }
 
   /// Closes the multiplexer and all associated sockets.
@@ -216,7 +210,9 @@ class UDXMultiplexer {
       isServer: isServer,
     );
     socketsByCid[effectiveLocalCid] = newSocket;
-    socketsByPeer.putIfAbsent('$host:$port', () => newSocket);
+    // Only a dial is reused by address; a connection the peer opened is not
+    // this side's to send a new dial over.
+    if (!isServer) socketsByPeer.putIfAbsent('$host:$port', () => newSocket);
     return newSocket;
   }
 
@@ -259,49 +255,6 @@ class UDXMultiplexer {
   Map<ConnectionId, UDPSocket> getSocketsForTest() => socketsByCid;
 
   void handleIncomingDatagramForTest(
-      Uint8List data, InternetAddress address, int port) {
-    // This is a simplified version of the logic in _listen for test purposes
-    if (data.length < 18) return; // New minimum packet size
-
-    // Extract destination CID from new packet format
-    ConnectionId destinationCid;
-    try {
-      final dcidLength = data[4]; // Byte at offset 4 is destination CID length
-      if (dcidLength > 20 || data.length < 5 + dcidLength) {
-        return; // Invalid packet
-      }
-      destinationCid = ConnectionId(data.sublist(5, 5 + dcidLength));
-    } catch (e) {
-      return; // Failed to parse CID, ignore packet
-    }
-
-    final socketConnection = socketsByCid[destinationCid];
-
-    if (socketConnection != null) {
-      socketConnection.handleIncomingDatagram(data, address, port);
-    } else {
-      try {
-        final packet = UDXPacket.fromBytes(data);
-        final isNewConnection =
-            packet.frames.whereType<StreamFrame>().any((frame) => frame.isSyn);
-
-        if (isNewConnection) {
-          final newSocket = createSocket(
-            UDX(),
-            address.address,
-            port,
-            localCid: destinationCid, // Use the CID from the SYN packet
-            remoteCid: packet.sourceCid,
-          );
-          // THE FIX: Map the temporary destination CID to the new socket
-          // to handle retransmissions during the handshake.
-          socketsByCid[destinationCid] = newSocket;
-          _connectionsController.add(newSocket);
-          newSocket.handleIncomingDatagram(data, address, port);
-        }
-      } catch (e) {
-        // Ignore
-      }
-    }
-  }
+          Uint8List data, InternetAddress address, int port) =>
+      _route(data, address, port);
 }

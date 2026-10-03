@@ -1,83 +1,107 @@
-import 'package:dart_udx/src/multiplexer.dart';
-import 'package:dart_udx/dart_udx.dart';
-import 'package:dart_udx/src/socket.dart';
-import 'package:dart_udx/src/stream.dart';
-import 'package:test/test.dart';
 import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:dart_udx/dart_udx.dart';
+import 'package:dart_udx/src/multiplexer.dart';
+import 'package:dart_udx/src/socket.dart';
+import 'package:dart_udx/src/stream.dart';
+import 'package:test/test.dart';
+
+// A hole punch has both peers dial each other at once. Each dial is its own
+// connection, as it is over go-udx and js-udx, which never merge them: a
+// peer that folded the other's SYN into its own pending dial ended up
+// answering both of the other side's connections from one socket.
 void main() {
-  group('UDX Simultaneous Open', () {
+  group('UDX simultaneous open', () {
     late UDX udx;
-    late UDXMultiplexer multiplexer1;
-    late UDXMultiplexer multiplexer2;
-    late RawDatagramSocket rawSocket1;
-    late RawDatagramSocket rawSocket2;
-    UDXStream? stream1;
-    UDXStream? stream2;
+    late RawDatagramSocket rawA;
+    late RawDatagramSocket rawB;
+    late UDXMultiplexer muxA;
+    late UDXMultiplexer muxB;
+    final streams = <UDXStream>[];
 
     setUp(() async {
       udx = UDX();
-      rawSocket1 = await RawDatagramSocket.bind(InternetAddress.loopbackIPv4, 0);
-      rawSocket2 = await RawDatagramSocket.bind(InternetAddress.loopbackIPv4, 0);
-      multiplexer1 = UDXMultiplexer(rawSocket1);
-      multiplexer2 = UDXMultiplexer(rawSocket2);
+      rawA = await RawDatagramSocket.bind(InternetAddress.loopbackIPv4, 0);
+      rawB = await RawDatagramSocket.bind(InternetAddress.loopbackIPv4, 0);
+      muxA = UDXMultiplexer(rawA);
+      muxB = UDXMultiplexer(rawB);
     });
 
     tearDown(() async {
-      await stream1?.close();
-      await stream2?.close();
-      multiplexer1.close();
-      multiplexer2.close();
+      for (final s in streams) {
+        await s.close();
+      }
+      streams.clear();
+      muxA.close();
+      muxB.close();
     });
 
-    test('handles simultaneous open and establishes a single stream', () async {
-      final address1 = rawSocket1.address;
-      final port1 = rawSocket1.port;
-      final address2 = rawSocket2.address;
-      final port2 = rawSocket2.port;
-      
-      const id1 = 100;
-      const id2 = 200;
+    /// Collects the connections [mux] accepts and the bytes each one receives.
+    (List<UDPSocket>, Map<UDPSocket, List<int>>) accept(UDXMultiplexer mux) {
+      final sockets = <UDPSocket>[];
+      final received = <UDPSocket, List<int>>{};
+      mux.connections.listen((socket) {
+        sockets.add(socket);
+        received[socket] = [];
+        socket.on('stream').listen((e) {
+          final stream = e.data as UDXStream;
+          streams.add(stream);
+          stream.data.listen(received[socket]!.addAll);
+        });
+        socket.flushStreamBuffer();
+      });
+      return (sockets, received);
+    }
 
-      final completer1 = Completer<Uint8List>();
-      final completer2 = Completer<Uint8List>();
+    Future<void> until(bool Function() condition) async {
+      final deadline = DateTime.now().add(const Duration(seconds: 3));
+      while (!condition()) {
+        if (DateTime.now().isAfter(deadline)) fail('timed out');
+        await Future.delayed(const Duration(milliseconds: 10));
+      }
+    }
 
-      // Both sides create sockets targeting each other
-      final socket1 = multiplexer1.createSocket(udx, address2.address, port2);
-      final socket2 = multiplexer2.createSocket(udx, address1.address, port1);
+    test('dials crossing each other are two connections', () async {
+      final (acceptedA, receivedA) = accept(muxA);
+      final (acceptedB, receivedB) = accept(muxB);
 
-      // Both sides try to create an outgoing stream at the same time
-      final f1 = UDXStream.createOutgoing(udx, socket1, id1, id2, address2.address, port2);
-      final f2 = UDXStream.createOutgoing(udx, socket2, id2, id1, address1.address, port1);
+      final dialA = muxA.createSocket(udx, rawB.address.address, rawB.port);
+      final dialB = muxB.createSocket(udx, rawA.address.address, rawA.port);
+      final opened = await Future.wait([
+        UDXStream.createOutgoing(udx, dialA, 100, 101, rawB.address.address, rawB.port),
+        UDXStream.createOutgoing(udx, dialB, 200, 201, rawA.address.address, rawA.port),
+      ]);
+      streams.addAll(opened);
 
-      final results = await Future.wait([f1, f2]);
-      stream1 = results[0];
-      stream2 = results[1];
+      await opened[0].add(Uint8List.fromList([1, 2, 3]));
+      await opened[1].add(Uint8List.fromList([4, 5, 6]));
+      await until(() =>
+          acceptedA.length == 1 &&
+          acceptedB.length == 1 &&
+          receivedA[acceptedA.single]!.length == 3 &&
+          receivedB[acceptedB.single]!.length == 3);
 
-      // The multiplexer should have resolved this into a single connection on each side.
-      // Now, we set up listeners and exchange data to confirm.
-      stream1!.data.listen(completer2.complete); // stream1 receives data for completer2
-      stream2!.data.listen(completer1.complete); // stream2 receives data for completer1
+      expect(identical(acceptedA.single, dialA), isFalse);
+      expect(identical(acceptedB.single, dialB), isFalse);
+      expect(receivedB[acceptedB.single], [1, 2, 3]);
+      expect(receivedA[acceptedA.single], [4, 5, 6]);
+    });
 
-      final data1 = Uint8List.fromList([1, 2, 3]);
-      final data2 = Uint8List.fromList([4, 5, 6]);
+    test('a dial does not reuse a connection the peer opened', () async {
+      final (acceptedB, _) = accept(muxB);
 
-      // Send data in both directions
-      await stream1!.add(data1);
-      await stream2!.add(data2);
+      final dialA = muxA.createSocket(udx, rawB.address.address, rawB.port);
+      streams.add(await UDXStream.createOutgoing(
+          udx, dialA, 100, 101, rawB.address.address, rawB.port));
+      await until(() => acceptedB.length == 1);
 
-      // Wait for the data to be received
-      final receivedOnSocket2 = await completer1.future.timeout(const Duration(seconds: 2));
-      final receivedOnSocket1 = await completer2.future.timeout(const Duration(seconds: 2));
-
-      // Verify that the data was correctly exchanged
-      expect(receivedOnSocket2, equals(data1), reason: "Socket 2 should receive data from socket 1");
-      expect(receivedOnSocket1, equals(data2), reason: "Socket 1 should receive data from socket 2");
-      
-      expect(stream1!.connected, isTrue);
-      expect(stream2!.connected, isTrue);
+      final dialB = muxB.createSocket(udx, rawA.address.address, rawA.port);
+      expect(identical(dialB, acceptedB.single), isFalse);
+      expect(dialB.isServer, isFalse);
+      expect(identical(muxB.createSocket(udx, rawA.address.address, rawA.port), dialB), isTrue,
+          reason: 'a second dial to the same address still shares the first');
     });
   });
 }

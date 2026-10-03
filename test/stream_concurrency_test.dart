@@ -15,9 +15,7 @@ void main() {
     late RawDatagramSocket rawSocket2;
     late UDXMultiplexer multiplexer1;
     late UDXMultiplexer multiplexer2;
-    late InternetAddress address1;
     late InternetAddress address2;
-    late int port1;
     late int port2;
 
     setUp(() async {
@@ -26,8 +24,6 @@ void main() {
       rawSocket2 = await RawDatagramSocket.bind(InternetAddress.loopbackIPv4, 0);
       multiplexer1 = UDXMultiplexer(rawSocket1);
       multiplexer2 = UDXMultiplexer(rawSocket2);
-      address1 = rawSocket1.address;
-      port1 = rawSocket1.port;
       address2 = rawSocket2.address;
       port2 = rawSocket2.port;
     });
@@ -41,11 +37,9 @@ void main() {
       const serverMaxStreams = 2;
 
       final socket1 = multiplexer1.createSocket(udx, address2.address, port2);
-      final socket2 = multiplexer2.createSocket(udx, address1.address, port1);
-      
-      // Set up the server to advertise its stream limit
-      socket2.setLocalMaxStreamsForTest(serverMaxStreams);
-      
+      // The server's socket is the connection it accepts.
+      final accepted2 = multiplexer2.connections.first;
+
       // Set up the client to receive the stream limit update
       final streamLimitCompleter = Completer<void>();
       socket1.on('remoteMaxStreamsUpdate').listen((event) {
@@ -64,8 +58,12 @@ void main() {
       );
       
       // Wait for connection to be established
+      final socket2 = await accepted2.timeout(const Duration(seconds: 2));
       await socket1.handshakeComplete;
       await socket2.handshakeComplete;
+
+      // Set up the server to advertise its stream limit
+      socket2.setLocalMaxStreamsForTest(serverMaxStreams);
       
       // Now have the server send its stream limit to the client
       await socket2.sendMaxStreamsFrame();
@@ -133,18 +131,8 @@ void main() {
 
     test('server rejects incoming stream when its limit is exceeded', () async {
       final socket1 = multiplexer1.createSocket(udx, address2.address, port2);
-      final socket2 = multiplexer2.createSocket(udx, address1.address, port1);
-
-      // Set server's local max streams to a low value
-      socket2.setLocalMaxStreamsForTest(1);
-
-      final serverStreamCompleter = Completer<UDXStream>();
-      socket2.on('stream').listen((event) {
-        if (!serverStreamCompleter.isCompleted) {
-          serverStreamCompleter.complete(event.data as UDXStream);
-        }
-      });
-      socket2.flushStreamBuffer();
+      // The server's socket is the connection it accepts.
+      final accepted2 = multiplexer2.connections.first;
 
       // Client creates the first stream, which should be accepted
       final clientStream1 = await UDXStream.createOutgoing(
@@ -155,7 +143,20 @@ void main() {
         address2.address,
         port2,
       );
-      
+
+      final socket2 = await accepted2.timeout(const Duration(seconds: 2));
+      // Set server's local max streams to a low value; the first stream
+      // already counts towards it.
+      socket2.setLocalMaxStreamsForTest(1);
+
+      final serverStreamCompleter = Completer<UDXStream>();
+      socket2.on('stream').listen((event) {
+        if (!serverStreamCompleter.isCompleted) {
+          serverStreamCompleter.complete(event.data as UDXStream);
+        }
+      });
+      socket2.flushStreamBuffer();
+
       final serverStream1 = await serverStreamCompleter.future.timeout(const Duration(seconds: 2));
       expect(serverStream1, isA<UDXStream>());
 

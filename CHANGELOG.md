@@ -5,6 +5,17 @@ All notable changes to dart-udx will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Crossing dials are two connections, not one.** When both ends dial each other at once (a hole punch), a SYN that arrived while this side's own dial to that address was still pending was folded into the dial, on the assumption that the peer would fold ours too. go-udx and js-udx never do: they keep both connections, so the folded socket answered whichever of the peer's two connections had last sent it a packet, and neither worked. Every new connection id is now its own connection, emitted on `connections`, as with go-udx; a hole punch leaves one connection each way. Code that relied on two `createSocket` dials meeting as one connection must accept the peer's dial instead.
+
+### Fixed
+
+- **A dial no longer reuses a connection the peer opened.** `createSocket` returned any socket for the address, including one accepted from the peer, so a dial made after the peer's SYN arrived was sent over the peer's connection. Only dials are reused by address now.
+- `handleIncomingDatagramForTest` routes through the same code as received datagrams; it had its own, older copy.
+
 ## [3.1.0] - 2026-10-02
 
 Interoperability fixes found while porting UDX to TypeScript (js-udx), checked

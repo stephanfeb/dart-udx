@@ -38,7 +38,7 @@ void main() {
     late UDXMultiplexer multiplexerA;
     late UDXMultiplexer multiplexerB;
     late UDPSocket socketA;
-    late UDPSocket socketB;
+    late Future<UDPSocket> acceptedB;
     UDXStream? streamA;
     UDXStream? streamB;
 
@@ -49,7 +49,8 @@ void main() {
       multiplexerA = UDXMultiplexer(rawSocketA);
       multiplexerB = UDXMultiplexer(rawSocketB);
       socketA = multiplexerA.createSocket(udx, rawSocketB.address.address, rawSocketB.port);
-      socketB = multiplexerB.createSocket(udx, rawSocketA.address.address, rawSocketA.port);
+      // B is the side being dialed: its socket is the connection it accepts.
+      acceptedB = multiplexerB.connections.first;
     });
 
     tearDown(() {
@@ -66,8 +67,9 @@ void main() {
       final closeCompleterB = Completer<void>();
       final errorCompleterB = Completer<dynamic>();
 
-      // Setup listener for incoming stream on socket B
-      socketB.on('stream').listen((event) {
+      // Setup listener for incoming stream on the connection B accepts
+      acceptedB.then((socketB) {
+        socketB.on('stream').listen((event) {
         streamB = event.data as UDXStream;
         streamB!.on('close').listen((_) => closeCompleterB.complete());
         streamB!.on('error').listen((err) {
@@ -76,8 +78,9 @@ void main() {
           }
         });
         completerB.complete(streamB);
+        });
+        socketB.flushStreamBuffer();
       });
-      socketB.flushStreamBuffer();
 
       // Create outgoing stream from socket A
       streamA = await UDXStream.createOutgoing(

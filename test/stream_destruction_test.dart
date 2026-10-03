@@ -14,7 +14,6 @@ void main() {
     late UDXMultiplexer multiplexer1;
     late UDXMultiplexer multiplexer2;
     late UDPSocket socket1;
-    late UDPSocket socket2;
     late UDXStream stream;
 
     setUp(() async {
@@ -24,13 +23,16 @@ void main() {
       multiplexer1 = UDXMultiplexer(rawSocket1);
       multiplexer2 = UDXMultiplexer(rawSocket2);
       socket1 = multiplexer1.createSocket(udx, rawSocket2.address.address, rawSocket2.port);
-      socket2 = multiplexer2.createSocket(udx, rawSocket1.address.address, rawSocket1.port);
 
+      // multiplexer2 is the side being dialed: its socket is the connection
+      // it accepts.
       final completer = Completer<UDXStream>();
-      socket2.on('stream').listen((event) {
-        completer.complete(event.data as UDXStream);
+      multiplexer2.connections.first.then((socket2) {
+        socket2.on('stream').listen((event) {
+          completer.complete(event.data as UDXStream);
+        });
+        socket2.flushStreamBuffer();
       });
-      socket2.flushStreamBuffer();
 
       stream = await UDXStream.createOutgoing(
         udx,

@@ -15,7 +15,7 @@ void main() {
     late UDXMultiplexer multiplexerA;
     late UDXMultiplexer multiplexerB;
     late UDPSocket socketA;
-    late UDPSocket socketB;
+    late Future<UDPSocket> acceptedB;
 
     setUp(() async {
       udx = UDX();
@@ -24,7 +24,8 @@ void main() {
       multiplexerA = UDXMultiplexer(rawSocketA);
       multiplexerB = UDXMultiplexer(rawSocketB);
       socketA = multiplexerA.createSocket(udx, rawSocketB.address.address, rawSocketB.port);
-      socketB = multiplexerB.createSocket(udx, rawSocketA.address.address, rawSocketA.port);
+      // B is the side being dialed: its socket is the connection it accepts.
+      acceptedB = multiplexerB.connections.first;
     });
 
     tearDown(() {
@@ -34,13 +35,6 @@ void main() {
 
     test('peer B should create a new stream upon receiving a SYN packet', () async {
       final completer = Completer<UDXStream>();
-
-      // Listen on socketB for a new stream event
-      final subscription = socketB.on('stream').listen((event) {
-        completer.complete(event.data as UDXStream);
-      });
-      addTearDown(subscription.cancel);
-      socketB.flushStreamBuffer();
 
       // 1. Stream A creates an outgoing stream targeting socketB
       final streamA = await UDXStream.createOutgoing(
@@ -52,6 +46,14 @@ void main() {
         rawSocketB.port,
       );
       addTearDown(streamA.close);
+
+      // Listen on the accepted connection for the new stream
+      final socketB = await acceptedB.timeout(const Duration(seconds: 2));
+      final subscription = socketB.on('stream').listen((event) {
+        completer.complete(event.data as UDXStream);
+      });
+      addTearDown(subscription.cancel);
+      socketB.flushStreamBuffer();
 
       // The createOutgoing method sends an initial packet with the SYN flag.
       // We wait for socketB to process it and emit the stream.
