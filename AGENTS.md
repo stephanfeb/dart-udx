@@ -8,7 +8,7 @@ This project uses **bd** (beads, 1.x) for issue tracking. Run `bd prime` for the
 bd ready              # Find available work
 bd show <id>          # View issue details
 bd update <id> --status in_progress  # Claim work
-bd close <id>         # Complete work
+bd close <id>         # Complete work (close children before their parent)
 bd export -o .beads/issues.jsonl     # Write the issues to the tracked file
 ```
 
@@ -30,7 +30,7 @@ loop) and do not set `sync.remote`.
    ```bash
    bd export -o .beads/issues.jsonl
    git add .beads/issues.jsonl   # with the code changes
-   git commit
+   git commit -m "..."
    git pull --rebase
    git push
    git status  # MUST show "up to date with origin"
