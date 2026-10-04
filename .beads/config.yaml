@@ -62,4 +62,4 @@
 # - github.repo
 
 sync:
-    remote: "git+ssh://git@github.com/stephanfeb/dart-udx.git"
+    # remote: "git+ssh://git@github.com/stephanfeb/dart-udx.git"
