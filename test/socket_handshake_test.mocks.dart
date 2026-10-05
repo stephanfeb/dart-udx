@@ -136,6 +136,7 @@ class MockUDXMultiplexer extends _i1.Mock implements _i4.UDXMultiplexer {
     _i5.ConnectionId? localCid,
     _i5.ConnectionId? remoteCid,
     bool? isServer = false,
+    bool? shared = true,
   }) =>
       (super.noSuchMethod(
         Invocation.method(
@@ -149,6 +150,7 @@ class MockUDXMultiplexer extends _i1.Mock implements _i4.UDXMultiplexer {
             #localCid: localCid,
             #remoteCid: remoteCid,
             #isServer: isServer,
+            #shared: shared,
           },
         ),
         returnValue: _FakeUDPSocket_1(
@@ -164,6 +166,7 @@ class MockUDXMultiplexer extends _i1.Mock implements _i4.UDXMultiplexer {
               #localCid: localCid,
               #remoteCid: remoteCid,
               #isServer: isServer,
+            #shared: shared,
             },
           ),
         ),

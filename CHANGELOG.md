@@ -5,6 +5,12 @@ All notable changes to dart-udx will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.1.0] - 2026-10-05
+
+### Added
+
+- **`createSocket(..., shared: false)` makes a dial that is its own connection.** By default, a second dial to the same `host:port` returns the first dial's socket. Two callers that dialed one address at once then shared one connection and one close: when one caller gave up on its dial and closed its socket, the connection of the other caller also closed. With `shared: false`, each call makes a new socket with its own connection ID, as in go-udx, and later calls do not get it back. The default does not change.
+
 ## [4.0.0] - 2026-10-04
 
 One breaking change: crossing dials stay two connections, as with go-udx and

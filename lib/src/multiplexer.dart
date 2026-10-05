@@ -173,9 +173,15 @@ class UDXMultiplexer {
 
   /// Creates or retrieves a `UDPSocket` for a given peer.
   ///
-  /// For dialing: a second call for the same `host:port` returns the first
-  /// socket. Inbound connections don't go through this; each one gets its own
-  /// socket, keyed by its connection ID.
+  /// For dialing: when [shared] is true (the default), a second call for the
+  /// same `host:port` returns the first socket. Inbound connections don't go
+  /// through this; each one gets its own socket, keyed by its connection ID.
+  ///
+  /// When [shared] is false, the call always makes a new socket with its own
+  /// connection ID, and later calls do not get it back. Use this when each
+  /// dial must be a separate connection, as in go-udx: two callers that share
+  /// one socket also share its close, so a caller that gives up on its dial
+  /// and closes the socket also closes the other caller's connection.
   UDPSocket createSocket(
     UDX udx,
     String host,
@@ -183,11 +189,14 @@ class UDXMultiplexer {
     ConnectionId? localCid,
     ConnectionId? remoteCid,
     bool isServer = false,
+    bool shared = true,
   }) {
-    final peerKey = '$host:$port';
-    final existing = socketsByPeer[peerKey];
-    if (existing != null) return existing;
-    return _newSocket(udx, host, port, localCid: localCid, remoteCid: remoteCid, isServer: isServer);
+    if (shared) {
+      final existing = socketsByPeer['$host:$port'];
+      if (existing != null) return existing;
+    }
+    return _newSocket(udx, host, port,
+        localCid: localCid, remoteCid: remoteCid, isServer: isServer, shared: shared);
   }
 
   UDPSocket _newSocket(
@@ -197,6 +206,7 @@ class UDXMultiplexer {
     ConnectionId? localCid,
     ConnectionId? remoteCid,
     bool isServer = false,
+    bool shared = true,
   }) {
     final effectiveLocalCid = localCid ?? ConnectionId.random();
     final effectiveRemoteCid = remoteCid ?? ConnectionId.random();
@@ -210,9 +220,9 @@ class UDXMultiplexer {
       isServer: isServer,
     );
     socketsByCid[effectiveLocalCid] = newSocket;
-    // Only a dial is reused by address; a connection the peer opened is not
-    // this side's to send a new dial over.
-    if (!isServer) socketsByPeer.putIfAbsent('$host:$port', () => newSocket);
+    // Only a shared dial is reused by address; a connection the peer opened
+    // is not this side's to send a new dial over.
+    if (!isServer && shared) socketsByPeer.putIfAbsent('$host:$port', () => newSocket);
     return newSocket;
   }
 
