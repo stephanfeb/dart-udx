@@ -5,6 +5,16 @@ All notable changes to dart-udx will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.2.0] - 2026-10-18
+
+### Fixed
+
+- **A multiplexer whose UDP socket stopped kept its connections on a dead socket** (dartudx-5ry). Dart closes a socket on any error, for example when Android refuses the packets of an app whose network it cut while the screen was off. The multiplexer had no error or done handler and ignored `RawSocketEvent.closed`, so it did not notice. Its connections stayed open, sends went nowhere, and every dial through it timed out. Now the multiplexer closes its connections and its `connections` stream when its socket stops, and sends nothing more.
+
+### Added
+
+- **`UDXMultiplexer.done`** completes when the socket stops, with the error it stopped with, if any. **`UDXMultiplexer.lost`** is true when the socket stopped by itself, not by `close()`. A listener can use it to bind a new socket.
+
 ## [4.1.0] - 2026-10-05
 
 ### Added

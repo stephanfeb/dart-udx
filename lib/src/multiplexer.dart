@@ -4,6 +4,7 @@ import 'dart:typed_data';
 
 import 'package:dart_udx/src/cid.dart';
 import 'package:dart_udx/src/packet.dart';
+import 'package:dart_udx/src/logging.dart';
 import 'package:dart_udx/src/socket.dart';
 import 'package:meta/meta.dart';
 
@@ -16,11 +17,27 @@ import 'metrics_observer.dart';
 /// packets to the appropriate `UDPSocket` instance based on their destination
 /// Connection ID (CID).
 class UDXMultiplexer {
-  UDXMultiplexer(this.socket, {this.metricsObserver}) {
+  UDXMultiplexer(this.socket, {this.metricsObserver}) : _port = socket.port {
     socket.readEventsEnabled = true;
     socket.writeEventsEnabled = false; // We'll enable when needed
     _listen();
   }
+
+  /// The port the socket was bound to: still known once the socket is gone.
+  final int _port;
+
+  final _done = Completer<Object?>();
+
+  /// Completes once the socket stops: closed by [close], or [lost]. Its
+  /// value is the error the socket stopped with, if it had one.
+  Future<Object?> get done => _done.future;
+
+  /// Whether the socket stopped by itself rather than by [close]: an OS
+  /// error (Dart closes a socket on any error, such as a send the OS
+  /// refuses while an app's network is cut) or the OS closing it. The
+  /// connections on it are closed; a listener should bind a new socket.
+  bool get lost => _lost;
+  bool _lost = false;
 
   /// The underlying UDP socket that this multiplexer listens on.
   final RawDatagramSocket socket;
@@ -45,14 +62,36 @@ class UDXMultiplexer {
 
   /// Starts listening for incoming datagrams and routes them.
   void _listen() {
-    socket.listen((event) {
-      if (event == RawSocketEvent.read) {
-        final datagram = socket.receive();
-        if (datagram == null) return;
+    socket.listen(
+      (event) {
+        if (event == RawSocketEvent.read) {
+          final datagram = socket.receive();
+          if (datagram == null) return;
 
-        _route(datagram.data, datagram.address, datagram.port);
-      }
-    });
+          _route(datagram.data, datagram.address, datagram.port);
+        } else if (event == RawSocketEvent.closed) {
+          _stopped(null);
+        }
+      },
+      onError: (Object error, StackTrace _) => _stopped(error),
+      onDone: () => _stopped(null),
+    );
+  }
+
+  /// The socket stopped without [close]: its connections can no longer
+  /// send or receive, so they close now rather than time out one by one.
+  void _stopped(Object? error) {
+    if (_done.isCompleted) return;
+    _lost = true;
+    UdxLogging.warn('multiplexer socket on port $_port stopped: ${error ?? 'closed'}; '
+        'closing ${socketsByCid.length} connection(s)');
+    for (final s in List<UDPSocket>.from(socketsByCid.values)) {
+      unawaited(s.close().catchError((_) {}));
+    }
+    socketsByCid.clear();
+    socketsByPeer.clear();
+    _done.complete(error);
+    _connectionsController.close();
   }
 
   /// Routes one datagram to its connection by destination CID, or opens a
@@ -141,11 +180,14 @@ class UDXMultiplexer {
     }
     socketsByCid.clear();
     socket.close();
+    if (!_done.isCompleted) _done.complete(null);
     _connectionsController.close();
   }
 
-  /// Sends a datagram to the specified address and port.
+  /// Sends a datagram to the specified address and port. Nothing goes once
+  /// the socket has stopped.
   void send(Uint8List data, InternetAddress address, int port) {
+    if (_done.isCompleted) return;
     socket.send(data, address, port);
   }
 
