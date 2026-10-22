@@ -64,6 +64,19 @@ const Duration handshakeTimeout = Duration(seconds: 10);
 // Congestion Control
 // =============================================================================
 
+/// The largest datagram stream data goes out in: what any internet path
+/// carries, as QUIC's 1200 (RFC 9000 section 14), so it fits the 1280-byte
+/// IPv6 minimum MTU with its headers. Mobile carriers' tunnels (464XLAT,
+/// GTP) carry less than 1500 and drop a larger datagram that may not be
+/// fragmented: a write of more than one full datagram then never arrives,
+/// and the connection is given up. go-udx sends the same size.
+const int safeDatagramSize = 1200;
+
+/// A stream packet's bytes besides its data: the packet header with both
+/// connection IDs at their longest (20 bytes each), and the stream frame's
+/// header.
+const int streamPacketOverhead = 70;
+
 /// Maximum datagram size (typical MTU minus IP/UDP headers)
 const int maxDatagramSize = 1472;
 

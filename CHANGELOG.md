@@ -5,6 +5,12 @@ All notable changes to dart-udx will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.2.1] - 2026-10-22
+
+### Fixed
+
+- **A write of more than one packet never crossed a mobile carrier's path.** Stream data went out in datagrams of up to 1454 bytes. A carrier's tunnel (464XLAT, GTP) carries less than 1500 and drops a larger datagram that may not be fragmented, so the write stalled until the connection was given up: a phone on Rogers 5G could not send a photo, a post with an image or its prekeys. Stream data now goes out in datagrams of at most 1200 bytes (`safeDatagramSize`, QUIC's 1200), which fit the 1280-byte IPv6 minimum MTU with the longest connection IDs. go-udx v0.1.4 sends the same size. `test/small_mtu_path_test.dart` sends 8 KB across a 1350-byte path.
+
 ## [4.2.0] - 2026-10-18
 
 ### Fixed

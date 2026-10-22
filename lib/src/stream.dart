@@ -3,6 +3,7 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import 'cid.dart';
+import 'constants.dart';
 import 'events.dart';
 import 'logging.dart';
 import 'udx.dart';
@@ -101,11 +102,11 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
   /// Whether this stream was created by this endpoint.
   final bool isInitiator;
 
-  /// The maximum transmission unit (MTU)
+  /// The largest datagram this stream's data goes out in.
   int get mtu => _mtu;
-  int _mtu = 1400;
+  final int _mtu = safeDatagramSize;
 
-  int get _maxPayloadSize => _mtu - 16;
+  int get _maxPayloadSize => _mtu - streamPacketOverhead;
 
   /// Maximum number of retransmission attempts before considering packet lost
   int maxRetransmissionAttempts = 10;
@@ -889,6 +890,6 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
     _socket = socket;
   }
 
-  // Calculate max payload size based on default MTU (1400) minus headers (16)
-  static int getMaxPayloadSizeTestHook() => 1400 - 16;
+  // The data one stream packet carries (see safeDatagramSize).
+  static int getMaxPayloadSizeTestHook() => safeDatagramSize - streamPacketOverhead;
 }
