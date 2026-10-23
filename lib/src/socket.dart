@@ -12,6 +12,7 @@ import 'packet.dart';
 import 'congestion.dart';
 import 'multiplexer.dart';
 import 'pmtud.dart';
+import 'recv_tracker.dart';
 import 'metrics_observer.dart';
 import 'logging.dart';
 import 'version.dart';
@@ -85,11 +86,25 @@ class UDPSocket with UDXEventEmitter {
   /// Connection-level congestion controller.
   late final CongestionController _congestionController;
 
-  /// Tracks received packet sequences for ACK generation.
-  final Set<int> _receivedPacketSequences = {};
+  /// Which ack-eliciting packets have arrived, for the ACK's ranges.
+  final RecvTracker _recvd = RecvTracker();
 
-  /// Arrival time of the largest-acked packet, for ACK delay calculation.
-  DateTime? _largestAckedPacketArrivalTime;
+  /// Ack-eliciting packets received since the last ACK went out, the ACK
+  /// timer that flushes them, and when the largest sequence arrived (what
+  /// the frame's ackDelay reports, so the sender's RTT sample is honest).
+  int _ackPending = 0;
+  Timer? _ackTimer;
+  DateTime? _largestArrival;
+
+  /// Acknowledgement policy (RFC 9000 section 13.2), as go-udx's: at once
+  /// when a packet is out of order or opens or closes a stream or carries a
+  /// PING or MTU probe, otherwise after every [ackElicitingThreshold]
+  /// ack-eliciting packets or when the ACK timer fires, whichever is first.
+  /// The timer is a quarter of the smoothed RTT within [minAckDelay,
+  /// maxAckDelay]; the sender subtracts at most maxAckDelay from its sample.
+  static const int ackElicitingThreshold = 2;
+  static const Duration minAckDelay = Duration(milliseconds: 1);
+  static const Duration maxAckDelay = Duration(milliseconds: 25);
 
   /// Completes when a writer may have gained send credit: bytes acknowledged
   /// (the congestion window and the connection's send window both open),
@@ -244,6 +259,7 @@ class UDPSocket with UDXEventEmitter {
     if (_closing) return;
     _closing = true;
     _idleTimer?.cancel();
+    _ackTimer?.cancel();
     notifySendCredit();
     UdxLogging.warn(
         'socket idle-timeout close: cid=${cids.localCid} peer=${remoteAddress.address}:$remotePort '
@@ -407,22 +423,16 @@ class UDPSocket with UDXEventEmitter {
       // every stream on the connection — one lossy stream held up all its
       // siblings — and it was the only thing keeping the byte stream contiguous,
       // so it could not simply be removed. Offsets replace it.
-      bool containsAckElicitingFrames =
-          udxPacket.frames.any((f) => f is StreamFrame || f is PingFrame);
-      bool hasStreamData = udxPacket.frames
-          .any((f) => f is StreamFrame && (f.data.isNotEmpty || f.isFin || f.isSyn));
+      final ackEliciting =
+          udxPacket.frames.any((f) => f is StreamFrame || f is PingFrame || f is MtuProbeFrame);
 
-      if (hasStreamData) {
-        _largestAckedPacketArrivalTime = DateTime.now();
-      }
       _processPacketFrames(udxPacket, fromAddress, fromPort);
 
-      if (containsAckElicitingFrames) {
+      if (ackEliciting) {
         // ACKs reflect receipt, not delivery. A packet whose bytes are waiting
         // on an earlier gap has still arrived, and saying so lets the peer
         // retransmit only what is genuinely missing.
-        _receivedPacketSequences.add(udxPacket.sequence);
-        _sendConnectionAck();
+        _noteReceived(udxPacket);
       }
     } catch (e) {
       // Ignore invalid packets
@@ -594,22 +604,70 @@ class UDPSocket with UDXEventEmitter {
     }
   }
 
-  /// Sends a connection-level ACK for received packets.
+  /// Records an ack-eliciting packet and decides whether to acknowledge now
+  /// or later (RFC 9000 section 13.2; go-udx's noteReceived).
+  ///
+  /// Now: the packet is out of order (the sender should learn of the gap
+  /// without waiting), or it opens or closes a stream (a SYN is what a dial
+  /// is waiting on; a FIN's ACK lets the sender retire the stream), or it
+  /// carries a PING or MTU probe (the sender is timing the answer), or it is
+  /// the [ackElicitingThreshold]-th unacknowledged packet. Later: the ACK
+  /// timer. Every packet used to be acknowledged on arrival, one datagram
+  /// sent for every datagram received.
+  void _noteReceived(UDXPacket packet) {
+    final now = DateTime.now();
+    var edge = false;
+    for (final f in packet.frames) {
+      if (f is StreamFrame && (f.isSyn || f.isFin)) {
+        edge = true;
+        break;
+      }
+      if (f is PingFrame || f is MtuProbeFrame) {
+        edge = true;
+        break;
+      }
+    }
+
+    final hadAny = _recvd.any;
+    final before = _recvd.largest;
+    final outOfOrder = _recvd.add(packet.sequence);
+    if (!hadAny || _recvd.largest != before) {
+      _largestArrival = now;
+    }
+    _ackPending++;
+    if (outOfOrder || edge || _ackPending >= ackElicitingThreshold) {
+      _sendConnectionAck();
+      return;
+    }
+    if (_ackTimer == null) {
+      var delay = _congestionController.smoothedRtt ~/ 4;
+      if (delay < minAckDelay) delay = minAckDelay;
+      if (delay > maxAckDelay) delay = maxAckDelay;
+      _ackTimer = Timer(delay, () {
+        _ackTimer = null;
+        if (_ackPending > 0) _sendConnectionAck();
+      });
+    }
+  }
+
+  /// Sends the ACK for everything received, with ranges from the history,
+  /// and disarms the ACK timer.
   void _sendConnectionAck() {
-    if (_closing || _receivedPacketSequences.isEmpty) return;
+    _ackTimer?.cancel();
+    _ackTimer = null;
+    _ackPending = 0;
+    if (_closing || !_recvd.any) return;
 
-    final sortedSequences = _receivedPacketSequences.toList()..sort();
-
+    var ackDelayMs = 0;
+    final arrival = _largestArrival;
+    if (arrival != null) {
+      ackDelayMs = DateTime.now().difference(arrival).inMilliseconds.clamp(0, 65535);
+    }
+    final ackFrame = _recvd.frame(ackDelayMs);
     if (UdxLogging.info) {
-      UdxLogging.infoLog('[DIAG-UDX-ACK-OUT] seqs=${sortedSequences.length} largest=${sortedSequences.last}');
+      UdxLogging.infoLog('[DIAG-UDX-ACK-OUT] largest=${ackFrame.largestAcked} '
+          'first=${ackFrame.firstAckRangeLength} ranges=${ackFrame.ackRanges.length} delay=${ackDelayMs}ms');
     }
-    int ackDelayMs = 0;
-    if (_largestAckedPacketArrivalTime != null) {
-      ackDelayMs = DateTime.now().difference(_largestAckedPacketArrivalTime!).inMilliseconds;
-      ackDelayMs = ackDelayMs.clamp(0, 65535);
-    }
-
-    final ackFrame = AckFrame.fromReceived(sortedSequences, ackDelay: ackDelayMs);
 
     // ACK-only packets reuse last sent sequence to avoid consuming new sequences
     final ackSeq = _packetManager.lastSentPacketNumber >= 0
@@ -625,9 +683,11 @@ class UDPSocket with UDXEventEmitter {
       frames: [ackFrame],
     );
 
-    send(ackPacket.toBytes());
-    _receivedPacketSequences.clear();
-    _largestAckedPacketArrivalTime = null;
+    try {
+      send(ackPacket.toBytes());
+    } catch (_) {
+      // The socket closed under us; nothing to acknowledge to.
+    }
   }
 
   /// Sends data to the peer via the multiplexer.
@@ -716,6 +776,7 @@ class UDPSocket with UDXEventEmitter {
     if (_closing) return;
     _closing = true;
     _idleTimer?.cancel();
+    _ackTimer?.cancel();
     notifySendCredit();
     UdxLogging.warn(
         'socket closeWithError: code=$errorCode reason="$reason" '
@@ -774,6 +835,7 @@ class UDPSocket with UDXEventEmitter {
     if (_closing) return;
     _closing = true;
     _idleTimer?.cancel();
+    _ackTimer?.cancel();
     notifySendCredit();
     UdxLogging.warn(
         'socket close(): cid=${cids.localCid} peer=${remoteAddress.address}:$remotePort '
