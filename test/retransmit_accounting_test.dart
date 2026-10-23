@@ -181,7 +181,9 @@ void main() {
     final rttBefore = cc.smoothedRtt;
     const marker = Duration(seconds: 2); // a value no loopback sample would leave in place
     cc.setSmoothedRtt(marker);
-    await _transfer(clientStream, receiver, payload);
+    // Enough packets for a dozen ACKs at full-size datagrams (one ACK per
+    // two packets).
+    await _transfer(clientStream, receiver, Uint8List.fromList(List.generate(32 * 1024, (i) => i % 251)));
     await Future<void>.delayed(const Duration(milliseconds: 300));
 
     // Smoothing is 1/8 per sample, so a dozen loopback samples bring the

@@ -101,14 +101,26 @@ const double lossDetectionThresholdDen = 8;
 // Path MTU Discovery
 // =============================================================================
 
-/// Minimum MTU to probe (IPv6 minimum)
-const int minMtu = 1280;
+// In datagram bytes: the search probes up from [safeDatagramSize] towards
+// [maxDatagramSize] (MtuDiscovery), as go-udx does.
 
-/// Maximum MTU to probe (common Ethernet MTU minus headers)
-const int maxMtu = 1500;
+/// How many times a probe size is lost before it is ruled out: one loss is
+/// as likely congestion as a path that cannot carry it.
+const int mtuProbeTries = 3;
 
-/// MTU probe timeout
-const Duration mtuProbeTimeout = Duration(seconds: 2);
+/// The search ends once the validated size is this close to one that failed.
+const int mtuSearchStep = 16;
+
+/// How many full-size data packets must be lost in a row, with none
+/// acknowledged in between, before the path is taken to have shrunk.
+const int blackholePackets = 3;
+
+/// The same conclusion from probe timeouts, when nothing at all is
+/// acknowledged any more.
+const int blackholePtos = 3;
+
+/// How long after a black hole the search starts over.
+const Duration blackholeRetry = Duration(minutes: 1);
 
 // =============================================================================
 // Anti-Amplification

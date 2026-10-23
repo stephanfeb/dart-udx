@@ -12,6 +12,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:dart_udx/dart_udx.dart';
+import 'package:dart_udx/src/constants.dart';
 import 'package:test/test.dart';
 
 /// A relay from a client to a server that counts what passes each way, can
@@ -142,7 +143,10 @@ void main() {
     await Future<void>.delayed(const Duration(milliseconds: 50)); // the SYN's ACK
     relay.acks.clear();
 
-    await transfer(clientStream, serverStream, Uint8List(60 * 1130)); // 60 full packets
+    // 60 full packets, at whatever datagram size the path has been found
+    // to carry by now (the search runs on the first ACKs).
+    final perPacket = clientStream.mtu - streamPacketOverhead;
+    await transfer(clientStream, serverStream, Uint8List(60 * perPacket));
     await Future<void>.delayed(const Duration(milliseconds: 100)); // the timer's last ACK
 
     expect(relay.dataPackets, greaterThanOrEqualTo(60));
@@ -160,9 +164,10 @@ void main() {
     final (clientStream, serverStream) = await connect();
     await Future<void>.delayed(const Duration(milliseconds: 50));
     relay.acks.clear();
-    relay.dropOffsets.add(2 * 1130); // the third data packet, first transmission only
+    final perPacket = clientStream.mtu - streamPacketOverhead;
+    relay.dropOffsets.add(2 * perPacket); // the third data packet, first transmission only
 
-    await transfer(clientStream, serverStream, Uint8List(8 * 1130));
+    await transfer(clientStream, serverStream, Uint8List(8 * perPacket));
     await Future<void>.delayed(const Duration(milliseconds: 100));
 
     final withGap = relay.acks.where((a) => a.ackRanges.isNotEmpty).toList();
@@ -172,12 +177,14 @@ void main() {
     // The resend goes out under a fresh sequence, so the dropped sequence is
     // never received and its gap stays in the history; the sender no longer
     // tracks that sequence, so the gap costs nothing. The last ACK names
-    // every sequence that arrived: the SYN, the seven other originals and
-    // the resend (one per data packet the relay saw), around the one hole.
+    // every sequence that arrived: the SYN, the path-MTU probe that went
+    // out on the SYN's ACK, the seven other originals and the resend (one
+    // per data packet the relay saw), around the one hole.
     final last = relay.acks.last;
-    expect(last.ackRanges.map((r) => (r.gap, r.ackRangeLength)).toList(), [(1, 3)]);
-    expect(acknowledged(last).length, relay.dataPackets);
-    expect(last.largestAcked, relay.dataPackets, reason: 'the resend has the newest sequence');
+    expect(last.ackRanges.map((r) => (r.gap, r.ackRangeLength)).toList(), [(1, 4)],
+        reason: 'below the hole: the SYN, the probe and two data packets');
+    expect(acknowledged(last).length, relay.dataPackets + 1, reason: 'the data packets and the probe');
+    expect(last.largestAcked, relay.dataPackets + 1, reason: 'the resend has the newest sequence');
     await clientStream.close();
   });
 }

@@ -20,7 +20,12 @@ class LostQueue {
     required this.congestionController,
     required this.clock,
     required this.send,
+    this.maxDatagram,
   });
+
+  /// The datagram size the path carries now (MtuDiscovery): a queued packet
+  /// larger than it is re-chunked before it goes out.
+  final int Function()? maxDatagram;
 
   final PacketManager packetManager;
   final CongestionController congestionController;
@@ -51,6 +56,16 @@ class LostQueue {
       if (packet.isAcked) {
         _queue.removeAt(0);
         continue;
+      }
+      final limit = maxDatagram?.call();
+      if (limit != null && (packet.wireSize ?? packet.toBytes().length) > limit) {
+        // The path shrank under it: its pieces take its place in the
+        // queue, each through the gates below.
+        final pieces = packetManager.fitToPath(packet, limit);
+        if (pieces.length > 1) {
+          _queue.replaceRange(0, 1, pieces);
+          continue;
+        }
       }
       final wait = congestionController.pacingController.timeUntilSend();
       if (wait > Duration.zero) {

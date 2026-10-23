@@ -1,143 +1,149 @@
-import 'dart:math';
+import 'clock.dart';
+import 'constants.dart';
 
-import 'cid.dart';
-import 'packet.dart';
-
-/// The default minimum MTU, based on IPv6 standards.
-const int defaultMinMtu = 1280;
-
-/// The default maximum MTU to probe for.
-const int defaultMaxMtu = 1500;
-
-/// Represents the state of the Path MTU Discovery process.
-enum PmtudState {
-  /// The initial state before any probing has begun.
-  initial,
-
-  /// The state where the controller is actively sending probes to find the MTU.
-  searching,
-
-  /// The state where the MTU has been validated and is considered stable.
-  validated,
-}
-
-/// Implements Datagram Packetization Layer Path MTU Discovery (DPLPMTUD)
-/// as described in RFC 8899.
+/// Finds how large a datagram the path carries, in the packetization layer
+/// (DPLPMTUD, RFC 8899; RFC 9000 section 14), and watches for the path
+/// shrinking underneath a validated size. go-udx's MTUDiscovery.
 ///
-/// This controller manages the state and logic for discovering and maintaining
-/// the maximum transmission unit (MTU) for a network path.
-class PathMtuDiscoveryController {
-  /// The minimum MTU to consider for the path.
-  final int minMtu;
-
-  /// The maximum MTU to consider for the path.
-  final int maxMtu;
-
-  /// The current state of the PMTUD process.
-  PmtudState _state = PmtudState.initial;
-  PmtudState get state => _state;
-
-  /// The currently validated and usable MTU for the path.
-  int _currentMtu;
-  int get currentMtu => _currentMtu;
-
-  /// The size of the next probe packet to be sent.
-  int _probeMtu = 0;
-
-  /// A map to track in-flight probes by their packet sequence number.
-  final Map<int, int> _inFlightProbes = {};
-
-  PathMtuDiscoveryController({
-    this.minMtu = defaultMinMtu,
-    this.maxMtu = defaultMaxMtu,
-  }) : _currentMtu = minMtu;
-
-  /// Builds a UDX packet to be used as an MTU probe.
-  ///
-  /// The packet is padded with an `MtuProbeFrame` to reach the desired probe size.
-  /// Returns the packet and its sequence number.
-  (UDXPacket, int) buildProbePacket(ConnectionId destCid, ConnectionId srcCid,
-      int destId, int srcId, int sequence) {
-    // Start with the base MTU and search upwards.
-    if (_state == PmtudState.initial) {
-      _probeMtu = minMtu;
-      _state = PmtudState.searching;
-    }
-
-    // The size of the probe frame needs to account for the UDX packet header.
-    // v2 header format: version(4) + dcidLen(1) + dcid(8) + scidLen(1) + scid(8) + seq(4) + destId(4) + srcId(4) = 34 bytes
-    final frameSize = _probeMtu - 34; // 34 bytes for the UDX v2 header with default CID length
-    if (frameSize <= 0) {
-      // This should not happen with reasonable MTU values.
-      throw StateError('Calculated frame size for MTU probe is not positive.');
-    }
-
-    final probePacket = UDXPacket(
-      destinationCid: destCid,
-      sourceCid: srcCid,
-      destinationStreamId: destId,
-      sourceStreamId: srcId,
-      sequence: sequence,
-      frames: [MtuProbeFrame(probeSize: frameSize)],
-    );
-
-    _inFlightProbes[sequence] = _probeMtu;
-    return (probePacket, sequence);
+/// Streams send datagrams of [safeDatagramSize], 1200 bytes, which any path
+/// carries. The search probes up from there towards [maxDatagramSize] with
+/// packets padded to the size under test: one is acknowledged, that size is
+/// validated and streams use it; one is lost [mtuProbeTries] times, that
+/// size is ruled out. The next size is halfway between the largest
+/// validated and the smallest ruled out, and the search ends when the two
+/// are within [mtuSearchStep]. A probe is numbered and tracked like data, so
+/// the ACK ranges and loss detection report on it, but it is never re-sent,
+/// is not booked in flight, and its loss is no congestion signal (section
+/// 14.4).
+///
+/// A black hole is a path that stopped carrying the validated size: a
+/// carrier's tunnel on the far side of a handover, where every full-size
+/// packet vanishes and only the small ones get through. [blackholePackets]
+/// consecutive full-size data packets lost with none acknowledged in
+/// between, or [blackholePtos] probe timeouts in a row (nothing at all is
+/// being acknowledged), take the size back to [safeDatagramSize] at once;
+/// re-sends are re-chunked to fit (PacketManager.fitToPath), and the search
+/// starts over after [blackholeRetry].
+///
+/// This was a controller that nothing drove: the socket asked it whether to
+/// probe in a state where the answer was always no, and every stream sent
+/// 1200-byte datagrams for the life of the connection.
+class MtuDiscovery {
+  MtuDiscovery({Clock? clock}) : clock = clock ?? const SystemClock() {
+    _restart();
   }
 
-  /// Handles the acknowledgment of a packet that was an MTU probe.
-  ///
-  /// This method updates the current MTU and adjusts the search state.
-  void onProbeAcked(int sequence) {
-    if (!_inFlightProbes.containsKey(sequence)) return;
+  final Clock clock;
 
-    final ackedProbeSize = _inFlightProbes.remove(sequence)!;
+  int _current = safeDatagramSize;
+  int _probe = 0;
+  int _lowFailed = 0;
+  int _tries = 0;
+  bool _inFlight = false;
+  bool _done = false;
 
-    // The probe was successful, so this size is now our validated MTU.
-    _currentMtu = ackedProbeSize;
+  /// When the search restarts after a black hole; null when there was none.
+  Duration? _retryAt;
 
-    // Continue searching for a larger MTU using a binary search approach.
-    // The next probe size is halfway between the current and max MTU.
-    // We add 1 to round up, ensuring the search doesn't get stuck.
-    final nextProbeSize = (_currentMtu + maxMtu + 1) ~/ 2;
+  /// Consecutive lost data packets larger than the base with none
+  /// acknowledged since.
+  int _largeLost = 0;
 
-    if (nextProbeSize > _currentMtu) {
-      _probeMtu = nextProbeSize;
-      _state = PmtudState.searching;
-    } else {
-      // We have reached the maximum or can't probe further.
-      _state = PmtudState.validated;
-    }
+  void _restart() {
+    _probe = maxDatagramSize;
+    _lowFailed = maxDatagramSize + 1;
+    _tries = 0;
+    _inFlight = false;
+    _done = false;
+    _retryAt = null;
+    _largeLost = 0;
   }
 
-  /// Handles the loss of a packet that was an MTU probe.
-  ///
-  /// This method adjusts the search range downwards.
-  void onProbeLost(int sequence) {
-    if (!_inFlightProbes.containsKey(sequence)) return;
+  /// The validated datagram size: what streams send now.
+  int get current => _current;
 
-    final lostProbeSize = _inFlightProbes.remove(sequence)!;
+  /// Whether the search has ended (also after a black hole, until the
+  /// retry).
+  bool get done => _done;
 
-    // The probe of size `lostProbeSize` failed. The new maximum we should
-    // try is one less than the failed size.
-    final newMax = lostProbeSize - 1;
-
-    // The next probe should be halfway between the last known good MTU
-    // and the new maximum.
-    _probeMtu = (_currentMtu + newMax) ~/ 2;
-
-    if (_probeMtu <= _currentMtu) {
-      // The search has concluded.
-      _state = PmtudState.validated;
-    } else {
-      _state = PmtudState.searching;
+  /// The size to probe now, marked in flight, or 0 when nothing is to be
+  /// sent: the search is over, a probe is already in flight, or the wait
+  /// after a black hole has not passed.
+  int nextProbe() {
+    final retry = _retryAt;
+    if (retry != null) {
+      if (clock.now() < retry) return 0;
+      _restart();
     }
+    if (_done || _inFlight) return 0;
+    _inFlight = true;
+    return _probe;
   }
 
-  /// Determines if a new probe should be sent based on the current state.
-  bool shouldSendProbe() {
-    // For now, we only send probes during the initial search.
-    // A more advanced implementation would periodically re-probe.
-    return _state == PmtudState.searching && _inFlightProbes.isEmpty;
+  /// Validates [size] and moves the search up.
+  void onProbeAcked(int size) {
+    _inFlight = false;
+    if (_retryAt != null) return; // stale: the path has shrunk since
+    if (size > _current) _current = size;
+    _tries = 0;
+    _next();
+  }
+
+  /// Counts a loss of [size]; the [mtuProbeTries]-th rules it out and moves
+  /// the search down.
+  void onProbeLost(int size) {
+    _inFlight = false;
+    if (_retryAt != null) return;
+    _tries++;
+    if (_tries < mtuProbeTries) return; // the same size again
+    _tries = 0;
+    if (size < _lowFailed) _lowFailed = size;
+    _next();
+  }
+
+  void _next() {
+    if (_lowFailed - _current <= mtuSearchStep) {
+      _done = true;
+      _probe = 0;
+      return;
+    }
+    _probe = (_current + _lowFailed) ~/ 2;
+  }
+
+  /// Told of every acknowledged data packet: a full-size one getting
+  /// through clears the black-hole count.
+  void onDataAcked(int size) {
+    if (size > safeDatagramSize) _largeLost = 0;
+  }
+
+  /// Told of every lost data packet: [blackholePackets] full-size ones in a
+  /// row, with none acknowledged between, mean the path no longer carries
+  /// the validated size.
+  void onDataLost(int size) {
+    if (_current <= safeDatagramSize || size <= safeDatagramSize) return;
+    _largeLost++;
+    if (_largeLost >= blackholePackets) _blackhole();
+  }
+
+  /// Takes the size back to the base at once, as the socket does after
+  /// [blackholePtos] probe timeouts in a row; the search restarts after
+  /// [blackholeRetry].
+  void blackhole() => _blackhole();
+
+  void _blackhole() {
+    if (_current <= safeDatagramSize) return;
+    _current = safeDatagramSize;
+    _probe = 0;
+    _done = true;
+    _inFlight = false;
+    _largeLost = 0;
+    _retryAt = clock.now() + blackholeRetry;
+  }
+
+  /// Starts over from the base, for a connection that moved to a new path
+  /// (RFC 9000 section 9.4).
+  void reset() {
+    _current = safeDatagramSize;
+    _restart();
   }
 }

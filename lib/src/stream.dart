@@ -102,11 +102,12 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
   /// Whether this stream was created by this endpoint.
   final bool isInitiator;
 
-  /// The largest datagram this stream's data goes out in.
-  int get mtu => _mtu;
-  final int _mtu = safeDatagramSize;
+  /// The largest datagram this stream's data goes out in: what the path has
+  /// been found to carry (UDPSocket.maxDatagram, MtuDiscovery), read at each
+  /// write.
+  int get mtu => _socket?.maxDatagram ?? safeDatagramSize;
 
-  int get _maxPayloadSize => _mtu - streamPacketOverhead;
+  int get _maxPayloadSize => mtu - streamPacketOverhead;
 
   /// How long a write waits for the connection's handshake, in seconds.
   int packetTimeoutTolerance = 30;

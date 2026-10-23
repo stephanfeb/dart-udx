@@ -504,12 +504,11 @@ class MtuProbeFrame extends Frame {
     return buffer;
   }
 
+  /// The probe is the rest of the packet: its type byte and the padding
+  /// after it. (Reading it as one byte left the padding to be parsed as a
+  /// thousand PADDING frames.)
   static MtuProbeFrame fromBytes(ByteData view, int offset) {
-    // The length of the probe is the remaining length of the packet.
-    // This frame should be the only one in a probe packet besides the header.
-    // The actual size is determined by the packet length, not a field here.
-    // We'll give it a nominal size of 1 for the type byte.
-    return MtuProbeFrame(probeSize: 1);
+    return MtuProbeFrame(probeSize: view.lengthInBytes - offset);
   }
 }
 
@@ -1060,6 +1059,15 @@ class UDXPacket {
   /// Whether the packet has been acknowledged
   bool isAcked = false;
 
+  /// A path-MTU probe (MtuDiscovery): numbered and tracked so its ACK or
+  /// loss is reported, but never re-sent, not booked in flight, and no
+  /// congestion signal when lost.
+  bool isProbe = false;
+
+  /// The datagram's length as sent, set by the sender; what the path-MTU
+  /// search judges a packet by.
+  int? wireSize;
+
   /// How many times this packet has been retransmitted, and when it last was.
   /// Used to space attempts and to collapse a near-simultaneous RTO timer and
   /// fast-retransmit into a single re-send.
@@ -1372,24 +1380,30 @@ class PacketManager {
   /// will say), their bytes stay in flight, and neither the window nor the
   /// pacer is consulted: a probe is allowed out when nothing else is (RFC
   /// 9002 section 7.7 exempts probes from pacing), though it is drawn from
-  /// the pacing budget so that what follows it is paced as if it had been. Returns
-  /// whether anything went out.
+  /// the pacing budget so that what follows it is paced as if it had been.
+  /// [maxDatagram], when given, is what the path carries now: a larger
+  /// packet is re-chunked to fit. Returns whether anything went out.
   ///
   /// This used to send a PING under [lastSentPacketNumber], the sequence of
   /// a data packet still in flight; both peers acknowledge a numbered PING,
   /// so a lost data packet could be marked acknowledged by its probe's ACK
   /// and never re-sent.
-  bool sendProbe() {
+  bool sendProbe({int? maxDatagram}) {
     var sent = false;
     for (final oldest in oldestUnacked(ptoProbes)) {
-      final newSeq = resend(oldest);
-      if (newSeq == null) continue;
-      sent = true;
-      onPacketRetransmitEvent?.call(newSeq, oldest.retransmitCount, congestionController.pto);
-      onRetransmit?.call(oldest);
-      // Drawn from the pacing budget, so what follows the probe is paced as
-      // if it had been (section 7.7 exempts the probe itself).
-      congestionController.pacingController.onPacketSent(oldest.toBytes().length);
+      // Re-chunked if the path no longer carries it (fitToPath): after a
+      // black hole, the probe is the first packet that can get through.
+      final pieces = maxDatagram == null ? [oldest] : fitToPath(oldest, maxDatagram);
+      for (final piece in pieces) {
+        final newSeq = resend(piece);
+        if (newSeq == null) continue;
+        sent = true;
+        onPacketRetransmitEvent?.call(newSeq, piece.retransmitCount, congestionController.pto);
+        onRetransmit?.call(piece);
+        // Drawn from the pacing budget, so what follows the probe is paced
+        // as if it had been (section 7.7 exempts the probe itself).
+        congestionController.pacingController.onPacketSent(piece.wireSize ?? piece.toBytes().length);
+      }
     }
     return sent;
   }
@@ -1524,7 +1538,7 @@ class PacketManager {
   /// flight, a lost packet's left flight when it was declared lost and are
   /// booked again by the caller when it goes out.
   int? resend(UDXPacket packet) {
-    if (packet.isAcked) return null;
+    if (packet.isAcked || packet.isProbe) return null;
     if (identical(_sentPackets[packet.sequence], packet)) {
       _sentPackets.remove(packet.sequence);
     }
@@ -1545,8 +1559,64 @@ class PacketManager {
   /// the longest unsent.
   List<UDXPacket> oldestUnacked(int n) {
     if (_sentPackets.isEmpty || n <= 0) return const [];
-    final all = _sentPackets.values.toList()..sort((a, b) => a.sequence.compareTo(b.sequence));
+    // A path-MTU probe is never re-sent.
+    final all = _sentPackets.values.where((p) => !p.isProbe).toList()
+      ..sort((a, b) => a.sequence.compareTo(b.sequence));
     return all.length > n ? all.sublist(0, n) : all;
+  }
+
+  /// Forgets a tracked packet that is being replaced by others
+  /// ([fitToPath]), neither acknowledged nor lost.
+  void drop(UDXPacket packet) {
+    if (identical(_sentPackets[packet.sequence], packet)) {
+      _sentPackets.remove(packet.sequence);
+    }
+  }
+
+  /// Re-chunks a packet larger than the path now carries (the size fell
+  /// back after a black hole, MtuDiscovery) into packets that fit, in its
+  /// place: the original is dropped from tracking and the pieces take fresh
+  /// sequences when they are re-sent ([resend]). A packet that fits is
+  /// returned as it is. Only a packet carrying one STREAM frame is split,
+  /// which is every data packet a stream sends.
+  List<UDXPacket> fitToPath(UDXPacket packet, int limit) {
+    final size = packet.wireSize ?? packet.toBytes().length;
+    if (size <= limit || packet.frames.length != 1) return [packet];
+    final frame = packet.frames.single;
+    if (frame is! StreamFrame) return [packet];
+    UDXPacket build(StreamFrame f) => UDXPacket(
+          destinationCid: packet.destinationCid,
+          sourceCid: packet.sourceCid,
+          destinationStreamId: packet.destinationStreamId,
+          sourceStreamId: packet.sourceStreamId,
+          sequence: 0,
+          frames: [f],
+        );
+    final overhead = build(StreamFrame(data: Uint8List(0), offset: frame.offset, isSyn: frame.isSyn)).toBytes().length;
+    final piece = limit - overhead;
+    if (piece <= 0 || piece >= frame.data.length) return [packet];
+    drop(packet);
+    final pieces = <UDXPacket>[];
+    var data = frame.data;
+    var offset = frame.offset;
+    var isSyn = frame.isSyn;
+    while (data.isNotEmpty) {
+      final k = piece < data.length ? piece : data.length;
+      final p = build(StreamFrame(
+        data: Uint8List.sublistView(data, 0, k),
+        offset: offset,
+        isSyn: isSyn,
+        isFin: frame.isFin && k == data.length,
+      ))
+        ..sentTime = packet.sentTime
+        ..retransmitCount = packet.retransmitCount;
+      p.wireSize = p.toBytes().length;
+      pieces.add(p);
+      isSyn = false;
+      offset += k;
+      data = Uint8List.sublistView(data, k);
+    }
+    return pieces;
   }
 
   /// Stops the loss timer and forgets every packet.

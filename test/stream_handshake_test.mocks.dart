@@ -230,6 +230,12 @@ class MockUDPSocket extends _i1.Mock implements _i9.UDPSocket {
       ) as bool);
 
   @override
+  int get maxDatagram => (super.noSuchMethod(
+        Invocation.getter(#maxDatagram),
+        returnValue: 0,
+      ) as int);
+
+  @override
   _i11.Future<void> get sendCreditChanged => (super.noSuchMethod(
         Invocation.getter(#sendCreditChanged),
         returnValue: _i11.Future<void>.value(),

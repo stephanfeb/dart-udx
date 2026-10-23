@@ -13,6 +13,7 @@ import 'packet.dart';
 import 'congestion.dart';
 import 'lost_queue.dart';
 import 'multiplexer.dart';
+import 'constants.dart';
 import 'pmtud.dart';
 import 'recv_tracker.dart';
 import 'metrics_observer.dart';
@@ -80,11 +81,18 @@ class UDPSocket with UDXEventEmitter {
   /// Timer for path validation timeout.
   Timer? _pathChallengeTimer;
 
-  // --- PMTUD Properties ---
-  /// A controller for Path MTU Discovery for this connection.
-  late final PathMtuDiscoveryController _pmtudController;
-  /// Tracks in-flight MTU probes by their sequence number.
-  final Map<int, Timer> _inFlightMtuProbes = {}; // seq -> timeoutTimer
+  /// The path-MTU search (DPLPMTUD, RFC 8899).
+  late final MtuDiscovery _mtu;
+
+  /// The datagram size the path has been found to carry: what streams chunk
+  /// their data to.
+  int get maxDatagram => _mtu.current;
+
+  /// Whether the last ACK acknowledged any data packet larger than the base
+  /// datagram size. Loss revealed by such an ACK is congestion, not a black
+  /// hole: a black hole is loss that picks the full-size packets out while
+  /// the small ones get through.
+  bool _ackedLarge = false;
   /// Connection-level packet manager (per-connection sequencing, per QUIC RFC 9000).
   late final PacketManager _packetManager;
 
@@ -199,7 +207,7 @@ class UDPSocket with UDXEventEmitter {
     _localConnectionMaxData = defaultInitialConnectionWindow;
     _remoteConnectionMaxData = defaultInitialConnectionWindow;
     _localMaxStreams = defaultMaxStreams;
-    _pmtudController = PathMtuDiscoveryController();
+    _mtu = MtuDiscovery(clock: this.clock);
 
     // Initialize connection-level packet management
     _packetManager = PacketManager(clock: this.clock);
@@ -210,12 +218,21 @@ class UDPSocket with UDXEventEmitter {
       congestionController: _congestionController,
       clock: this.clock,
       send: _sendQuietly,
+      maxDatagram: () => _mtu.current,
     );
 
     // A PTO probe re-sends the oldest outstanding packets under fresh
-    // sequences, through this; their bytes are still in flight.
+    // sequences, through this; their bytes are still in flight. Probe
+    // timeouts in a row while streams send more than the base datagram
+    // size are read as the path having stopped carrying that size (a
+    // carrier's tunnel after a handover drops every full-size packet and
+    // answers nothing): the size falls back to the base and the probe is
+    // re-chunked to fit, the first packet that can get through.
     _packetManager.onRetransmit = (packet) => _sendQuietly(packet.toBytes());
-    _congestionController.onProbe = _packetManager.sendProbe;
+    _congestionController.onProbe = () {
+      if (_congestionController.ptoCount >= blackholePtos) _mtu.blackhole();
+      _packetManager.sendProbe(maxDatagram: _mtu.current);
+    };
     _packetManager.onPacketsLost = _onPacketsLost;
 
     // For client-initiated connections, address is validated by default
@@ -259,6 +276,22 @@ class UDPSocket with UDXEventEmitter {
   /// congestion and collapses the window to the minimum (RFC 9002 section
   /// 7.6). The packets then queue for re-sending as the window allows.
   void _onPacketsLost(List<UDXPacket> lost) {
+    // A lost path-MTU probe says its size does not cross the path, and no
+    // more: it was never in flight and is not re-sent. Lost data larger
+    // than the base counts towards a black hole, unless the ACK that
+    // revealed the loss acknowledged full-size data too: then the path
+    // carries the size and the loss is congestion.
+    final data = <UDXPacket>[];
+    for (final packet in lost) {
+      final wire = packet.wireSize ?? packet.toBytes().length;
+      if (packet.isProbe) {
+        _mtu.onProbeLost(wire);
+        continue;
+      }
+      if (!_ackedLarge) _mtu.onDataLost(wire);
+      data.add(packet);
+    }
+    lost = data;
     if (lost.isEmpty) return;
     var bytes = 0;
     for (final packet in lost) {
@@ -397,12 +430,6 @@ class UDPSocket with UDXEventEmitter {
       if (pathHasChanged && _pathChallengeData == null) {
         _initiatePathValidation(fromAddress, fromPort);
       }
-
-      // --- PMTUD: Handle ACKs for Probes & Trigger New Probes ---
-      for (final frame in udxPacket.frames.whereType<AckFrame>()) {
-        _handleAckFrameForPmtud(frame);
-      }
-      _sendMtuProbeIfNeeded();
 
       // --- Process connection-level frames (not sequence-dependent) ---
       for (final frame in udxPacket.frames) {
@@ -573,10 +600,22 @@ class UDPSocket with UDXEventEmitter {
 
     var bytes = 0;
     UDXPacket? largest;
+    _ackedLarge = false;
     for (final packet in acked) {
+      if (packet.sequence == frame.largestAcked) largest = packet;
+      if (packet.isProbe) {
+        // A path-MTU probe: not in flight, but its RTT sample is as good
+        // as any, and it validates its size.
+        _mtu.onProbeAcked(packet.wireSize ?? packet.toBytes().length);
+        continue;
+      }
       final size = packet.dataBytes;
       bytes += size;
-      if (packet.sequence == frame.largestAcked) largest = packet;
+      final wire = packet.wireSize ?? packet.toBytes().length;
+      if (wire > safeDatagramSize) {
+        _ackedLarge = true;
+        _mtu.onDataAcked(wire);
+      }
       decrementConnectionBytesSent(size);
       emit('ack', {'largestAcked': packet.sequence});
     }
@@ -595,6 +634,35 @@ class UDPSocket with UDXEventEmitter {
     _packetManager.detectLostPackets();
     _lostQueue.flush();
     notifySendCredit();
+    _probeMtu();
+  }
+
+  /// Sends the next path-MTU probe when the search wants one: a packet
+  /// padded to the size under test, numbered and tracked so that its ACK or
+  /// loss reports back, but not booked in flight (one at a time, and RFC
+  /// 9000 section 14.4 keeps probes out of the congestion signals) and
+  /// never re-sent. Probing waits for an RTT sample, which loss detection
+  /// needs, and follows the ACKs: a connection with nothing to acknowledge
+  /// has nothing to gain from a larger datagram.
+  void _probeMtu() {
+    if (_closing || !_congestionController.hasRttSample) return;
+    final size = _mtu.nextProbe();
+    if (size == 0) return;
+    final sequence = _packetManager.nextSequence;
+    UDXPacket build(int probeSize) => UDXPacket(
+          destinationCid: cids.remoteCid,
+          sourceCid: cids.localCid,
+          destinationStreamId: 0,
+          sourceStreamId: 0,
+          sequence: sequence,
+          frames: [MtuProbeFrame(probeSize: probeSize)],
+        );
+    final header = build(1).toBytes().length - 1;
+    final packet = build(size - header)
+      ..isProbe = true
+      ..wireSize = size;
+    _packetManager.sendPacket(packet);
+    _sendQuietly(packet.toBytes());
   }
 
   /// The connection-level congestion controller, exposed for stream flow control checks.
@@ -635,16 +703,18 @@ class UDPSocket with UDXEventEmitter {
       frames: frames,
     );
 
+    final bytes = packet.toBytes();
+    packet.wireSize = bytes.length;
     if (hasData && trackForRetransmit) {
       _packetManager.sendPacket(packet);
       _congestionController.onPacketSent(dataSize);
     }
 
-    send(packet.toBytes());
+    send(bytes);
 
     if (dataSize > 0) {
       incrementConnectionBytesSent(dataSize);
-      _congestionController.pacingController.onPacketSent(packet.toBytes().length);
+      _congestionController.pacingController.onPacketSent(bytes.length);
     }
   }
 
@@ -1181,58 +1251,6 @@ class UDPSocket with UDXEventEmitter {
     }
 
     return completer.future;
-  }
-
-  // --- PMTUD Methods ---
-
-  void _sendMtuProbeIfNeeded() {
-    if (!_pmtudController.shouldSendProbe()) {
-      return;
-    }
-
-    final (probePacket, sequence) = _pmtudController.buildProbePacket(
-        cids.remoteCid, cids.localCid, 0, 0, _packetManager.nextSequence);
-    
-    send(probePacket.toBytes());
-
-    final timer = clock.timer(const Duration(seconds: 3), () {
-      _handleProbeLoss(sequence);
-    });
-
-    _inFlightMtuProbes[sequence] = timer;
-  }
-
-  void _handleProbeLoss(int sequence) {
-    if (_inFlightMtuProbes.remove(sequence) == null) {
-      return;
-    }
-    _pmtudController.onProbeLost(sequence);
-  }
-
-  void _handleAckFrameForPmtud(AckFrame frame) {
-    final ackedSequences = <int>{};
-    if (frame.firstAckRangeLength > 0) {
-      for (int i = 0; i < frame.firstAckRangeLength; i++) {
-        ackedSequences.add(frame.largestAcked - i);
-      }
-    }
-
-    int currentSeq = frame.largestAcked - frame.firstAckRangeLength;
-    for (final rangeBlock in frame.ackRanges) {
-      final rangeEnd = currentSeq - rangeBlock.gap;
-      for (int i = 0; i < rangeBlock.ackRangeLength; i++) {
-        ackedSequences.add(rangeEnd - i);
-      }
-      currentSeq = (rangeEnd - rangeBlock.ackRangeLength + 1) - 1;
-    }
-
-    for (final seq in ackedSequences) {
-      if (_inFlightMtuProbes.containsKey(seq)) {
-        final timer = _inFlightMtuProbes.remove(seq)!;
-        timer.cancel();
-        _pmtudController.onProbeAcked(seq);
-      }
-    }
   }
 
   // --- Test Hooks ---

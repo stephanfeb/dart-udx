@@ -221,10 +221,11 @@ class MockPacketManager extends _i1.Mock implements _i4.PacketManager {
       )) as _i4.UDXPacket?);
 
   @override
-  bool sendProbe() => (super.noSuchMethod(
+  bool sendProbe({int? maxDatagram}) => (super.noSuchMethod(
         Invocation.method(
           #sendProbe,
           [],
+          {#maxDatagram: maxDatagram},
         ),
         returnValue: false,
       ) as bool);
@@ -276,6 +277,31 @@ class MockPacketManager extends _i1.Mock implements _i4.PacketManager {
         Invocation.method(
           #oldestUnacked,
           [n],
+        ),
+        returnValue: <_i4.UDXPacket>[],
+      ) as List<_i4.UDXPacket>);
+
+  @override
+  void drop(_i4.UDXPacket? packet) => super.noSuchMethod(
+        Invocation.method(
+          #drop,
+          [packet],
+        ),
+        returnValueForMissingStub: null,
+      );
+
+  @override
+  List<_i4.UDXPacket> fitToPath(
+    _i4.UDXPacket? packet,
+    int? limit,
+  ) =>
+      (super.noSuchMethod(
+        Invocation.method(
+          #fitToPath,
+          [
+            packet,
+            limit,
+          ],
         ),
         returnValue: <_i4.UDXPacket>[],
       ) as List<_i4.UDXPacket>);
