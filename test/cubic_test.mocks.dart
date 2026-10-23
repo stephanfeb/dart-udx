@@ -3,10 +3,9 @@
 // Do not manually edit this file.
 
 // ignore_for_file: no_leading_underscores_for_library_prefixes
-import 'dart:async' as _i4;
-
+import 'package:dart_udx/src/clock.dart' as _i3;
 import 'package:dart_udx/src/congestion.dart' as _i2;
-import 'package:dart_udx/src/packet.dart' as _i3;
+import 'package:dart_udx/src/packet.dart' as _i4;
 import 'package:mockito/mockito.dart' as _i1;
 
 // ignore_for_file: type=lint
@@ -33,10 +32,30 @@ class _FakeCongestionController_0 extends _i1.SmartFake
         );
 }
 
+class _FakeClock_1 extends _i1.SmartFake implements _i3.Clock {
+  _FakeClock_1(
+    Object parent,
+    Invocation parentInvocation,
+  ) : super(
+          parent,
+          parentInvocation,
+        );
+}
+
+class _FakeDuration_2 extends _i1.SmartFake implements Duration {
+  _FakeDuration_2(
+    Object parent,
+    Invocation parentInvocation,
+  ) : super(
+          parent,
+          parentInvocation,
+        );
+}
+
 /// A class which mocks [PacketManager].
 ///
 /// See the documentation for Mockito's code generation for more information.
-class MockPacketManager extends _i1.Mock implements _i3.PacketManager {
+class MockPacketManager extends _i1.Mock implements _i4.PacketManager {
   MockPacketManager() {
     _i1.throwOnMissingStub(this);
   }
@@ -61,6 +80,15 @@ class MockPacketManager extends _i1.Mock implements _i3.PacketManager {
       );
 
   @override
+  _i3.Clock get clock => (super.noSuchMethod(
+        Invocation.getter(#clock),
+        returnValue: _FakeClock_1(
+          this,
+          Invocation.getter(#clock),
+        ),
+      ) as _i3.Clock);
+
+  @override
   int get lastSentPacketNumber => (super.noSuchMethod(
         Invocation.getter(#lastSentPacketNumber),
         returnValue: 0,
@@ -76,7 +104,7 @@ class MockPacketManager extends _i1.Mock implements _i3.PacketManager {
       );
 
   @override
-  set onRetransmit(void Function(_i3.UDXPacket)? _onRetransmit) =>
+  set onRetransmit(void Function(_i4.UDXPacket)? _onRetransmit) =>
       super.noSuchMethod(
         Invocation.setter(
           #onRetransmit,
@@ -115,12 +143,11 @@ class MockPacketManager extends _i1.Mock implements _i3.PacketManager {
       );
 
   @override
-  set onPacketPermanentlyLost(
-          void Function(_i3.UDXPacket)? _onPacketPermanentlyLost) =>
+  set onPacketsLost(void Function(List<_i4.UDXPacket>)? _onPacketsLost) =>
       super.noSuchMethod(
         Invocation.setter(
-          #onPacketPermanentlyLost,
-          _onPacketPermanentlyLost,
+          #onPacketsLost,
+          _onPacketsLost,
         ),
         returnValueForMissingStub: null,
       );
@@ -132,19 +159,34 @@ class MockPacketManager extends _i1.Mock implements _i3.PacketManager {
       ) as int);
 
   @override
-  List<_i3.UDXPacket> get sentPackets => (super.noSuchMethod(
+  List<_i4.UDXPacket> get sentPackets => (super.noSuchMethod(
         Invocation.getter(#sentPackets),
-        returnValue: <_i3.UDXPacket>[],
-      ) as List<_i3.UDXPacket>);
+        returnValue: <_i4.UDXPacket>[],
+      ) as List<_i4.UDXPacket>);
 
   @override
-  int get retransmitTimeout => (super.noSuchMethod(
-        Invocation.getter(#retransmitTimeout),
+  int get largestAcked => (super.noSuchMethod(
+        Invocation.getter(#largestAcked),
         returnValue: 0,
       ) as int);
 
   @override
-  void sendPacket(_i3.UDXPacket? packet) => super.noSuchMethod(
+  Duration get lossDelay => (super.noSuchMethod(
+        Invocation.getter(#lossDelay),
+        returnValue: _FakeDuration_2(
+          this,
+          Invocation.getter(#lossDelay),
+        ),
+      ) as Duration);
+
+  @override
+  bool get lossTimerArmed => (super.noSuchMethod(
+        Invocation.getter(#lossTimerArmed),
+        returnValue: false,
+      ) as bool);
+
+  @override
+  void sendPacket(_i4.UDXPacket? packet) => super.noSuchMethod(
         Invocation.method(
           #sendPacket,
           [packet],
@@ -153,17 +195,17 @@ class MockPacketManager extends _i1.Mock implements _i3.PacketManager {
       );
 
   @override
-  List<_i3.UDXPacket> handleAckFrame(_i3.AckFrame? frame) =>
+  List<_i4.UDXPacket> handleAckFrame(_i4.AckFrame? frame) =>
       (super.noSuchMethod(
         Invocation.method(
           #handleAckFrame,
           [frame],
         ),
-        returnValue: <_i3.UDXPacket>[],
-      ) as List<_i3.UDXPacket>);
+        returnValue: <_i4.UDXPacket>[],
+      ) as List<_i4.UDXPacket>);
 
   @override
-  void handleData(_i3.UDXPacket? packet) => super.noSuchMethod(
+  void handleData(_i4.UDXPacket? packet) => super.noSuchMethod(
         Invocation.method(
           #handleData,
           [packet],
@@ -172,11 +214,11 @@ class MockPacketManager extends _i1.Mock implements _i3.PacketManager {
       );
 
   @override
-  _i3.UDXPacket? getPacket(int? sequence) =>
+  _i4.UDXPacket? getPacket(int? sequence) =>
       (super.noSuchMethod(Invocation.method(
         #getPacket,
         [sequence],
-      )) as _i3.UDXPacket?);
+      )) as _i4.UDXPacket?);
 
   @override
   bool sendProbe() => (super.noSuchMethod(
@@ -188,7 +230,7 @@ class MockPacketManager extends _i1.Mock implements _i3.PacketManager {
       ) as bool);
 
   @override
-  void trackUntilAcked(_i3.UDXPacket? packet) => super.noSuchMethod(
+  void trackUntilAcked(_i4.UDXPacket? packet) => super.noSuchMethod(
         Invocation.method(
           #trackUntilAcked,
           [packet],
@@ -206,20 +248,37 @@ class MockPacketManager extends _i1.Mock implements _i3.PacketManager {
       );
 
   @override
-  int? retransmit(_i3.UDXPacket? packet) =>
-      (super.noSuchMethod(Invocation.method(
-        #retransmit,
+  List<_i4.UDXPacket> detectLostPackets() => (super.noSuchMethod(
+        Invocation.method(
+          #detectLostPackets,
+          [],
+        ),
+        returnValue: <_i4.UDXPacket>[],
+      ) as List<_i4.UDXPacket>);
+
+  @override
+  bool persistentCongestion(List<_i4.UDXPacket>? lost) => (super.noSuchMethod(
+        Invocation.method(
+          #persistentCongestion,
+          [lost],
+        ),
+        returnValue: false,
+      ) as bool);
+
+  @override
+  int? resend(_i4.UDXPacket? packet) => (super.noSuchMethod(Invocation.method(
+        #resend,
         [packet],
       )) as int?);
 
   @override
-  void retransmitPacket(int? sequence) => super.noSuchMethod(
+  List<_i4.UDXPacket> oldestUnacked(int? n) => (super.noSuchMethod(
         Invocation.method(
-          #retransmitPacket,
-          [sequence],
+          #oldestUnacked,
+          [n],
         ),
-        returnValueForMissingStub: null,
-      );
+        returnValue: <_i4.UDXPacket>[],
+      ) as List<_i4.UDXPacket>);
 
   @override
   void destroy() => super.noSuchMethod(
@@ -231,20 +290,11 @@ class MockPacketManager extends _i1.Mock implements _i3.PacketManager {
       );
 
   @override
-  Map<int, _i3.UDXPacket> getSentPacketsTestHook() => (super.noSuchMethod(
+  Map<int, _i4.UDXPacket> getSentPacketsTestHook() => (super.noSuchMethod(
         Invocation.method(
           #getSentPacketsTestHook,
           [],
         ),
-        returnValue: <int, _i3.UDXPacket>{},
-      ) as Map<int, _i3.UDXPacket>);
-
-  @override
-  Map<int, _i4.Timer> getRetransmitTimersTestHook() => (super.noSuchMethod(
-        Invocation.method(
-          #getRetransmitTimersTestHook,
-          [],
-        ),
-        returnValue: <int, _i4.Timer>{},
-      ) as Map<int, _i4.Timer>);
+        returnValue: <int, _i4.UDXPacket>{},
+      ) as Map<int, _i4.UDXPacket>);
 }

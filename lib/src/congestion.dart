@@ -100,24 +100,40 @@ class CongestionController {
   /// 7.3.2); retransmissions take fresh sequences, so that packet exists.
   int _recoveryEndPacketNumber = -1;
 
-  /// The Probe Timeout (PTO) duration.
+  /// The base probe timeout (RFC 9002 section 6.2.1): smoothed_rtt +
+  /// max(4 * rttvar, kGranularity) + max_ack_delay, within [minPto, maxPto].
+  /// The peer delays its ACKs by up to max_ack_delay, so a PTO without that
+  /// term fires on a delayed ACK alone.
   Duration get pto {
-    // PTO = smoothed_rtt + max(4 * rttvar, kGranularity) + max_ack_delay
-    // We'll simplify kGranularity and max_ack_delay for now.
-    final ptoMillis = _smoothedRtt.inMilliseconds + (4 * _rttVar.inMilliseconds);
-    return Duration(milliseconds: ptoMillis.clamp(200, 5000));
+    var v = _rttVar * 4;
+    if (v < PacketManager.lossTimerGranularity) v = PacketManager.lossTimerGranularity;
+    var pto = _smoothedRtt + v + const Duration(milliseconds: maxAckDelay);
+    if (pto < minPto) pto = minPto;
+    if (pto > maxPto) pto = maxPto;
+    return pto;
   }
 
-  /// Timer for PTO.
+  static const Duration minPto = Duration(milliseconds: 200);
+  static const Duration maxPto = Duration(seconds: 5);
+
+  /// One PTO timer per connection (RFC 9002 section 6.2), armed from the
+  /// last ack-eliciting send and backing off by [ptoCount] until an ACK
+  /// arrives. There is no retry cap: a path that never answers is ended by
+  /// the connection's idle timeout, not by the probing stopping.
   Timer? _ptoTimer;
+  int get ptoCount => _ptoCount;
+  int _ptoCount = 0;
+  Duration? _lastSendTime;
 
-  /// Maximum number of PTO retries before considering connection issues
-  int maxPtoRetries = 10;
+  /// The wait for the next probe: the base PTO backed off by the number of
+  /// PTOs that have fired without an ACK.
+  Duration get nextPto {
+    final shift = _ptoCount > 20 ? 20 : _ptoCount;
+    return pto * (1 << shift);
+  }
 
-  /// Current count of consecutive PTO timeouts
-  int _ptoRetryCount = 0;
-
-  /// Callback for when a probe packet should be sent.
+  /// Called when the PTO fires: the socket sends a probe or two (the oldest
+  /// outstanding data under fresh sequences), without touching the window.
   void Function()? onProbe;
 
   /// The packet pacer.
@@ -134,6 +150,7 @@ class CongestionController {
   /// Called when a packet is sent.
   void onPacketSent(int bytes) {
     _inflight += bytes;
+    _lastSendTime = clock.now();
     _armPtoTimer();
   }
 
@@ -179,12 +196,38 @@ class CongestionController {
       }
     }
 
-    // An ACK is proof the path answers: the PTO starts over.
+    // An ACK is proof the path answers: the PTO backoff starts over
+    // (RFC 9002 section 6.2.1), measured from the last send.
     _ptoTimer?.cancel();
     _ptoTimer = null;
-    _ptoRetryCount = 0;
+    _ptoCount = 0;
     if (_inflight > 0) {
       _armPtoTimer();
+    }
+  }
+
+  /// Whether any RTT sample has been taken; persistent congestion is only
+  /// declared once one has (RFC 9002 section 7.6.2).
+  bool get hasRttSample => _hasRttSample;
+
+  /// How long a span of loss must cover before it counts as persistent
+  /// congestion (RFC 9002 section 7.6.1): three PTOs, the PTO already
+  /// including the max_ack_delay term.
+  Duration get persistentCongestionDuration => pto * kPersistentCongestionThreshold;
+
+  /// The RFC 9002 section 7.6 reaction: the window collapses to the minimum
+  /// and recovery ends, so sending restarts in slow start, as after an
+  /// outage long enough that everything sent in three PTOs was lost. Called
+  /// after [onPacketLost] for the same loss event.
+  void onPersistentCongestion() {
+    final oldCwnd = _cwnd;
+    _cwnd = minCwnd;
+    _inRecovery = false;
+    _recoveryEndPacketNumber = -1;
+    _epochStart = null;
+    pacingController.updateRate(_cwnd, _minRtt);
+    if (connectionId != null) {
+      metricsObserver?.onCongestionWindowUpdate(connectionId!, oldCwnd, _cwnd, 'persistent_congestion');
     }
   }
 
@@ -283,12 +326,14 @@ class CongestionController {
     _rttVar = rttVar;
   }
 
-  /// Called when a packet is considered lost.
+  /// Called when packets are declared lost: their bytes leave flight
+  /// (RFC 9002 section 7.3) and the window contracts, once per recovery
+  /// epoch. When the data is re-sent it is booked again by [onPacketSent], as
+  /// the new packet it is. Persistent congestion is the socket's call
+  /// (PacketManager.persistentCongestion, then [onPersistentCongestion]).
   void onPacketLost(int bytes, List<UDXPacket> lostPackets) {
     _inflight -= bytes;
     if (_inflight < 0) _inflight = 0;
-
-    _checkPersistentCongestion(lostPackets);
 
     // Don't reduce CWND if we are already in a recovery period.
     if (_inRecovery) {
@@ -320,28 +365,31 @@ class CongestionController {
     }
   }
 
-  /// Arms the PTO timer.
+  /// Sets the PTO timer to fire [nextPto] after the last ack-eliciting send
+  /// (RFC 9002 section 6.2.1).
   void _armPtoTimer() {
     _ptoTimer?.cancel();
-    _ptoTimer = clock.timer(pto, _onPtoTimeout);
+    var wait = nextPto;
+    final last = _lastSendTime;
+    if (last != null) {
+      final remaining = last + wait - clock.now();
+      if (remaining < wait) wait = remaining;
+    }
+    if (wait < PacketManager.lossTimerGranularity) wait = PacketManager.lossTimerGranularity;
+    _ptoTimer = clock.timer(wait, _onPtoTimeout);
   }
 
-  /// Called when the PTO timer expires.
+  /// Fires when nothing has been acknowledged for a PTO: the socket sends a
+  /// probe ([onProbe]), and the next PTO waits twice as long. The window is
+  /// untouched; loss is declared only once an ACK proves it.
   void _onPtoTimeout() {
-    _ptoRetryCount++;
-
-    // Only send probe if we haven't exceeded max retries
-    if (_ptoRetryCount <= maxPtoRetries) {
-      onProbe?.call();
-
-      // Double the PTO for the next probe if this one doesn't elicit an ACK.
-      final nextPto = pto * 2;
+    _ptoCount++;
+    _ptoTimer = null;
+    onProbe?.call();
+    if (_inflight > 0 && _ptoTimer == null) {
+      // Measured from now: the probe just sent is the last send.
+      _lastSendTime = clock.now();
       _ptoTimer = clock.timer(nextPto, _onPtoTimeout);
-    } else {
-      // Exceeded max retries: keep probing, less often.
-      _ptoRetryCount = 0;
-      final backoffPto = pto * 4; // Use 4x PTO as backoff
-      _ptoTimer = clock.timer(backoffPto, _onPtoTimeout);
     }
   }
 
@@ -350,50 +398,6 @@ class CongestionController {
     _ptoTimer?.cancel();
     _ptoTimer = null;
     pacingController.dispose();
-  }
-
-  /// Checks if a persistent congestion has occurred.
-  /// See RFC 9002, Section 7.6.2
-  void _checkPersistentCongestion(List<UDXPacket> lostPackets) {
-    // 1. Must have a valid RTT sample.
-    if (_latestRtt == Duration.zero) {
-      return;
-    }
-
-    // 2. Must have at least two lost packets.
-    final ackElicitingLost =
-        lostPackets.where((p) => p.frames.any((f) => f.type != FrameType.ack)).toList();
-    if (ackElicitingLost.length < 2) {
-      return;
-    }
-
-    ackElicitingLost.sort((a, b) => a.sequence.compareTo(b.sequence));
-    final oldestLost = ackElicitingLost.first;
-    final newestLost = ackElicitingLost.last;
-
-    // 3. The duration between the send times of these two packets exceeds the
-    //    persistent congestion duration.
-    final persistentCongestionDuration = (pto * kPersistentCongestionThreshold);
-    final lostPeriod = clock.now() - oldestLost.sentTime!;
-
-    if (lostPeriod < persistentCongestionDuration) {
-      return;
-    }
-
-    // 4. None of the packets sent between the send times of these two packets
-    //    are acknowledged.
-    final sentBetween = packetManager.sentPackets
-        .where((p) => p.sequence > oldestLost.sequence && p.sequence < newestLost.sequence);
-
-    if (sentBetween.any((p) => p.isAcked)) {
-      return;
-    }
-
-    // Persistent congestion established. Collapse the window.
-    _cwnd = minCwnd;
-    pacingController.updateRate(_cwnd, _minRtt);
-    _inRecovery = false; // Exit recovery to allow for slow start
-    _recoveryEndPacketNumber = -1;
   }
 
   /// Processes ECN (Explicit Congestion Notification) feedback from ACK frames.

@@ -118,7 +118,7 @@ void main() {
             reason: 'ACK should not have consumed sequence 3');
       });
 
-      test('a PTO probe re-sends the oldest unacknowledged packet under a fresh sequence', () async {
+      test('a PTO probe re-sends the oldest unacknowledged packets under fresh sequences', () async {
         // A probe used to be a PING under lastSentPacketNumber, the sequence
         // of a data packet still in flight; its ACK could acknowledge data the
         // peer never got. See test/pto_probe_test.dart for the whole failure.
@@ -138,25 +138,22 @@ void main() {
             );
         final first = data(pm.nextSequence); // 0
         final second = data(pm.nextSequence); // 1
+        final third = data(pm.nextSequence); // 2
         pm.sendPacket(first);
         pm.sendPacket(second);
+        pm.sendPacket(third);
 
         expect(pm.sendProbe(), isTrue);
-        expect(sent, [same(first)], reason: 'the oldest unacknowledged packet is the probe');
-        expect(first.sequence, equals(2), reason: 'under a fresh sequence, never the last data packet\'s');
+        expect(sent, [same(first), same(second)], reason: 'the two oldest outstanding packets are the probes');
+        expect(first.sequence, equals(3), reason: 'under fresh sequences, never the last data packet\'s');
+        expect(second.sequence, equals(4));
         expect(first.frames.first, isA<StreamFrame>(), reason: 'it carries the data, not a PING');
-        expect(pm.getSentPacketsTestHook().keys, unorderedEquals([1, 2]));
+        expect(pm.getSentPacketsTestHook().keys, unorderedEquals([2, 3, 4]));
+        expect(pm.nextSequence, equals(5));
 
-        // The next probe takes the next-oldest packet (a PTO may send two).
-        expect(pm.sendProbe(), isTrue);
-        expect(sent, [same(first), same(second)]);
-        expect(second.sequence, equals(3));
-
-        // Everything was re-sent within the last RTO: a probe collapses into
-        // those resends and sends nothing, consuming nothing.
+        // Nothing outstanding: nothing to probe with.
+        pm.handleAckFrame(AckFrame(largestAcked: 4, ackDelay: 0, firstAckRangeLength: 3));
         expect(pm.sendProbe(), isFalse);
-        expect(sent.length, 2);
-        expect(pm.nextSequence, equals(4));
       });
     });
 

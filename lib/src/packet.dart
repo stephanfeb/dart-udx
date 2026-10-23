@@ -1214,11 +1214,30 @@ class UDXPacket {
 }
 
 /// Manages packet sending and receiving for a UDXStream
+/// Tracks sent packets, matches ACKs to them, and declares loss the way
+/// RFC 9002 section 6.1 does: from acknowledgements, never from a per-packet
+/// timer. The port of go-udx's PacketManager.
+///
+/// A packet is lost once a later one has been acknowledged and it is either
+/// [lossReorderThreshold] sequences behind the largest acknowledged or older
+/// than [lossDelay] (9/8 of the RTT). Packets behind but not yet old enough
+/// wait on the loss timer, which declares them lost when the delay elapses
+/// without another ACK. What is lost is handed to [onPacketsLost]; the socket
+/// contracts its window once per recovery epoch and re-sends the data under
+/// fresh sequences through the congestion window and the pacer (LostQueue).
+///
+/// This replaced one retransmission timer per packet, armed at the RTO and
+/// backing off to a 2 s cap. On a radio gap every timer fired together and
+/// the whole window went out again at once, past the congestion window, and
+/// again every 2 s into a dead path; the resends did not contract the window
+/// either. QUIC's one PTO per connection (CongestionController) sends a probe
+/// or two instead, backing off until the idle timeout, and loss is declared
+/// only once an ACK proves it.
 class PacketManager {
   /// The congestion control algorithm
   late CongestionController congestionController;
 
-  /// The clock send times and the retransmission timers run on; see [Clock].
+  /// The clock send times and the loss timer run on; see [Clock].
   final Clock clock;
 
   /// The next sequence number to use
@@ -1228,33 +1247,34 @@ class PacketManager {
   /// The sequence number of the last packet that was sent.
   int lastSentPacketNumber = -1;
 
-  /// The set of sent packets waiting for acknowledgment
+  /// The set of sent packets waiting for acknowledgment, keyed by the
+  /// sequence each was LAST sent under.
   final Map<int, UDXPacket> _sentPackets = {};
   List<UDXPacket> get sentPackets => _sentPackets.values.toList();
 
   /// The set of received packets
   final Map<int, UDXPacket> _receivedPackets = {};
 
-  /// The maximum number of retransmissions
-  static const int maxRetries = 3;
+  /// The largest sequence the peer has acknowledged, -1 if none; when the
+  /// last ACK that acknowledged something arrived; and the one before the
+  /// ACK (or timer) that last declared loss: persistent congestion asks
+  /// whether anything was acknowledged since the oldest lost packet went
+  /// out, which the ACK that revealed the loss does not answer.
+  int get largestAcked => _largestAcked;
+  int _largestAcked = -1;
+  Duration? _lastAckTime;
+  Duration? _ackBeforeLoss;
 
-  /// The retransmission timeout in milliseconds
-  int get retransmitTimeout {
-    // If we don't have an RTT sample yet, use a conservative initial RTO.
-    // See RFC 9002, Section 6.2.1.
-    if (congestionController.smoothedRtt == Duration.zero) {
-      return 1000; // 1 second initial RTO
-    }
-    // RTO = smoothed_rtt + 4 * rttvar
-    final rto = congestionController.smoothedRtt.inMilliseconds +
-        (4 * congestionController.rttVar.inMilliseconds);
-    return rto.clamp(200, 5000); // Clamp to a reasonable range (increased min)
-  }
+  /// Fires when the oldest packet behind the largest acknowledged becomes old
+  /// enough to be lost without another ACK (the time threshold).
+  Timer? _lossTimer;
 
-  /// The retransmission timers, keyed by each packet's CURRENT sequence number
-  /// and re-keyed alongside it: one live timer per unacked packet, following it
-  /// across renumberings.
-  final Map<int, Timer> _retransmitTimers = {};
+  /// How many sequences a packet must trail the largest acknowledged before a
+  /// gap counts as loss (kPacketThreshold, RFC 9002 section 6.1.1).
+  static const int lossReorderThreshold = 3;
+
+  /// The floor on the loss delay (kGranularity).
+  static const Duration lossTimerGranularity = Duration(milliseconds: 1);
 
   /// Creates a new packet manager
   PacketManager({CongestionController? congestionController, Clock? clock})
@@ -1264,19 +1284,22 @@ class PacketManager {
     }
   }
 
-  /// Callback to be invoked when a packet needs to be retransmitted.
+  /// Puts a packet back on the wire. By the time it is called the packet's
+  /// sequence has been advanced to a fresh number ([resend]), so this only
+  /// encodes and sends.
   void Function(UDXPacket packet)? onRetransmit;
-  
+
   /// Callback for metrics when a packet is retransmitted.
-  /// Provides sequence number, attempt count, and current RTO.
+  /// Provides sequence number, attempt count, and the current PTO.
   void Function(int sequence, int attemptCount, Duration rto)? onPacketRetransmitEvent;
-  
+
   /// Callback for metrics when packet loss is detected.
-  /// Provides sequence number and loss type ('timeout' or 'fast_retransmit').
+  /// Provides sequence number and loss type ('ack' or 'time').
   void Function(int sequence, String lossType)? onPacketLossEvent;
 
-  /// Callback for when a packet is considered permanently lost after max retries.
-  void Function(UDXPacket packet)? onPacketPermanentlyLost;
+  /// Told what loss detection declared lost, oldest first. The packets are no
+  /// longer tracked: the receiver re-sends them ([resend]) and books them.
+  void Function(List<UDXPacket> lost)? onPacketsLost;
 
   /// Sends a packet
   void sendPacket(UDXPacket packet) {
@@ -1285,65 +1308,48 @@ class PacketManager {
     packet.lastSentTime = now;
     lastSentPacketNumber = packet.sequence;
     _sentPackets[packet.sequence] = packet;
-    _scheduleRetransmission(packet);
   }
 
   /// Processes an incoming AckFrame, marking packets as acknowledged.
   ///
   /// Returns the packets the frame newly acknowledged, each under the sequence
   /// it was last sent with. The packets, not bare sequences: the caller needs
-  /// their size and last send time, and the entries are removed here, so a
-  /// later lookup by sequence would find nothing. That lookup used to live in
-  /// a separate map keyed by the ORIGINAL sequence, which a retransmission's
-  /// fresh sequence was absent from, so a retransmitted packet's bytes were
-  /// never credited back to the congestion window or the connection's send
-  /// window: every loss shrank the usable window for good.
+  /// their size and last send time, and the entries are removed here. The
+  /// caller books them with the congestion controller and then runs
+  /// [detectLostPackets], in that order (RFC 9002 appendix A.7: the
+  /// acknowledged bytes grow the window before the loss contracts it).
   List<UDXPacket> handleAckFrame(AckFrame frame) {
-    final newlyAckedSequences = <UDXPacket>[];
-
-    // Process the first range (ending at largestAcked)
-    // largestAcked is inclusive. firstAckRangeLength is the count of packets in this range.
-    // So, the smallest sequence in this range is largestAcked - firstAckRangeLength + 1.
-    if (frame.firstAckRangeLength > 0) {
-      for (int i = 0; i < frame.firstAckRangeLength; i++) {
-        final seq = frame.largestAcked - i;
-        final packet = _sentPackets.remove(seq);
-        if (packet != null) {
-          packet.isAcked = true;
-          _retransmitTimers[seq]?.cancel();
-          _retransmitTimers.remove(seq);
-          newlyAckedSequences.add(packet);
-        }
+    final newlyAcked = <UDXPacket>[];
+    void take(int seq) {
+      final packet = _sentPackets.remove(seq);
+      if (packet != null) {
+        packet.isAcked = true;
+        newlyAcked.add(packet);
       }
     }
 
+    // The first range ends at largestAcked, inclusive.
+    for (int i = 0; i < frame.firstAckRangeLength; i++) {
+      take(frame.largestAcked - i);
+    }
 
-    // Process additional ACK ranges
-    // Ranges are ordered from highest sequence numbers to lowest.
-    // `gap` is relative to the *start* of the previously processed (higher sequence) range.
-    int currentSeq = frame.largestAcked - frame.firstAckRangeLength; // Sequence just below the first range
-
+    // Additional ranges, highest first. `gap` is counted from the packet just
+    // below the previous range; the next range's highest is `gap` below it.
+    int currentSeq = frame.largestAcked - frame.firstAckRangeLength;
     for (final rangeBlock in frame.ackRanges) {
-      // The current range's highest packet (rangeEnd) is `rangeBlock.gap` packets below `currentSeq`.
-      // `currentSeq` represents the packet number immediately preceding the lowest packet of the previously acked block.
-      final rangeEnd = currentSeq - rangeBlock.gap; // CORRECTED
-      
+      final rangeEnd = currentSeq - rangeBlock.gap;
       for (int i = 0; i < rangeBlock.ackRangeLength; i++) {
-        final seq = rangeEnd - i;
-        final packet = _sentPackets.remove(seq);
-        if (packet != null) {
-          packet.isAcked = true;
-          _retransmitTimers[seq]?.cancel();
-          _retransmitTimers.remove(seq);
-          newlyAckedSequences.add(packet);
-        }
+        take(rangeEnd - i);
       }
-      // Update currentSeq for the next iteration: it should be the packet number
-      // immediately preceding the lowest packet of the range just processed.
-      // Lowest packet in current range = rangeEnd - rangeBlock.ackRangeLength + 1.
-      currentSeq = (rangeEnd - rangeBlock.ackRangeLength + 1) - 1; // CORRECTED
+      currentSeq = rangeEnd - rangeBlock.ackRangeLength;
     }
-    return newlyAckedSequences;
+
+    if (newlyAcked.isNotEmpty) {
+      _ackBeforeLoss = _lastAckTime;
+      _lastAckTime = clock.now();
+      if (frame.largestAcked > _largestAcked) _largestAcked = frame.largestAcked;
+    }
+    return newlyAcked;
   }
 
   /// Handles received data
@@ -1351,43 +1357,36 @@ class PacketManager {
     _receivedPackets[packet.sequence] = packet;
   }
 
-  /// The oldest unacknowledged packet: the one that has waited longest since
-  /// it last went out. A re-key moves a packet to the end of the map, so the
-  /// first entry is the longest unsent.
-  UDXPacket? getNextRetransmit() {
-    if (_sentPackets.isEmpty) return null;
-    return _sentPackets.values.first;
-  }
-
   /// Gets a sent packet by its sequence number
   UDXPacket? getPacket(int sequence) {
     return _sentPackets[sequence];
   }
 
-  /// Sends a probe when the PTO fires: the oldest unacknowledged packet,
-  /// re-sent under a fresh sequence (RFC 9002 section 6.2.4: a probe carries
-  /// data when there is data to carry). Returns whether anything went out.
+  /// How many outstanding packets a PTO re-sends, the oldest first (RFC 9002
+  /// section 6.2.4 allows up to two).
+  static const int ptoProbes = 2;
+
+  /// Sends the PTO's probes: the [ptoProbes] oldest outstanding packets,
+  /// re-sent under fresh sequences (RFC 9002 section 6.2.4: a probe carries
+  /// data when there is data to carry). They are not declared lost (an ACK
+  /// will say), their bytes stay in flight, and neither the window nor the
+  /// pacer is consulted: a probe is allowed out when nothing else is. Returns
+  /// whether anything went out.
   ///
-  /// This used to send a PING under [lastSentPacketNumber], the sequence of a
-  /// data packet still in flight. Both peers acknowledge a numbered PING, so
-  /// when that data packet had been lost and the PING arrived, its ACK marked
-  /// the data acknowledged: the bytes were never re-sent and the stream hung
-  /// at that offset. The PTO and the packet's own RTO timer fire together,
-  /// which put the PING under the resend's fresh sequence just as the resend
-  /// went out, so one lost resend was enough. The reasoning behind the reuse
-  /// (a sequence gap would stall the receiver) predates reassembly on byte
-  /// offsets and no longer holds.
-  ///
-  /// Nothing is sent when the oldest packet was re-sent within the last RTO
-  /// ([retransmit] collapses the two), or when nothing is tracked.
+  /// This used to send a PING under [lastSentPacketNumber], the sequence of
+  /// a data packet still in flight; both peers acknowledge a numbered PING,
+  /// so a lost data packet could be marked acknowledged by its probe's ACK
+  /// and never re-sent.
   bool sendProbe() {
-    final oldest = getNextRetransmit();
-    if (oldest == null) return false;
-    final newSeq = retransmit(oldest);
-    if (newSeq == null) return false;
-    onPacketRetransmitEvent?.call(newSeq, oldest.retransmitCount, Duration(milliseconds: retransmitTimeout));
-    onRetransmit?.call(oldest);
-    return true;
+    var sent = false;
+    for (final oldest in oldestUnacked(ptoProbes)) {
+      final newSeq = resend(oldest);
+      if (newSeq == null) continue;
+      sent = true;
+      onPacketRetransmitEvent?.call(newSeq, oldest.retransmitCount, congestionController.pto);
+      onRetransmit?.call(oldest);
+    }
+    return sent;
   }
 
   /// Tracks a packet the caller sends itself, so that [handleAckFrame] returns
@@ -1405,144 +1404,153 @@ class PacketManager {
   /// Stops tracking [sequence], if it is still tracked.
   void forget(int sequence) {
     _sentPackets.remove(sequence);
-    _retransmitTimers.remove(sequence)?.cancel();
   }
 
-  /// The floor and ceiling on the wait between retransmission attempts. The
-  /// ceiling is a cap, not a fixed interval, and never applies below the current
-  /// RTO — retransmitting faster than the round trip just piles duplicates onto
-  /// a path that has not had time to answer.
-  static const int minRetransmitBackoffMs = 200;
-  static const int maxRetransmitBackoffMs = 2000;
-
-  /// The wait before the given (1-based) attempt: exponential from the RTO up to
-  /// the ceiling, with the ceiling never below the RTO itself.
-  int _retransmitBackoffMs(int attempt) {
-    final rto = retransmitTimeout;
-    var ceiling = maxRetransmitBackoffMs;
-    if (ceiling < rto) ceiling = rto;
-
-    var backoff = ceiling;
-    final shift = attempt - 1;
-    if (shift < 31) {
-      final scaled = rto * (1 << shift);
-      if (scaled < ceiling) backoff = scaled;
-    }
-    if (backoff < minRetransmitBackoffMs) backoff = minRetransmitBackoffMs;
-    return backoff;
+  /// How long a packet must have been outstanding before age alone marks it
+  /// lost: 9/8 of the larger of the smoothed and latest RTT, floored at the
+  /// timer granularity (RFC 9002 section 6.1.2). The larger of the two: after
+  /// a sudden increase in delay the smoothed estimate lags, and alone it would
+  /// declare a window of packets lost for being slower than they used to be.
+  Duration get lossDelay {
+    var rtt = congestionController.smoothedRtt;
+    final latest = congestionController.latestRttForTest;
+    if (latest > rtt) rtt = latest;
+    var delay = rtt * 9 ~/ 8;
+    if (delay < lossTimerGranularity) delay = lossTimerGranularity;
+    return delay;
   }
 
-  /// Re-sends a still-unacked packet under a FRESH sequence number, returning
-  /// the new sequence (or null when nothing should be sent).
-  ///
-  /// Reusing the original number is what made loss fatal: the retry budget rode
-  /// on the packet, so exhausting it left a hole the stream could never fill and
-  /// the packet was silently dropped, stalling the stream. QUIC never reuses a
-  /// packet number (RFC 9000 section 12.3); it re-frames lost data into a new
-  /// packet, bounded by the connection's idle timeout rather than a per-packet
-  /// count. Both v3 stacks reassemble streams on byte offsets, so a fresh number
-  /// is safe here — a duplicate is discarded by its offset, and the
-  /// retransmission is acknowledged unambiguously (no Karn ambiguity, because
-  /// sentTime is reset to the resend).
-  ///
-  /// The re-key moves the tracking entry and the retransmit timer from the old
-  /// number to the new. It leaves congestion accounting alone: the bytes stay in
-  /// flight across the re-key (onRetransmit never calls onPacketSent), so they
-  /// are counted once, from the original send until the packet is acknowledged.
-  ///
-  /// Returns null when the packet was already acknowledged, or was retransmitted
-  /// within the last RTO — collapsing a near-simultaneous RTO timer and
-  /// fast-retransmit into one send.
-  int? retransmit(UDXPacket packet) {
-    final oldSeq = packet.sequence;
-    if (!_sentPackets.containsKey(oldSeq)) {
-      _retransmitTimers[oldSeq]?.cancel();
-      _retransmitTimers.remove(oldSeq);
-      return null;
-    }
+  /// Runs loss detection over everything outstanding (RFC 9002 section 6.1)
+  /// and returns what it declared lost, also handed to [onPacketsLost]. The
+  /// socket calls it after each ACK that acknowledged something; the loss
+  /// timer calls it when the time threshold elapses.
+  List<UDXPacket> detectLostPackets() {
+    final lost = _detectLost(clock.now());
+    if (lost.isNotEmpty) onPacketsLost?.call(lost);
+    return lost;
+  }
 
+  /// Declares lost every outstanding packet below the largest acknowledged
+  /// that is [lossReorderThreshold] or more behind it, or older than
+  /// [lossDelay], removes them from tracking and returns them in sequence
+  /// order. Packets behind the largest acknowledged but not yet old enough
+  /// arm the loss timer for when the oldest will be.
+  ///
+  /// Every outstanding packet below the largest acknowledged is considered,
+  /// not only those in a frame's gaps: a receiver that acknowledges one
+  /// packet at a time sends no gaps, and the time threshold is then what
+  /// declares loss.
+  List<UDXPacket> _detectLost(Duration now) {
+    _lossTimer?.cancel();
+    _lossTimer = null;
+    if (_largestAcked < 0) return const [];
+    final delay = lossDelay;
+    final lost = <UDXPacket>[];
+    Duration? nextLoss;
+    for (final packet in _sentPackets.values) {
+      final seq = packet.sequence;
+      if (seq > _largestAcked) continue;
+      final sentAt = packet.lastSentTime ?? packet.sentTime ?? now;
+      if (_largestAcked - seq >= lossReorderThreshold) {
+        lost.add(packet);
+        onPacketLossEvent?.call(seq, 'ack');
+      } else if (now >= sentAt + delay) {
+        lost.add(packet);
+        onPacketLossEvent?.call(seq, 'time');
+      } else {
+        final at = sentAt + delay;
+        if (nextLoss == null || at < nextLoss) nextLoss = at;
+      }
+    }
+    for (final packet in lost) {
+      _sentPackets.remove(packet.sequence);
+    }
+    lost.sort((a, b) => a.sequence.compareTo(b.sequence));
+    if (nextLoss != null) {
+      var wait = nextLoss - now;
+      if (wait < lossTimerGranularity) wait = lossTimerGranularity;
+      _lossTimer = clock.timer(wait, _onLossTimer);
+    }
+    return lost;
+  }
+
+  void _onLossTimer() {
+    _ackBeforeLoss = _lastAckTime;
+    final lost = _detectLost(clock.now());
+    if (lost.isNotEmpty) onPacketsLost?.call(lost);
+  }
+
+  /// Whether a packet is waiting on the time threshold.
+  bool get lossTimerArmed => _lossTimer != null;
+
+  /// Whether [lost], as just declared, is persistent congestion (RFC 9002
+  /// section 7.6): the sender has an RTT sample, the newest lost packet went
+  /// out at least three PTOs after the oldest, and nothing was acknowledged
+  /// between the oldest going out and the ACK (or timer) that revealed the
+  /// loss. The socket then collapses the window.
+  bool persistentCongestion(List<UDXPacket> lost) {
+    if (lost.length < 2 || !congestionController.hasRttSample) return false;
+    final oldest = lost.first.lastSentTime;
+    final newest = lost.last.lastSentTime;
+    if (oldest == null || newest == null) return false;
+    if (newest - oldest < congestionController.persistentCongestionDuration) return false;
+    final before = _ackBeforeLoss;
+    return before == null || before < oldest;
+  }
+
+  /// Gives a packet a FRESH sequence number for another transmission and
+  /// tracks it under that number, returning the number, or null when the
+  /// packet has been acknowledged and must not go out again.
+  ///
+  /// Reusing the original number is what made loss fatal: the retry budget
+  /// rode on the packet, so exhausting it left a hole the stream could never
+  /// fill. QUIC never reuses a packet number (RFC 9000 section 12.3); it
+  /// re-frames lost data into a new packet. Both v3 stacks reassemble
+  /// streams on byte offsets, so a fresh number is safe: a duplicate is
+  /// discarded by its offset, and the retransmission is acknowledged
+  /// unambiguously.
+  ///
+  /// The packet may be tracked (a PTO probe re-sends the oldest outstanding
+  /// packet, which stays outstanding) or not (loss detection removed it):
+  /// either way it is tracked under the new number afterwards, with
+  /// [UDXPacket.lastSentTime] reset so the RTT sample and loss detection
+  /// measure from this send; [UDXPacket.sentTime] stays the first send.
+  /// Congestion accounting is the caller's: a probe's bytes are still in
+  /// flight, a lost packet's left flight when it was declared lost and are
+  /// booked again by the caller when it goes out.
+  int? resend(UDXPacket packet) {
+    if (packet.isAcked) return null;
+    if (identical(_sentPackets[packet.sequence], packet)) {
+      _sentPackets.remove(packet.sequence);
+    }
     final now = clock.now();
-    if (packet.retransmitCount > 0 &&
-        packet.lastRetransmit != null &&
-        (now - packet.lastRetransmit!).inMilliseconds < retransmitTimeout) {
-      return null;
-    }
-
     final newSeq = nextSequence;
-
-    _retransmitTimers[oldSeq]?.cancel();
-    _retransmitTimers.remove(oldSeq);
-    _sentPackets.remove(oldSeq);
-
     packet.sequence = newSeq;
     packet.retransmitCount++;
     packet.lastRetransmit = now;
-    // sentTime stays: it is the ORIGINAL send time, and persistent-congestion
-    // detection measures how long a packet has gone undelivered from it, so a
-    // resend must not restart that clock. lastSentTime moves: the RTT sample
-    // for this packet, should the resend be the transmission that is
-    // acknowledged, is measured from the resend. The fresh sequence makes that
-    // unambiguous (no Karn ambiguity), as go-udx does.
     packet.lastSentTime = now;
+    packet.sentTime ??= now;
     lastSentPacketNumber = newSeq;
     _sentPackets[newSeq] = packet;
-
-    final backoff = _retransmitBackoffMs(packet.retransmitCount);
-    _retransmitTimers[newSeq] = clock.timer(
-      Duration(milliseconds: backoff),
-      () => _onRetransmitTimer(packet),
-    );
-
     return newSeq;
   }
 
-  /// Retransmits a specific packet identified by its (current) sequence number.
-  /// Used by fast-retransmit; the sequence may already have been retired by an
-  /// RTO-driven re-key, in which case there is nothing to do.
-  void retransmitPacket(int sequence) {
-    final packet = _sentPackets[sequence];
-    if (packet == null) return;
-    final newSeq = retransmit(packet);
-    if (newSeq != null) {
-      onRetransmit?.call(packet);
-    }
+  /// Up to [n] outstanding packets, lowest sequence first: what a PTO probe
+  /// re-sends. A re-send takes a fresh sequence, so the lowest numbers are
+  /// the longest unsent.
+  List<UDXPacket> oldestUnacked(int n) {
+    if (_sentPackets.isEmpty || n <= 0) return const [];
+    final all = _sentPackets.values.toList()..sort((a, b) => a.sequence.compareTo(b.sequence));
+    return all.length > n ? all.sublist(0, n) : all;
   }
 
-  /// Fires when a packet's RTO elapses without an ACK: re-key under a fresh
-  /// sequence (which also arms the next timer) and put it back on the wire.
-  /// There is no per-packet retry cap — a genuinely dead path is ended by the
-  /// socket's idle timeout closing the whole connection, not by abandoning one
-  /// packet's bytes.
-  void _onRetransmitTimer(UDXPacket packet) {
-    final newSeq = retransmit(packet);
-    if (newSeq != null) {
-      onPacketRetransmitEvent?.call(
-          newSeq, packet.retransmitCount, Duration(milliseconds: retransmitTimeout));
-      onRetransmit?.call(packet);
-    }
-  }
-
-  /// Schedules the first retransmission timer for a freshly-sent packet. Every
-  /// later timer is armed by [retransmit] as it re-keys the packet, so there is
-  /// exactly one live timer per unacked packet, following it across renumberings.
-  void _scheduleRetransmission(UDXPacket packet) {
-    _retransmitTimers[packet.sequence] = clock.timer(
-      Duration(milliseconds: retransmitTimeout),
-      () => _onRetransmitTimer(packet),
-    );
-  }
-
-  /// Destroys the packet manager and cancels all timers
+  /// Stops the loss timer and forgets every packet.
   void destroy() {
-    for (final timer in _retransmitTimers.values) {
-      timer.cancel();
-    }
-    _retransmitTimers.clear();
+    _lossTimer?.cancel();
+    _lossTimer = null;
     _sentPackets.clear();
   }
 
   // --- Test Hooks ---
-  // Methods to allow tests to inspect internal state.
   Map<int, UDXPacket> getSentPacketsTestHook() => _sentPackets;
-  Map<int, Timer> getRetransmitTimersTestHook() => _retransmitTimers;
 }

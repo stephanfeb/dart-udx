@@ -1,217 +1,133 @@
-@Skip('Per-stream PM/CC moved to socket level - needs rewrite for per-connection sequencing')
+/// Loss is declared from acknowledgements (RFC 9002 section 6.1), never from
+/// a per-packet timer: a packet below the largest acknowledged is lost once
+/// it is three sequences behind it or older than 9/8 of the RTT, and the
+/// loss timer catches the latter without another ACK.
 library;
 
-import 'package:dart_udx/src/multiplexer.dart';
-import 'package:dart_udx/dart_udx.dart';
-import 'package:dart_udx/src/packet.dart';
-import 'package:dart_udx/src/socket.dart';
-import 'package:dart_udx/src/stream.dart';
-import 'package:test/test.dart';
 import 'dart:typed_data';
-import 'dart:async';
-import 'dart:io';
 
-// A custom multiplexer to simulate packet loss for testing
-class FlakyUDXMultiplexer extends UDXMultiplexer {
-  final Set<int> dropSequences;
-  final Set<int> _alreadyAttempted = {};
-  int packetsSent = 0;
-  int packetsDropped = 0;
+import 'package:dart_udx/src/cid.dart';
+import 'package:dart_udx/src/clock.dart';
+import 'package:dart_udx/src/congestion.dart';
+import 'package:dart_udx/src/packet.dart';
+import 'package:test/test.dart';
 
-  FlakyUDXMultiplexer(
-    RawDatagramSocket socket, {
-    required this.dropSequences,
-  }) : super(socket);
+UDXPacket _dataPacket(int sequence) => UDXPacket(
+      destinationCid: ConnectionId.random(),
+      sourceCid: ConnectionId.random(),
+      destinationStreamId: 1,
+      sourceStreamId: 2,
+      sequence: sequence,
+      frames: [StreamFrame(data: Uint8List(100), offset: sequence * 100)],
+    );
 
-  @override
-  void send(Uint8List data, InternetAddress address, int port) {
-    try {
-      final packet = UDXPacket.fromBytes(data);
-      final isFirstAttempt = !_alreadyAttempted.contains(packet.sequence);
-      _alreadyAttempted.add(packet.sequence);
-
-      if (isFirstAttempt && dropSequences.contains(packet.sequence)) {
-        print('FlakyUDXMultiplexer: Dropping packet with seq: ${packet.sequence}');
-        packetsDropped++;
-        return; // Drop the packet
-      }
-      
-      packetsSent++;
-      super.send(data, address, port);
-    } catch (e) {
-      // Not a UDX packet, or some other issue, send anyway
-      super.send(data, address, port);
-    }
-  }
-}
+List<int> _seqs(List<UDXPacket> packets) => packets.map((p) => p.sequence).toList();
 
 void main() {
-  group('Loss Detection', () {
-    late UDX udx;
-    late FlakyUDXMultiplexer clientMultiplexer;
-    late UDXMultiplexer serverMultiplexer;
-    late RawDatagramSocket clientRawSocket;
-    late RawDatagramSocket serverRawSocket;
+  late FakeClock clock;
+  late PacketManager pm;
+  late CongestionController cc;
+  late List<UDXPacket> lost;
 
-    // Helper to set up a standard client/server connection for a test
-    Future<({UDPSocket clientSocket, UDPSocket serverSocket, UDXStream clientStream, UDXStream serverStream})>
-        setupTestEnvironment({required Set<int> dropSequences}) async {
-      
-      clientRawSocket = await RawDatagramSocket.bind(InternetAddress.loopbackIPv4, 0);
-      serverRawSocket = await RawDatagramSocket.bind(InternetAddress.loopbackIPv4, 0);
+  setUp(() {
+    clock = FakeClock();
+    pm = PacketManager(clock: clock);
+    cc = CongestionController(packetManager: pm, clock: clock);
+    pm.congestionController = cc;
+    cc.setSmoothedRtt(const Duration(milliseconds: 50));
+    lost = [];
+    pm.onPacketsLost = lost.addAll;
+  });
 
-      clientMultiplexer = FlakyUDXMultiplexer(clientRawSocket, dropSequences: dropSequences);
-      serverMultiplexer = UDXMultiplexer(serverRawSocket);
-      
-      final serverAddress = serverRawSocket.address;
-      final serverPort = serverRawSocket.port;
+  tearDown(() {
+    cc.destroy();
+    pm.destroy();
+  });
 
-      final clientSocket = clientMultiplexer.createSocket(udx, serverAddress.address, serverPort);
-      
-      final serverConnectionCompleter = Completer<UDPSocket>();
-      serverMultiplexer.connections.listen(serverConnectionCompleter.complete);
-
-      final clientStream = await UDXStream.createOutgoing(udx, clientSocket, 1, 2, serverAddress.address, serverPort);
-      
-      final serverSocket = await serverConnectionCompleter.future.timeout(const Duration(seconds: 2));
-      
-      final serverStreamCompleter = Completer<UDXStream>();
-      serverSocket.on('stream').listen((event) {
-        if (!serverStreamCompleter.isCompleted) {
-          serverStreamCompleter.complete(event.data as UDXStream);
-        }
-      });
-      serverSocket.flushStreamBuffer();
-      
-      final serverStream = await serverStreamCompleter.future.timeout(const Duration(seconds: 2));
-
-      return (
-        clientSocket: clientSocket,
-        serverSocket: serverSocket,
-        clientStream: clientStream,
-        serverStream: serverStream
-      );
+  void sendN(int n) {
+    for (var i = 0; i < n; i++) {
+      pm.sendPacket(_dataPacket(pm.nextSequence));
     }
+  }
 
-    setUp(() {
-      udx = UDX();
-    });
+  test('packets three or more behind the largest acknowledged are lost; one or two behind wait', () {
+    sendN(10);
+    // 9 and 8 acknowledged; 7 and below in a gap.
+    pm.handleAckFrame(AckFrame(
+      largestAcked: 9,
+      ackDelay: 0,
+      firstAckRangeLength: 2,
+      ackRanges: [AckRange(gap: 4, ackRangeLength: 1)], // 3 as well
+    ));
+    pm.detectLostPackets();
 
-    tearDown(() async {
-      clientMultiplexer.close();
-      serverMultiplexer.close();
-    });
+    expect(_seqs(lost), [0, 1, 2, 4, 5, 6], reason: 'in sequence order; 3 was acknowledged');
+    expect(pm.getPacket(7), isNotNull, reason: 'two behind and just sent: reordering still explains it');
+    expect(pm.lossTimerArmed, isTrue, reason: '7 waits on the time threshold');
+  });
 
-    test('retransmits lost packet and completes data transfer', () async {
-      final setup = await setupTestEnvironment(dropSequences: {1});
-      final clientStream = setup.clientStream;
-      final serverStream = setup.serverStream;
+  test('a receiver that acknowledges one packet at a time still yields loss: by the time threshold', () {
+    // No gaps in such ACKs; the old code only looked at the gaps.
+    sendN(5);
+    pm.handleAckFrame(AckFrame(largestAcked: 4, ackDelay: 0, firstAckRangeLength: 1));
+    pm.detectLostPackets();
+    expect(_seqs(lost), [0, 1], reason: 'three or more behind');
+    expect(pm.lossTimerArmed, isTrue);
 
-      final dataToSend = Uint8List.fromList([1, 2, 3, 4, 5]);
-      final serverReceivedCompleter = Completer<Uint8List>();
+    lost.clear();
+    clock.advance(pm.lossDelay - const Duration(milliseconds: 1));
+    expect(lost, isEmpty);
+    clock.advance(const Duration(milliseconds: 1));
+    expect(_seqs(lost), [2, 3], reason: 'older than 9/8 RTT: the loss timer declared them lost');
+    expect(pm.lossTimerArmed, isFalse);
+  });
 
-      serverStream.data.listen((receivedData) {
-        if (!serverReceivedCompleter.isCompleted) {
-          serverReceivedCompleter.complete(receivedData);
-        }
-      });
+  test('the loss delay is 9/8 of the larger of the smoothed and latest RTT, floored at 1 ms', () {
+    expect(pm.lossDelay, const Duration(microseconds: 56250)); // 9/8 of 50 ms
+    // One much slower sample: latest jumps, smoothed barely moves.
+    cc.onPacketSent(100);
+    cc.onPacketAcked(100, clock.now() - const Duration(milliseconds: 400), Duration.zero, true, 0);
+    expect(cc.latestRttForTest, const Duration(milliseconds: 400));
+    expect(pm.lossDelay, const Duration(milliseconds: 450));
 
-      await clientStream.add(dataToSend);
+    cc.setSmoothedRtt(Duration.zero);
+    cc.onPacketSent(100);
+    cc.onPacketAcked(100, clock.now(), Duration.zero, true, 1);
+    expect(pm.lossDelay, PacketManager.lossTimerGranularity);
+  });
 
-      final receivedData = await serverReceivedCompleter.future.timeout(
-        Duration(milliseconds: clientStream.packetManager.retransmitTimeout + 500),
-        onTimeout: () => throw TimeoutException('Server did not receive data in time.'),
-      );
+  test('a re-sent packet is tracked above the largest acknowledged and is not lost again by the same ACK', () {
+    sendN(5);
+    pm.handleAckFrame(AckFrame(largestAcked: 4, ackDelay: 0, firstAckRangeLength: 1));
+    pm.detectLostPackets();
+    expect(_seqs(lost), [0, 1]);
+    final packet = lost.first;
+    expect(pm.resend(packet), 5);
 
-      expect(receivedData, equals(dataToSend));
-      expect(clientMultiplexer.packetsDropped, equals(1));
-      expect(clientMultiplexer.packetsSent, greaterThan(1)); // Original + retransmit
-    });
+    lost.clear();
+    pm.handleAckFrame(AckFrame(largestAcked: 4, ackDelay: 0, firstAckRangeLength: 1));
+    pm.detectLostPackets();
+    expect(lost, isEmpty);
+    expect(pm.getPacket(5), same(packet));
+  });
 
-    test('triggers fast retransmit on 3 duplicate ACKs', () async {
-      final setup = await setupTestEnvironment(dropSequences: {1});
-      final clientStream = setup.clientStream;
-      
-      final fastRetransmitCompleter = Completer<void>();
-      clientStream.packetManager.congestionController.onFastRetransmit = (seq) {
-        if (!fastRetransmitCompleter.isCompleted) {
-          fastRetransmitCompleter.complete();
-        }
-      };
-
-      // Send 4 packets. The first data packet (seq 1) will be dropped.
-      // The next 3 (seq 2, 3, 4) will trigger duplicate ACKs, leading to fast retransmit.
-      for (int i = 0; i < 4; i++) {
-        await clientStream.add(Uint8List.fromList([i]));
-      }
-
-      await fastRetransmitCompleter.future.timeout(
-        const Duration(seconds: 2),
-        onTimeout: () => throw TimeoutException('Fast retransmit was not triggered.'),
-      );
-      
-      expect(clientMultiplexer.packetsDropped, equals(1));
-    });
-
-    test('recovers from multiple lost packets', () async {
-      final setup = await setupTestEnvironment(dropSequences: {2, 4});
-      final clientStream = setup.clientStream;
-      final serverStream = setup.serverStream;
-
-      final allData = List.generate(5 * 1000, (i) => i % 256);
-      final dataToSend = Uint8List.fromList(allData);
-      final receivedData = <int>[];
-      final serverReceivedCompleter = Completer<void>();
-
-      serverStream.data.listen((chunk) {
-        receivedData.addAll(chunk);
-        if (receivedData.length >= dataToSend.length) {
-          if (!serverReceivedCompleter.isCompleted) {
-            serverReceivedCompleter.complete();
-          }
-        }
-      });
-
-      await clientStream.add(dataToSend);
-      await serverReceivedCompleter.future.timeout(const Duration(seconds: 5));
-
-      expect(receivedData, equals(dataToSend));
-      expect(clientMultiplexer.packetsDropped, equals(2));
-      expect(clientMultiplexer.packetsSent, greaterThan(dataToSend.length / 1400));
-    });
-
-    test('retransmits single lost packet after subsequent ACK', () async {
-      // This test specifically targets a bug where an ACK for a later packet
-      // incorrectly cancels the retransmission timer for an earlier, lost packet.
-      final setup = await setupTestEnvironment(dropSequences: {0});
-      final clientStream = setup.clientStream;
-      final serverStream = setup.serverStream;
-
-      final receivedData = <int>[];
-      final serverReceivedCompleter = Completer<void>();
-
-      serverStream.data.listen((chunk) {
-        receivedData.addAll(chunk);
-        if (receivedData.length >= 2) {
-          if (!serverReceivedCompleter.isCompleted) {
-            serverReceivedCompleter.complete();
-          }
-        }
-      });
-
-      // Send two packets. Packet 0 will be dropped. Packet 1 will be sent.
-      // The server will receive packet 1 and send an ACK for it, creating a SACK.
-      // This SACK should NOT cancel the retransmit timer for packet 0.
-      await clientStream.add(Uint8List.fromList([1])); // Packet 0
-      await clientStream.add(Uint8List.fromList([2])); // Packet 1
-
-      await serverReceivedCompleter.future.timeout(
-        const Duration(seconds: 2),
-        onTimeout: () => throw TimeoutException('Server did not receive all data in time.'),
-      );
-
-      expect(receivedData, equals([1, 2]));
-      expect(clientMultiplexer.packetsDropped, equals(1));
-    });
+  test('a gap the peer keeps reporting for a sequence no longer tracked costs nothing', () {
+    // A resend has a fresh sequence, so the dropped sequence stays a gap in
+    // every later ACK's ranges; only tracked packets can be declared lost.
+    sendN(4);
+    pm.handleAckFrame(AckFrame(largestAcked: 3, ackDelay: 0, firstAckRangeLength: 1));
+    pm.detectLostPackets();
+    expect(_seqs(lost), [0]);
+    lost.clear();
+    pm.resend(pm.oldestUnacked(1).first); // 1 -> 4, as a probe would
+    pm.handleAckFrame(AckFrame(
+      largestAcked: 4,
+      ackDelay: 0,
+      firstAckRangeLength: 1,
+      ackRanges: [AckRange(gap: 1, ackRangeLength: 2)], // 3 and 2 acknowledged
+    ));
+    pm.detectLostPackets();
+    expect(lost, isEmpty);
+    expect(pm.getSentPacketsTestHook(), isEmpty);
   });
 }

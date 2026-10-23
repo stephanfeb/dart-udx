@@ -45,6 +45,12 @@ class PacingController {
     _pacingRateBytesPerSec = (pacingGain * cwnd) / minRttInSeconds;
   }
 
+  /// How long until the next packet may be sent: zero when it may go now.
+  Duration timeUntilSend() {
+    final now = clock.now();
+    return now < _nextSendTime ? _nextSendTime - now : Duration.zero;
+  }
+
   /// Waits until it is time to send the next packet.
   ///
   /// Returns a `Future` that completes when the pacer determines it's

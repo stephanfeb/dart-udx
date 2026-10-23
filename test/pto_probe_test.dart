@@ -13,6 +13,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:dart_udx/dart_udx.dart';
+import 'package:dart_udx/src/packet.dart';
 import 'package:test/test.dart';
 
 /// A relay that drops the first [drops] transmissions of the stream data at
@@ -58,6 +59,47 @@ class _DropsFirstChunk {
   Datagram? _client;
   int transmissions = 0;
   int pings = 0;
+
+  void close() {
+    inside.close();
+    outside.close();
+  }
+}
+
+/// A relay that can be cut: while [dropping], nothing from the client gets
+/// through, and every client datagram is counted either way.
+class _CuttablePath {
+  _CuttablePath._(this.inside, this.outside, this.server) {
+    inside.listen((event) {
+      if (event != RawSocketEvent.read) return;
+      final d = inside.receive();
+      if (d == null) return;
+      _client = d;
+      sent++;
+      if (dropping) return;
+      outside.send(d.data, server.address, server.port);
+    });
+    outside.listen((event) {
+      if (event != RawSocketEvent.read) return;
+      final d = outside.receive();
+      final client = _client;
+      if (d == null || client == null) return;
+      inside.send(d.data, client.address, client.port);
+    });
+  }
+
+  static Future<_CuttablePath> start(RawDatagramSocket server) async => _CuttablePath._(
+        await RawDatagramSocket.bind(InternetAddress.loopbackIPv4, 0),
+        await RawDatagramSocket.bind(InternetAddress.loopbackIPv4, 0),
+        server,
+      );
+
+  final RawDatagramSocket inside;
+  final RawDatagramSocket outside;
+  final RawDatagramSocket server;
+  Datagram? _client;
+  bool dropping = false;
+  int sent = 0;
 
   void close() {
     inside.close();
@@ -118,6 +160,51 @@ void main() {
     expect(path.transmissions, greaterThanOrEqualTo(3), reason: 'the chunk was re-sent until it got through');
     await Future<void>.delayed(const Duration(milliseconds: 300));
     expect(socket.packetManager.getSentPacketsTestHook(), isEmpty);
+    expect(socket.congestionController.inflight, 0);
+    await clientStream.close();
+  });
+
+  test('a cut path gets a few probes with backoff, not the window again and again; the transfer completes after', () async {
+    final path = await _CuttablePath.start(serverRaw);
+    addTearDown(path.close);
+    final (socket, clientStream, _, serverStream) = await connect(path.inside.address.address, path.inside.port);
+
+    const total = 200 * 1024;
+    final payload = Uint8List.fromList(List.generate(total, (i) => i % 251));
+    var received = 0;
+    final all = Completer<void>();
+    serverStream.data.listen((d) {
+      received += d.length;
+      if (received >= total && !all.isCompleted) all.complete();
+    });
+
+    // Cut the path as soon as the first bytes are out, so a window is in
+    // flight when it goes dark.
+    final writing = clientStream.add(payload);
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    path.dropping = true;
+    await Future<void>.delayed(const Duration(milliseconds: 200)); // the window is full
+    final atStart = path.sent;
+    const gap = Duration(seconds: 3);
+    await Future<void>.delayed(gap);
+    final during = path.sent - atStart;
+    path.dropping = false;
+
+    // On loopback the PTO sits at its floor; expirations in the gap are at
+    // 1, 3, 7, ... PTOs: three in three seconds, two probes each. The old
+    // per-packet timers re-sent the whole window every two seconds.
+    var expirations = 0;
+    for (var at = CongestionController.minPto; at < gap; at = at * 2 + CongestionController.minPto) {
+      expirations++;
+    }
+    final limit = PacketManager.ptoProbes * expirations + 2;
+    expect(during, lessThanOrEqualTo(limit),
+        reason: '$during datagrams went into a $gap gap; at most $limit ($expirations PTOs x ${PacketManager.ptoProbes} probes)');
+
+    await writing.timeout(const Duration(seconds: 30));
+    await all.future.timeout(const Duration(seconds: 30));
+    await Future<void>.delayed(const Duration(milliseconds: 300)); // the last ACKs
+    expect(socket.packetManager.getSentPacketsTestHook(), isEmpty, reason: 'everything acknowledged');
     expect(socket.congestionController.inflight, 0);
     await clientStream.close();
   });

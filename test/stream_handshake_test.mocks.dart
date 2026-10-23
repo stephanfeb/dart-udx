@@ -3,18 +3,19 @@
 // Do not manually edit this file.
 
 // ignore_for_file: no_leading_underscores_for_library_prefixes
-import 'dart:async' as _i10;
+import 'dart:async' as _i11;
 import 'dart:io' as _i4;
-import 'dart:typed_data' as _i12;
+import 'dart:typed_data' as _i13;
 
 import 'package:dart_udx/src/cid.dart' as _i5;
-import 'package:dart_udx/src/congestion.dart' as _i6;
-import 'package:dart_udx/src/events.dart' as _i13;
-import 'package:dart_udx/src/metrics_observer.dart' as _i9;
+import 'package:dart_udx/src/clock.dart' as _i6;
+import 'package:dart_udx/src/congestion.dart' as _i7;
+import 'package:dart_udx/src/events.dart' as _i14;
+import 'package:dart_udx/src/metrics_observer.dart' as _i10;
 import 'package:dart_udx/src/multiplexer.dart' as _i3;
-import 'package:dart_udx/src/packet.dart' as _i7;
-import 'package:dart_udx/src/socket.dart' as _i8;
-import 'package:dart_udx/src/stream.dart' as _i11;
+import 'package:dart_udx/src/packet.dart' as _i8;
+import 'package:dart_udx/src/socket.dart' as _i9;
+import 'package:dart_udx/src/stream.dart' as _i12;
 import 'package:dart_udx/src/udx.dart' as _i2;
 import 'package:mockito/mockito.dart' as _i1;
 
@@ -74,9 +75,8 @@ class _FakeConnectionCids_3 extends _i1.SmartFake
         );
 }
 
-class _FakeCongestionController_4 extends _i1.SmartFake
-    implements _i6.CongestionController {
-  _FakeCongestionController_4(
+class _FakeClock_4 extends _i1.SmartFake implements _i6.Clock {
+  _FakeClock_4(
     Object parent,
     Invocation parentInvocation,
   ) : super(
@@ -85,8 +85,19 @@ class _FakeCongestionController_4 extends _i1.SmartFake
         );
 }
 
-class _FakePacketManager_5 extends _i1.SmartFake implements _i7.PacketManager {
-  _FakePacketManager_5(
+class _FakeCongestionController_5 extends _i1.SmartFake
+    implements _i7.CongestionController {
+  _FakeCongestionController_5(
+    Object parent,
+    Invocation parentInvocation,
+  ) : super(
+          parent,
+          parentInvocation,
+        );
+}
+
+class _FakePacketManager_6 extends _i1.SmartFake implements _i8.PacketManager {
+  _FakePacketManager_6(
     Object parent,
     Invocation parentInvocation,
   ) : super(
@@ -98,7 +109,7 @@ class _FakePacketManager_5 extends _i1.SmartFake implements _i7.PacketManager {
 /// A class which mocks [UDPSocket].
 ///
 /// See the documentation for Mockito's code generation for more information.
-class MockUDPSocket extends _i1.Mock implements _i8.UDPSocket {
+class MockUDPSocket extends _i1.Mock implements _i9.UDPSocket {
   MockUDPSocket() {
     _i1.throwOnMissingStub(this);
   }
@@ -182,13 +193,22 @@ class MockUDPSocket extends _i1.Mock implements _i8.UDPSocket {
       );
 
   @override
+  _i6.Clock get clock => (super.noSuchMethod(
+        Invocation.getter(#clock),
+        returnValue: _FakeClock_4(
+          this,
+          Invocation.getter(#clock),
+        ),
+      ) as _i6.Clock);
+
+  @override
   bool get isServer => (super.noSuchMethod(
         Invocation.getter(#isServer),
         returnValue: false,
       ) as bool);
 
   @override
-  set metricsObserver(_i9.UdxMetricsObserver? _metricsObserver) =>
+  set metricsObserver(_i10.UdxMetricsObserver? _metricsObserver) =>
       super.noSuchMethod(
         Invocation.setter(
           #metricsObserver,
@@ -198,10 +218,10 @@ class MockUDPSocket extends _i1.Mock implements _i8.UDPSocket {
       );
 
   @override
-  _i10.Future<void> get handshakeComplete => (super.noSuchMethod(
+  _i11.Future<void> get handshakeComplete => (super.noSuchMethod(
         Invocation.getter(#handshakeComplete),
-        returnValue: _i10.Future<void>.value(),
-      ) as _i10.Future<void>);
+        returnValue: _i11.Future<void>.value(),
+      ) as _i11.Future<void>);
 
   @override
   bool get isHandshakeCompleted => (super.noSuchMethod(
@@ -210,10 +230,10 @@ class MockUDPSocket extends _i1.Mock implements _i8.UDPSocket {
       ) as bool);
 
   @override
-  _i10.Future<void> get sendCreditChanged => (super.noSuchMethod(
+  _i11.Future<void> get sendCreditChanged => (super.noSuchMethod(
         Invocation.getter(#sendCreditChanged),
-        returnValue: _i10.Future<void>.value(),
-      ) as _i10.Future<void>);
+        returnValue: _i11.Future<void>.value(),
+      ) as _i11.Future<void>);
 
   @override
   bool get closing => (super.noSuchMethod(
@@ -234,22 +254,28 @@ class MockUDPSocket extends _i1.Mock implements _i8.UDPSocket {
       ) as bool);
 
   @override
-  _i6.CongestionController get congestionController => (super.noSuchMethod(
+  int get lostQueueLength => (super.noSuchMethod(
+        Invocation.getter(#lostQueueLength),
+        returnValue: 0,
+      ) as int);
+
+  @override
+  _i7.CongestionController get congestionController => (super.noSuchMethod(
         Invocation.getter(#congestionController),
-        returnValue: _FakeCongestionController_4(
+        returnValue: _FakeCongestionController_5(
           this,
           Invocation.getter(#congestionController),
         ),
-      ) as _i6.CongestionController);
+      ) as _i7.CongestionController);
 
   @override
-  _i7.PacketManager get packetManager => (super.noSuchMethod(
+  _i8.PacketManager get packetManager => (super.noSuchMethod(
         Invocation.getter(#packetManager),
-        returnValue: _FakePacketManager_5(
+        returnValue: _FakePacketManager_6(
           this,
           Invocation.getter(#packetManager),
         ),
-      ) as _i7.PacketManager);
+      ) as _i8.PacketManager);
 
   @override
   int get remoteConnectionMaxData => (super.noSuchMethod(
@@ -267,17 +293,17 @@ class MockUDPSocket extends _i1.Mock implements _i8.UDPSocket {
       );
 
   @override
-  List<_i11.UDXStream> getStreamBuffer() => (super.noSuchMethod(
+  List<_i12.UDXStream> getStreamBuffer() => (super.noSuchMethod(
         Invocation.method(
           #getStreamBuffer,
           [],
         ),
-        returnValue: <_i11.UDXStream>[],
-      ) as List<_i11.UDXStream>);
+        returnValue: <_i12.UDXStream>[],
+      ) as List<_i12.UDXStream>);
 
   @override
-  _i10.Future<void> handleIncomingDatagram(
-    _i12.Uint8List? data,
+  _i11.Future<void> handleIncomingDatagram(
+    _i13.Uint8List? data,
     _i4.InternetAddress? fromAddress,
     int? fromPort,
   ) =>
@@ -290,15 +316,15 @@ class MockUDPSocket extends _i1.Mock implements _i8.UDPSocket {
             fromPort,
           ],
         ),
-        returnValue: _i10.Future<void>.value(),
-        returnValueForMissingStub: _i10.Future<void>.value(),
-      ) as _i10.Future<void>);
+        returnValue: _i11.Future<void>.value(),
+        returnValueForMissingStub: _i11.Future<void>.value(),
+      ) as _i11.Future<void>);
 
   @override
   void sendStreamPacket(
     int? dstStreamId,
     int? srcStreamId,
-    List<_i7.Frame>? frames, {
+    List<_i8.Frame>? frames, {
     bool? trackForRetransmit = true,
   }) =>
       super.noSuchMethod(
@@ -315,7 +341,7 @@ class MockUDPSocket extends _i1.Mock implements _i8.UDPSocket {
       );
 
   @override
-  void send(_i12.Uint8List? data) => super.noSuchMethod(
+  void send(_i13.Uint8List? data) => super.noSuchMethod(
         Invocation.method(
           #send,
           [data],
@@ -369,7 +395,7 @@ class MockUDPSocket extends _i1.Mock implements _i8.UDPSocket {
       );
 
   @override
-  _i10.Future<void> closeWithError(
+  _i11.Future<void> closeWithError(
     int? errorCode,
     String? reason, {
     int? frameType = 0,
@@ -383,19 +409,19 @@ class MockUDPSocket extends _i1.Mock implements _i8.UDPSocket {
           ],
           {#frameType: frameType},
         ),
-        returnValue: _i10.Future<void>.value(),
-        returnValueForMissingStub: _i10.Future<void>.value(),
-      ) as _i10.Future<void>);
+        returnValue: _i11.Future<void>.value(),
+        returnValueForMissingStub: _i11.Future<void>.value(),
+      ) as _i11.Future<void>);
 
   @override
-  _i10.Future<void> close() => (super.noSuchMethod(
+  _i11.Future<void> close() => (super.noSuchMethod(
         Invocation.method(
           #close,
           [],
         ),
-        returnValue: _i10.Future<void>.value(),
-        returnValueForMissingStub: _i10.Future<void>.value(),
-      ) as _i10.Future<void>);
+        returnValue: _i11.Future<void>.value(),
+        returnValueForMissingStub: _i11.Future<void>.value(),
+      ) as _i11.Future<void>);
 
   @override
   int allocateIncomingStreamId(int? requested) => (super.noSuchMethod(
@@ -407,7 +433,7 @@ class MockUDPSocket extends _i1.Mock implements _i8.UDPSocket {
       ) as int);
 
   @override
-  void registerStream(_i11.UDXStream? stream) => super.noSuchMethod(
+  void registerStream(_i12.UDXStream? stream) => super.noSuchMethod(
         Invocation.method(
           #registerStream,
           [stream],
@@ -434,14 +460,14 @@ class MockUDPSocket extends _i1.Mock implements _i8.UDPSocket {
       );
 
   @override
-  _i10.Future<void> sendMaxStreamsFrame() => (super.noSuchMethod(
+  _i11.Future<void> sendMaxStreamsFrame() => (super.noSuchMethod(
         Invocation.method(
           #sendMaxStreamsFrame,
           [],
         ),
-        returnValue: _i10.Future<void>.value(),
-        returnValueForMissingStub: _i10.Future<void>.value(),
-      ) as _i10.Future<void>);
+        returnValue: _i11.Future<void>.value(),
+        returnValueForMissingStub: _i11.Future<void>.value(),
+      ) as _i11.Future<void>);
 
   @override
   bool canCreateNewStream() => (super.noSuchMethod(
@@ -462,15 +488,15 @@ class MockUDPSocket extends _i1.Mock implements _i8.UDPSocket {
       );
 
   @override
-  _i10.Future<bool> ping({Duration? timeout = const Duration(seconds: 5)}) =>
+  _i11.Future<bool> ping({Duration? timeout = const Duration(seconds: 5)}) =>
       (super.noSuchMethod(
         Invocation.method(
           #ping,
           [],
           {#timeout: timeout},
         ),
-        returnValue: _i10.Future<bool>.value(false),
-      ) as _i10.Future<bool>);
+        returnValue: _i11.Future<bool>.value(false),
+      ) as _i11.Future<bool>);
 
   @override
   void setLocalMaxStreamsForTest(int? value) => super.noSuchMethod(
@@ -500,14 +526,14 @@ class MockUDPSocket extends _i1.Mock implements _i8.UDPSocket {
       ) as int);
 
   @override
-  _i12.Uint8List? popInitialPacket(int? streamId) =>
+  _i13.Uint8List? popInitialPacket(int? streamId) =>
       (super.noSuchMethod(Invocation.method(
         #popInitialPacket,
         [streamId],
-      )) as _i12.Uint8List?);
+      )) as _i13.Uint8List?);
 
   @override
-  _i10.Future<void> sendMaxDataFrame(
+  _i11.Future<void> sendMaxDataFrame(
     int? localMaxData, {
     int? streamId = 0,
   }) =>
@@ -517,9 +543,9 @@ class MockUDPSocket extends _i1.Mock implements _i8.UDPSocket {
           [localMaxData],
           {#streamId: streamId},
         ),
-        returnValue: _i10.Future<void>.value(),
-        returnValueForMissingStub: _i10.Future<void>.value(),
-      ) as _i10.Future<void>);
+        returnValue: _i11.Future<void>.value(),
+        returnValueForMissingStub: _i11.Future<void>.value(),
+      ) as _i11.Future<void>);
 
   @override
   void advertiseConnectionWindowUpdate() => super.noSuchMethod(
@@ -567,13 +593,13 @@ class MockUDPSocket extends _i1.Mock implements _i8.UDPSocket {
       );
 
   @override
-  _i10.Stream<_i13.UDXEvent> on(String? event) => (super.noSuchMethod(
+  _i11.Stream<_i14.UDXEvent> on(String? event) => (super.noSuchMethod(
         Invocation.method(
           #on,
           [event],
         ),
-        returnValue: _i10.Stream<_i13.UDXEvent>.empty(),
-      ) as _i10.Stream<_i13.UDXEvent>);
+        returnValue: _i11.Stream<_i14.UDXEvent>.empty(),
+      ) as _i11.Stream<_i14.UDXEvent>);
 
   @override
   void emit(
@@ -594,7 +620,7 @@ class MockUDPSocket extends _i1.Mock implements _i8.UDPSocket {
   @override
   void flushBufferedStreams(
     String? event,
-    _i13.UDXEventCallback? callback,
+    _i14.UDXEventCallback? callback,
     List<dynamic>? buffer,
   ) =>
       super.noSuchMethod(

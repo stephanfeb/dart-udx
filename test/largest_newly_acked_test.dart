@@ -41,7 +41,7 @@ void main() {
     final p1 = _dataPacket(pm.nextSequence);
     pm.sendPacket(p0);
     pm.sendPacket(p1);
-    final resent = pm.retransmit(p0)!; // p0 now lives under a fresh sequence
+    final resent = pm.resend(p0)!; // p0 now lives under a fresh sequence
     expect(resent, isNot(0));
 
     final acked = pm.handleAckFrame(AckFrame(largestAcked: resent, ackDelay: 0, firstAckRangeLength: 1));
@@ -102,7 +102,7 @@ void main() {
       cc.onPacketSent(1000);
     }
     final p1 = pm.getPacket(1)!;
-    final resent = pm.retransmit(p1)!;
+    final resent = pm.resend(p1)!;
     expect(resent, 3);
 
     cc.onPacketAcked(2000, const SystemClock().now() - (const Duration(milliseconds: 40)), Duration.zero, true, 2); // 0 and 2

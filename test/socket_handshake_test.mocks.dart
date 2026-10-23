@@ -3,15 +3,16 @@
 // Do not manually edit this file.
 
 // ignore_for_file: no_leading_underscores_for_library_prefixes
-import 'dart:async' as _i6;
+import 'dart:async' as _i7;
 import 'dart:io' as _i2;
-import 'dart:typed_data' as _i7;
+import 'dart:typed_data' as _i8;
 
-import 'package:dart_udx/src/cid.dart' as _i5;
-import 'package:dart_udx/src/multiplexer.dart' as _i4;
-import 'package:dart_udx/src/packet.dart' as _i9;
-import 'package:dart_udx/src/socket.dart' as _i3;
-import 'package:dart_udx/src/udx.dart' as _i8;
+import 'package:dart_udx/src/cid.dart' as _i6;
+import 'package:dart_udx/src/clock.dart' as _i3;
+import 'package:dart_udx/src/multiplexer.dart' as _i5;
+import 'package:dart_udx/src/packet.dart' as _i10;
+import 'package:dart_udx/src/socket.dart' as _i4;
+import 'package:dart_udx/src/udx.dart' as _i9;
 import 'package:mockito/mockito.dart' as _i1;
 
 // ignore_for_file: type=lint
@@ -38,8 +39,18 @@ class _FakeRawDatagramSocket_0 extends _i1.SmartFake
         );
 }
 
-class _FakeUDPSocket_1 extends _i1.SmartFake implements _i3.UDPSocket {
-  _FakeUDPSocket_1(
+class _FakeClock_1 extends _i1.SmartFake implements _i3.Clock {
+  _FakeClock_1(
+    Object parent,
+    Invocation parentInvocation,
+  ) : super(
+          parent,
+          parentInvocation,
+        );
+}
+
+class _FakeUDPSocket_2 extends _i1.SmartFake implements _i4.UDPSocket {
+  _FakeUDPSocket_2(
     Object parent,
     Invocation parentInvocation,
   ) : super(
@@ -51,7 +62,7 @@ class _FakeUDPSocket_1 extends _i1.SmartFake implements _i3.UDPSocket {
 /// A class which mocks [UDXMultiplexer].
 ///
 /// See the documentation for Mockito's code generation for more information.
-class MockUDXMultiplexer extends _i1.Mock implements _i4.UDXMultiplexer {
+class MockUDXMultiplexer extends _i1.Mock implements _i5.UDXMultiplexer {
   MockUDXMultiplexer() {
     _i1.throwOnMissingStub(this);
   }
@@ -66,22 +77,31 @@ class MockUDXMultiplexer extends _i1.Mock implements _i4.UDXMultiplexer {
       ) as _i2.RawDatagramSocket);
 
   @override
-  Map<_i5.ConnectionId, _i3.UDPSocket> get socketsByCid => (super.noSuchMethod(
+  _i3.Clock get clock => (super.noSuchMethod(
+        Invocation.getter(#clock),
+        returnValue: _FakeClock_1(
+          this,
+          Invocation.getter(#clock),
+        ),
+      ) as _i3.Clock);
+
+  @override
+  Map<_i6.ConnectionId, _i4.UDPSocket> get socketsByCid => (super.noSuchMethod(
         Invocation.getter(#socketsByCid),
-        returnValue: <_i5.ConnectionId, _i3.UDPSocket>{},
-      ) as Map<_i5.ConnectionId, _i3.UDPSocket>);
+        returnValue: <_i6.ConnectionId, _i4.UDPSocket>{},
+      ) as Map<_i6.ConnectionId, _i4.UDPSocket>);
 
   @override
-  Map<String, _i3.UDPSocket> get socketsByPeer => (super.noSuchMethod(
+  Map<String, _i4.UDPSocket> get socketsByPeer => (super.noSuchMethod(
         Invocation.getter(#socketsByPeer),
-        returnValue: <String, _i3.UDPSocket>{},
-      ) as Map<String, _i3.UDPSocket>);
+        returnValue: <String, _i4.UDPSocket>{},
+      ) as Map<String, _i4.UDPSocket>);
 
   @override
-  _i6.Future<Object?> get done => (super.noSuchMethod(
+  _i7.Future<Object?> get done => (super.noSuchMethod(
         Invocation.getter(#done),
-        returnValue: _i6.Future<Object?>.value(),
-      ) as _i6.Future<Object?>);
+        returnValue: _i7.Future<Object?>.value(),
+      ) as _i7.Future<Object?>);
 
   @override
   bool get lost => (super.noSuchMethod(
@@ -90,10 +110,10 @@ class MockUDXMultiplexer extends _i1.Mock implements _i4.UDXMultiplexer {
       ) as bool);
 
   @override
-  _i6.Stream<_i3.UDPSocket> get connections => (super.noSuchMethod(
+  _i7.Stream<_i4.UDPSocket> get connections => (super.noSuchMethod(
         Invocation.getter(#connections),
-        returnValue: _i6.Stream<_i3.UDPSocket>.empty(),
-      ) as _i6.Stream<_i3.UDPSocket>);
+        returnValue: _i7.Stream<_i4.UDPSocket>.empty(),
+      ) as _i7.Stream<_i4.UDPSocket>);
 
   @override
   void close() => super.noSuchMethod(
@@ -106,7 +126,7 @@ class MockUDXMultiplexer extends _i1.Mock implements _i4.UDXMultiplexer {
 
   @override
   void send(
-    _i7.Uint8List? data,
+    _i8.Uint8List? data,
     _i2.InternetAddress? address,
     int? port,
   ) =>
@@ -123,7 +143,7 @@ class MockUDXMultiplexer extends _i1.Mock implements _i4.UDXMultiplexer {
       );
 
   @override
-  void removeSocket(_i5.ConnectionId? localCid) => super.noSuchMethod(
+  void removeSocket(_i6.ConnectionId? localCid) => super.noSuchMethod(
         Invocation.method(
           #removeSocket,
           [localCid],
@@ -132,7 +152,7 @@ class MockUDXMultiplexer extends _i1.Mock implements _i4.UDXMultiplexer {
       );
 
   @override
-  void addSocket(_i3.UDPSocket? socket) => super.noSuchMethod(
+  void addSocket(_i4.UDPSocket? socket) => super.noSuchMethod(
         Invocation.method(
           #addSocket,
           [socket],
@@ -141,12 +161,12 @@ class MockUDXMultiplexer extends _i1.Mock implements _i4.UDXMultiplexer {
       );
 
   @override
-  _i3.UDPSocket createSocket(
-    _i8.UDX? udx,
+  _i4.UDPSocket createSocket(
+    _i9.UDX? udx,
     String? host,
     int? port, {
-    _i5.ConnectionId? localCid,
-    _i5.ConnectionId? remoteCid,
+    _i6.ConnectionId? localCid,
+    _i6.ConnectionId? remoteCid,
     bool? isServer = false,
     bool? shared = true,
   }) =>
@@ -165,7 +185,7 @@ class MockUDXMultiplexer extends _i1.Mock implements _i4.UDXMultiplexer {
             #shared: shared,
           },
         ),
-        returnValue: _FakeUDPSocket_1(
+        returnValue: _FakeUDPSocket_2(
           this,
           Invocation.method(
             #createSocket,
@@ -182,13 +202,13 @@ class MockUDXMultiplexer extends _i1.Mock implements _i4.UDXMultiplexer {
             },
           ),
         ),
-      ) as _i3.UDPSocket);
+      ) as _i4.UDPSocket);
 
   @override
   void sendStatelessReset(
     _i2.InternetAddress? address,
     int? port,
-    _i5.ConnectionId? connectionId,
+    _i6.ConnectionId? connectionId,
   ) =>
       super.noSuchMethod(
         Invocation.method(
@@ -204,8 +224,8 @@ class MockUDXMultiplexer extends _i1.Mock implements _i4.UDXMultiplexer {
 
   @override
   void registerResetToken(
-    _i5.ConnectionId? cid,
-    _i9.StatelessResetToken? token,
+    _i6.ConnectionId? cid,
+    _i10.StatelessResetToken? token,
   ) =>
       super.noSuchMethod(
         Invocation.method(
@@ -219,18 +239,18 @@ class MockUDXMultiplexer extends _i1.Mock implements _i4.UDXMultiplexer {
       );
 
   @override
-  Map<_i5.ConnectionId, _i3.UDPSocket> getSocketsForTest() =>
+  Map<_i6.ConnectionId, _i4.UDPSocket> getSocketsForTest() =>
       (super.noSuchMethod(
         Invocation.method(
           #getSocketsForTest,
           [],
         ),
-        returnValue: <_i5.ConnectionId, _i3.UDPSocket>{},
-      ) as Map<_i5.ConnectionId, _i3.UDPSocket>);
+        returnValue: <_i6.ConnectionId, _i4.UDPSocket>{},
+      ) as Map<_i6.ConnectionId, _i4.UDPSocket>);
 
   @override
   void handleIncomingDatagramForTest(
-    _i7.Uint8List? data,
+    _i8.Uint8List? data,
     _i2.InternetAddress? address,
     int? port,
   ) =>

@@ -11,6 +11,7 @@ import 'events.dart';
 import 'stream.dart';
 import 'packet.dart';
 import 'congestion.dart';
+import 'lost_queue.dart';
 import 'multiplexer.dart';
 import 'pmtud.dart';
 import 'recv_tracker.dart';
@@ -89,6 +90,9 @@ class UDPSocket with UDXEventEmitter {
 
   /// Connection-level congestion controller.
   late final CongestionController _congestionController;
+
+  /// Packets declared lost, re-sent as the window allows.
+  late final LostQueue _lostQueue;
 
   /// Which ack-eliciting packets have arrived, for the ACK's ranges.
   final RecvTracker _recvd = RecvTracker();
@@ -201,21 +205,18 @@ class UDPSocket with UDXEventEmitter {
     _packetManager = PacketManager(clock: this.clock);
     _congestionController = CongestionController(packetManager: _packetManager, clock: this.clock);
     _packetManager.congestionController = _congestionController;
+    _lostQueue = LostQueue(
+      packetManager: _packetManager,
+      congestionController: _congestionController,
+      clock: this.clock,
+      send: _sendQuietly,
+    );
 
-    // Set up retransmission callback
-    _packetManager.onRetransmit = (packet) {
-      if (!_closing) {
-        try {
-          send(packet.toBytes());
-        } catch (e) {
-          // Ignore send errors during retransmission
-        }
-      }
-    };
-
-    // The PTO probe re-sends the oldest unacknowledged packet under a fresh
-    // sequence, through onRetransmit above.
+    // A PTO probe re-sends the oldest outstanding packets under fresh
+    // sequences, through this; their bytes are still in flight.
+    _packetManager.onRetransmit = (packet) => _sendQuietly(packet.toBytes());
     _congestionController.onProbe = _packetManager.sendProbe;
+    _packetManager.onPacketsLost = _onPacketsLost;
 
     // For client-initiated connections, address is validated by default
     // For server-side connections (receiving SYN), address must be validated
@@ -235,13 +236,44 @@ class UDPSocket with UDXEventEmitter {
 
   /// The silence a connection tolerates before it is closed. RFC 9000 section
   /// 10.1 requires at least three PTOs, so loss recovery always gets a chance
-  /// before the path is declared dead; the RTO is capped, so the 30s floor wins
+  /// before the path is declared dead; the PTO is capped, so the 30s floor wins
   /// in practice, and the max() keeps it correct if that cap ever rises.
   Duration get _idleTimeout {
-    final threePto = _packetManager.retransmitTimeout * 3;
-    final floorMs = maxIdleTimeout.inMilliseconds;
-    return Duration(milliseconds: threePto > floorMs ? threePto : floorMs);
+    final threePto = _congestionController.pto * 3;
+    return threePto > maxIdleTimeout ? threePto : maxIdleTimeout;
   }
+
+  /// Sends encoded bytes, ignoring a socket that is closing under us.
+  void _sendQuietly(Uint8List bytes) {
+    if (_closing) return;
+    try {
+      send(bytes);
+    } catch (_) {
+      // The socket closed; nothing to send to.
+    }
+  }
+
+  /// Told by loss detection what is lost, oldest first. The bytes leave
+  /// flight and the window contracts once per recovery epoch; a loss span of
+  /// three PTOs with no ACK since the oldest went out is persistent
+  /// congestion and collapses the window to the minimum (RFC 9002 section
+  /// 7.6). The packets then queue for re-sending as the window allows.
+  void _onPacketsLost(List<UDXPacket> lost) {
+    if (lost.isEmpty) return;
+    var bytes = 0;
+    for (final packet in lost) {
+      bytes += packet.dataBytes;
+      metricsObserver?.onPacketLoss(cids.localCid, packet.sequence, 'ack');
+    }
+    _congestionController.onPacketLost(bytes, lost);
+    if (_packetManager.persistentCongestion(lost)) {
+      _congestionController.onPersistentCongestion();
+    }
+    _lostQueue.add(lost);
+  }
+
+  /// How many lost packets wait for window to be re-sent.
+  int get lostQueueLength => _lostQueue.length;
 
   void _armIdleCheck() {
     if (_closing) return;
@@ -278,6 +310,7 @@ class UDPSocket with UDXEventEmitter {
       _registeredStreams.clear();
 
       multiplexer.removeSocket(cids.localCid);
+      _lostQueue.dispose();
       _packetManager.destroy();
       _congestionController.destroy();
 
@@ -555,6 +588,12 @@ class UDPSocket with UDXEventEmitter {
       largest != null,
       frame.largestAcked,
     );
+    // Then loss detection over every outstanding packet below the largest
+    // acknowledged (RFC 9002 section 6.1); what it declares lost goes to
+    // _onPacketsLost. Lost data first, then new data: the window the ACK
+    // opened goes to the resend queue before writers are woken.
+    _packetManager.detectLostPackets();
+    _lostQueue.flush();
     notifySendCredit();
   }
 
@@ -823,6 +862,7 @@ class UDPSocket with UDXEventEmitter {
 
       multiplexer.removeSocket(cids.localCid);
 
+      _lostQueue.dispose();
       _packetManager.destroy();
       _congestionController.destroy();
 
@@ -858,6 +898,7 @@ class UDPSocket with UDXEventEmitter {
 
       multiplexer.removeSocket(cids.localCid);
 
+      _lostQueue.dispose();
       _packetManager.destroy();
       _congestionController.destroy();
 
