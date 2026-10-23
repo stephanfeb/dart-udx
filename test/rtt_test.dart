@@ -18,15 +18,41 @@ void main() {
       packetManager.congestionController = controller;
     });
 
-    test('calculates initial RTT correctly', () {
+    test('the first sample sets every estimate, unadjusted (RFC 9002 section 5.3)', () {
       final sentTime = DateTime.now().subtract(const Duration(milliseconds: 150));
       const ackDelay = Duration(milliseconds: 20);
 
       controller.onPacketAcked(1000, sentTime, ackDelay, true, 0);
 
+      // min_rtt is the first sample itself, and a sample is only adjusted for
+      // the ACK delay when it is at least min_rtt + ack_delay, which the first
+      // never is: it stands as measured.
+      expect(controller.latestRttForTest.inMilliseconds, closeTo(150, 5));
+      expect(controller.minRtt, equals(controller.latestRttForTest));
+      expect(controller.smoothedRtt, equals(controller.latestRttForTest));
+      expect(controller.rttVar.inMicroseconds, closeTo(controller.latestRttForTest.inMicroseconds / 2, 1));
+    });
+
+    test('later samples subtract the reported ACK delay, capped at max_ack_delay', () {
+      controller.onPacketAcked(1000, DateTime.now().subtract(const Duration(milliseconds: 100)), Duration.zero, true, 0);
+
+      controller.onPacketAcked(1000, DateTime.now().subtract(const Duration(milliseconds: 150)),
+          const Duration(milliseconds: 20), true, 1);
       expect(controller.latestRttForTest.inMilliseconds, closeTo(130, 5)); // 150 - 20
-      expect(controller.smoothedRtt.inMilliseconds, isNot(0));
-      expect(controller.rttVar.inMilliseconds, isNot(0));
+
+      controller.onPacketAcked(1000, DateTime.now().subtract(const Duration(milliseconds: 200)),
+          const Duration(milliseconds: 80), true, 2);
+      expect(controller.latestRttForTest.inMilliseconds, closeTo(175, 5)); // 200 - 25, not 200 - 80
+    });
+
+    test('an ACK delay that would take the sample below min_rtt is not applied', () {
+      controller.onPacketAcked(1000, DateTime.now().subtract(const Duration(milliseconds: 100)), Duration.zero, true, 0);
+
+      // 105 ms measured with 20 ms of reported delay would be 85 ms, below the
+      // 100 ms minimum ever seen; the delay is not credible and is ignored.
+      controller.onPacketAcked(1000, DateTime.now().subtract(const Duration(milliseconds: 105)),
+          const Duration(milliseconds: 20), true, 1);
+      expect(controller.latestRttForTest.inMilliseconds, closeTo(105, 5));
     });
 
     test('updates smoothed RTT and RTT variance over time', () {

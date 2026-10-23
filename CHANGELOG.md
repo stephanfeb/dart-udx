@@ -5,6 +5,19 @@ All notable changes to dart-udx will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.3.0] - 2026-10-23
+
+### Fixed
+
+- **A sender lost part of its window with every retransmitted packet.** The ACK path looked each acknowledged sequence up in a map keyed by the packet's original sequence; a retransmission is re-keyed under a fresh sequence, so the ACK of a resend found nothing and the packet's bytes stayed in flight and charged to the connection's send window for the rest of the connection. A dozen losses froze the sender, which then wrote only through a 30 s escape hatch that ignored both limits. `PacketManager.handleAckFrame` now returns the acknowledged packets themselves (their size and last send time travel with them across a re-key), and the socket credits every one of them. `test/retransmit_accounting_test.dart` drops packets on a relay and checks the accounting afterwards.
+- **After the first loss a connection never sampled the RTT or grew its window again.** The socket kept a TCP-style cumulative-ack point that a retransmission's never-acknowledged original sequence stuck forever; every later ACK counted as a duplicate. The controller now works from what each ACK frame newly acknowledges, as QUIC does (RFC 9002 sections 5.1 and 7.3): the RTT sample comes from the largest newly acknowledged packet's last send, the window grows by the bytes acknowledged, and recovery ends when a packet sent after it began is acknowledged. The duplicate-ACK counter and its fast retransmit are gone; loss detection from ACK ranges follows in a later release. `test/largest_newly_acked_test.dart`.
+- **ACK delay handling follows RFC 9002 section 5.3.** The first sample sets every estimate as measured; later samples subtract the reported delay (capped at 25 ms) only when that leaves them at or above `min_rtt`.
+
+### Changed
+
+- A writer blocked on the congestion window or the peer's limits now waits for the socket to wake it (`UDPSocket.sendCreditChanged`, completed on every ACK, MAX_DATA, WINDOW_UPDATE and close) instead of polling every 50 ms, and never sends past a limit. While blocked on the peer's limit it sends STREAM_DATA_BLOCKED or DATA_BLOCKED every 500 ms, so a lost WINDOW_UPDATE or MAX_DATA is re-advertised (go-udx already answers both; a dart-udx receiver now re-advertises MAX_DATA on DATA_BLOCKED).
+- `CongestionController.onPacketAcked` is called once per ACK frame with all the newly acknowledged bytes; its fourth argument now says whether the frame's largest acknowledged packet was newly acknowledged. `processDuplicateAck` and `onFastRetransmit` are removed.
+
 ## [4.2.1] - 2026-10-22
 
 ### Fixed

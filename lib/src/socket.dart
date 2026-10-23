@@ -91,17 +91,23 @@ class UDPSocket with UDXEventEmitter {
   /// Arrival time of the largest-acked packet, for ACK delay calculation.
   DateTime? _largestAckedPacketArrivalTime;
 
-  /// Sent packets tracking for RTT calculation (maps seq -> (sentTime, dataSize)).
-  final Map<int, (DateTime, int)> _sentPacketsForRtt = {};
+  /// Completes when a writer may have gained send credit: bytes acknowledged
+  /// (the congestion window and the connection's send window both open),
+  /// MAX_DATA or a stream's WINDOW_UPDATE from the peer, or this socket
+  /// closing. Writers wait on it instead of polling, and re-check their limits
+  /// when it completes; nothing is sent past a limit after a wait.
+  Completer<void> _sendCredit = Completer<void>();
 
-  /// Tracks all sequences ever acked by remote for cumulative ack calculation.
-  final Set<int> _everAckedSequencesByRemote = {};
+  /// A future that completes the next time send credit may have changed.
+  Future<void> get sendCreditChanged => _sendCredit.future;
 
-  /// Highest seq N such that all packets 0..N are confirmed acked.
-  int _currentHighestCumulativeAckFromRemote = -1;
-
-  /// Mirror of CC's highest processed cumulative ack.
-  int _ccMirrorOfHighestProcessedCumulativeAck = -1;
+  /// Wakes writers waiting on [sendCreditChanged].
+  void notifySendCredit() {
+    final waiting = _sendCredit;
+    if (waiting.isCompleted) return;
+    _sendCredit = Completer<void>();
+    waiting.complete();
+  }
 
   // Connection-level flow control properties
   late int _localConnectionMaxData; // Our connection receive window
@@ -201,10 +207,6 @@ class UDPSocket with UDXEventEmitter {
       _packetManager.sendProbe(cids.remoteCid, cids.localCid, 0, 0);
     };
 
-    _congestionController.onFastRetransmit = (sequence) {
-      _packetManager.retransmitPacket(sequence);
-    };
-    
     // For client-initiated connections, address is validated by default
     // For server-side connections (receiving SYN), address must be validated
     _addressValidated = !isServer;
@@ -252,6 +254,7 @@ class UDPSocket with UDXEventEmitter {
     if (_closing) return;
     _closing = true;
     _idleTimer?.cancel();
+    notifySendCredit();
     UdxLogging.warn(
         'socket idle-timeout close: cid=${cids.localCid} peer=${remoteAddress.address}:$remotePort '
         'idleTimeout=${_idleTimeout.inSeconds}s lastActivity=$_lastActivity streams=${_registeredStreams.length}');
@@ -376,7 +379,10 @@ class UDPSocket with UDXEventEmitter {
         } else if (frame is PathResponseFrame) {
           _handlePathResponse(frame, fromAddress, fromPort);
         } else if (frame is DataBlockedFrame) {
+          // The peer is out of connection-level credit, possibly because our
+          // MAX_DATA was lost (it is never retransmitted): re-advertise.
           emit('dataBlocked', {'maxData': frame.maxData});
+          advertiseConnectionWindowUpdate();
         }
       }
 
@@ -508,48 +514,43 @@ class UDPSocket with UDXEventEmitter {
     }
   }
 
-  /// Handles an ACK frame at the connection level.
+  /// Handles an ACK frame at the connection level (RFC 9002 sections 5.1 and
+  /// 7.3.1), the way go-udx's handleAckFrame does.
+  ///
+  /// Every packet the frame newly acknowledges, under whatever sequence it was
+  /// last sent with, leaves flight and gives its bytes back to the connection's
+  /// send window. The controller hears about the frame once, with all of those
+  /// bytes together, and takes its RTT sample from the largest acknowledged
+  /// packet when that one is among them.
+  ///
+  /// This used to keep a TCP-style cumulative-ack point and count "duplicate"
+  /// ACKs against it. A retransmission is re-keyed under a fresh sequence, so
+  /// the original sequence is never acknowledged and the point stuck there for
+  /// the rest of the connection: every later ACK counted as a duplicate, the
+  /// RTT was never sampled again, the window never grew again, recovery never
+  /// ended, and fast retransmit was aimed at a retired sequence.
   void _handleConnectionAckFrame(AckFrame frame) {
-    final newlySackedSequences = _packetManager.handleAckFrame(frame);
-    _everAckedSequencesByRemote.addAll(newlySackedSequences);
+    final acked = _packetManager.handleAckFrame(frame);
+    if (acked.isEmpty) return;
 
-    // Compute true cumulative ack
-    while (_everAckedSequencesByRemote.contains(_currentHighestCumulativeAckFromRemote + 1)) {
-      _currentHighestCumulativeAckFromRemote++;
+    var bytes = 0;
+    UDXPacket? largest;
+    for (final packet in acked) {
+      final size = packet.dataBytes;
+      bytes += size;
+      if (packet.sequence == frame.largestAcked) largest = packet;
+      decrementConnectionBytesSent(size);
+      emit('ack', {'largestAcked': packet.sequence});
     }
 
-    bool advancesCcCumulativePoint = _currentHighestCumulativeAckFromRemote > _ccMirrorOfHighestProcessedCumulativeAck;
-    final int largestAckedInThisFrame = frame.largestAcked;
-
-    if (newlySackedSequences.isNotEmpty) {
-      for (final ackedSeq in newlySackedSequences) {
-        final sentPacketInfo = _sentPacketsForRtt.remove(ackedSeq);
-        if (sentPacketInfo != null) {
-          final (sentTime, ackedSize) = sentPacketInfo;
-
-          bool isNewCumulativeForCC = advancesCcCumulativePoint &&
-              ackedSeq > _ccMirrorOfHighestProcessedCumulativeAck &&
-              ackedSeq <= _currentHighestCumulativeAckFromRemote;
-
-          _congestionController.onPacketAcked(
-            ackedSize,
-            sentTime,
-            Duration(milliseconds: frame.ackDelay),
-            isNewCumulativeForCC,
-            largestAckedInThisFrame,
-          );
-
-          decrementConnectionBytesSent(ackedSize);
-          emit('ack', {'largestAcked': ackedSeq});
-        }
-      }
-    }
-
-    if (advancesCcCumulativePoint) {
-      _ccMirrorOfHighestProcessedCumulativeAck = _currentHighestCumulativeAckFromRemote;
-    } else {
-      _congestionController.processDuplicateAck(_ccMirrorOfHighestProcessedCumulativeAck);
-    }
+    _congestionController.onPacketAcked(
+      bytes,
+      largest?.lastSentTime,
+      Duration(milliseconds: frame.ackDelay),
+      largest != null,
+      frame.largestAcked,
+    );
+    notifySendCredit();
   }
 
   /// The connection-level congestion controller, exposed for stream flow control checks.
@@ -593,7 +594,6 @@ class UDPSocket with UDXEventEmitter {
     if (hasData && trackForRetransmit) {
       _packetManager.sendPacket(packet);
       _congestionController.onPacketSent(dataSize);
-      _sentPacketsForRtt[seq] = (DateTime.now(), dataSize);
     }
 
     send(packet.toBytes());
@@ -726,6 +726,7 @@ class UDPSocket with UDXEventEmitter {
     if (_closing) return;
     _closing = true;
     _idleTimer?.cancel();
+    notifySendCredit();
     UdxLogging.warn(
         'socket closeWithError: code=$errorCode reason="$reason" '
         'cid=${cids.localCid} peer=${remoteAddress.address}:$remotePort streams=${_registeredStreams.length}');
@@ -783,6 +784,7 @@ class UDPSocket with UDXEventEmitter {
     if (_closing) return;
     _closing = true;
     _idleTimer?.cancel();
+    notifySendCredit();
     UdxLogging.warn(
         'socket close(): cid=${cids.localCid} peer=${remoteAddress.address}:$remotePort '
         'streams=${_registeredStreams.length}');
@@ -1181,6 +1183,7 @@ class UDPSocket with UDXEventEmitter {
     if (frame.maxData > _remoteConnectionMaxData) {
       _remoteConnectionMaxData = frame.maxData;
       emit('remoteConnectionWindowUpdate', {'maxData': _remoteConnectionMaxData});
+      notifySendCredit();
     }
   }
 
@@ -1207,6 +1210,9 @@ class UDPSocket with UDXEventEmitter {
   void advertiseConnectionWindowUpdate() {
     sendMaxDataFrame(_localConnectionMaxData);
   }
+
+  /// The peer's connection-level limit on what we may send (its last MAX_DATA).
+  int get remoteConnectionMaxData => _remoteConnectionMaxData;
 
   /// Gets the available send window at the connection level.
   int getAvailableConnectionSendWindow() {

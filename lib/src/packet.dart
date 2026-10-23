@@ -1050,6 +1050,11 @@ class UDXPacket {
   /// has gone undelivered. Per-retransmission timing lives in [lastRetransmit].
   DateTime? sentTime;
 
+  /// When the packet last went on the wire: its first send, then each
+  /// retransmission. The RTT is sampled from here (RFC 9002 section 5.1): a
+  /// resend carries a fresh sequence, so its ACK names this send and no other.
+  DateTime? lastSentTime;
+
   /// Whether the packet has been acknowledged
   bool isAcked = false;
 
@@ -1066,6 +1071,17 @@ class UDXPacket {
   /// moment one of them was bumped: every outgoing packet still claimed v2
   /// while the receiver required v3, so the handshake never completed.
   static const int currentVersion = UdxVersion.current;
+
+  /// The stream data this packet carries, in bytes: what the congestion
+  /// window and flow control account in. Retransmission carries the frames
+  /// over, so it is the same under every sequence the packet is sent under.
+  int get dataBytes {
+    var n = 0;
+    for (final f in frames) {
+      if (f is StreamFrame) n += f.data.length;
+    }
+    return n;
+  }
 
   /// Creates a new UDX packet
   UDXPacket({
@@ -1261,16 +1277,26 @@ class PacketManager {
 
   /// Sends a packet
   void sendPacket(UDXPacket packet) {
-    packet.sentTime = DateTime.now();
+    final now = DateTime.now();
+    packet.sentTime = now;
+    packet.lastSentTime = now;
     lastSentPacketNumber = packet.sequence;
     _sentPackets[packet.sequence] = packet;
     _scheduleRetransmission(packet);
   }
 
   /// Processes an incoming AckFrame, marking packets as acknowledged.
-  /// Returns a list of sequence numbers that were successfully acknowledged by this frame.
-  List<int> handleAckFrame(AckFrame frame) {
-    final newlyAckedSequences = <int>[];
+  ///
+  /// Returns the packets the frame newly acknowledged, each under the sequence
+  /// it was last sent with. The packets, not bare sequences: the caller needs
+  /// their size and last send time, and the entries are removed here, so a
+  /// later lookup by sequence would find nothing. That lookup used to live in
+  /// a separate map keyed by the ORIGINAL sequence, which a retransmission's
+  /// fresh sequence was absent from, so a retransmitted packet's bytes were
+  /// never credited back to the congestion window or the connection's send
+  /// window: every loss shrank the usable window for good.
+  List<UDXPacket> handleAckFrame(AckFrame frame) {
+    final newlyAckedSequences = <UDXPacket>[];
 
     // Process the first range (ending at largestAcked)
     // largestAcked is inclusive. firstAckRangeLength is the count of packets in this range.
@@ -1278,12 +1304,12 @@ class PacketManager {
     if (frame.firstAckRangeLength > 0) {
       for (int i = 0; i < frame.firstAckRangeLength; i++) {
         final seq = frame.largestAcked - i;
-        if (_sentPackets.containsKey(seq)) {
-          final packet = _sentPackets.remove(seq);
-          packet?.isAcked = true;
+        final packet = _sentPackets.remove(seq);
+        if (packet != null) {
+          packet.isAcked = true;
           _retransmitTimers[seq]?.cancel();
           _retransmitTimers.remove(seq);
-          newlyAckedSequences.add(seq);
+          newlyAckedSequences.add(packet);
         }
       }
     }
@@ -1301,12 +1327,12 @@ class PacketManager {
       
       for (int i = 0; i < rangeBlock.ackRangeLength; i++) {
         final seq = rangeEnd - i;
-        if (_sentPackets.containsKey(seq)) {
-          final packet = _sentPackets.remove(seq);
-          packet?.isAcked = true;
+        final packet = _sentPackets.remove(seq);
+        if (packet != null) {
+          packet.isAcked = true;
           _retransmitTimers[seq]?.cancel();
           _retransmitTimers.remove(seq);
-          newlyAckedSequences.add(seq);
+          newlyAckedSequences.add(packet);
         }
       }
       // Update currentSeq for the next iteration: it should be the packet number
@@ -1422,12 +1448,13 @@ class PacketManager {
     packet.sequence = newSeq;
     packet.retransmitCount++;
     packet.lastRetransmit = now;
-    // Deliberately NOT touching sentTime. It is the ORIGINAL send time, and the
-    // only reader is persistent-congestion detection, which measures how long a
-    // packet has gone undelivered — that clock must not restart on a resend. RTT
-    // is sampled from a separate per-sequence map in the socket, and a
-    // retransmit's fresh sequence is simply absent from it, so a retransmitted
-    // packet yields no RTT sample (Karn's algorithm) without any special-casing.
+    // sentTime stays: it is the ORIGINAL send time, and persistent-congestion
+    // detection measures how long a packet has gone undelivered from it, so a
+    // resend must not restart that clock. lastSentTime moves: the RTT sample
+    // for this packet, should the resend be the transmission that is
+    // acknowledged, is measured from the resend. The fresh sequence makes that
+    // unambiguous (no Karn ambiguity), as go-udx does.
+    packet.lastSentTime = now;
     lastSentPacketNumber = newSeq;
     _sentPackets[newSeq] = packet;
 

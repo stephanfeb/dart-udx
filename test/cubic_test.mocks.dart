@@ -164,13 +164,14 @@ class MockPacketManager extends _i1.Mock implements _i3.PacketManager {
       );
 
   @override
-  List<int> handleAckFrame(_i3.AckFrame? frame) => (super.noSuchMethod(
+  List<_i3.UDXPacket> handleAckFrame(_i3.AckFrame? frame) =>
+      (super.noSuchMethod(
         Invocation.method(
           #handleAckFrame,
           [frame],
         ),
-        returnValue: <int>[],
-      ) as List<int>);
+        returnValue: <_i3.UDXPacket>[],
+      ) as List<_i3.UDXPacket>);
 
   @override
   void handleData(_i3.UDXPacket? packet) => super.noSuchMethod(
@@ -207,6 +208,13 @@ class MockPacketManager extends _i1.Mock implements _i3.PacketManager {
         ),
         returnValueForMissingStub: null,
       );
+
+  @override
+  int? retransmit(_i3.UDXPacket? packet) =>
+      (super.noSuchMethod(Invocation.method(
+        #retransmit,
+        [packet],
+      )) as int?);
 
   @override
   void retransmitPacket(int? sequence) => super.noSuchMethod(

@@ -108,10 +108,7 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
 
   int get _maxPayloadSize => _mtu - streamPacketOverhead;
 
-  /// Maximum number of retransmission attempts before considering packet lost
-  int maxRetransmissionAttempts = 10;
-
-  /// Total timeout tolerance for packet-level operations (in seconds)
+  /// How long a write waits for the connection's handshake, in seconds.
   int packetTimeoutTolerance = 30;
 
   /// The round-trip time (from connection-level CC)
@@ -156,11 +153,6 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
   /// The stream controller for data events
   final _dataController = StreamController<Uint8List>();
 
-  /// A completer that resolves when the stream can send more data.
-  Completer<void>? _drain;
-
-  StreamSubscription? _remoteConnectionWindowUpdateSubscription;
-
   /// Whether the stream is in framed mode
   final bool framed;
 
@@ -182,20 +174,6 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
     this.isInitiator = false,
   });
 
-  void _handleRemoteConnectionWindowUpdate(UDXEvent event) {
-    if (_socket == null) return;
-    if (_drain != null && !_drain!.isCompleted) {
-      final socket = _socket;
-      if (socket == null) return;
-      final connWindowAvailable = socket.getAvailableConnectionSendWindow();
-      if (inflight < cwnd &&
-          bytesWritten < _remoteReceiveWindow &&
-          connWindowAvailable > 0) {
-        _drain!.complete();
-      }
-    }
-  }
-
   /// Connects the stream to a remote endpoint
   Future<void> connect(
     UDPSocket socket,
@@ -215,8 +193,6 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
     connectedAt = DateTime.now();
 
     socket.registerStream(this);
-    _remoteConnectionWindowUpdateSubscription?.cancel();
-    _remoteConnectionWindowUpdateSubscription = _socket!.on('remoteConnectionWindowUpdate').listen(_handleRemoteConnectionWindowUpdate);
 
     emit('connect');
   }
@@ -431,15 +407,7 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
     // Monotonic: a stale or reordered frame must never revoke granted credit.
     if (candidate > _remoteReceiveWindow) {
       _remoteReceiveWindow = candidate;
-    }
-
-    if (_drain != null && !_drain!.isCompleted) {
-      final connWindowAvailable = _socket?.getAvailableConnectionSendWindow() ?? 0;
-      if (inflight < cwnd &&
-          bytesWritten < _remoteReceiveWindow &&
-          connWindowAvailable > 0) {
-        _drain!.complete();
-      }
+      _socket?.notifySendCredit();
     }
     emit('drain');
   }
@@ -486,6 +454,22 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
     return fragments;
   }
 
+  /// How often a writer blocked on the peer's flow-control limit tells it so.
+  /// WINDOW_UPDATE and MAX_DATA ride control packets that are never
+  /// retransmitted, so a lost one would leave the writer waiting for credit
+  /// the peer thinks it has granted; STREAM_DATA_BLOCKED / DATA_BLOCKED make
+  /// the peer re-advertise (go-udx does the same, every 500 ms).
+  static const Duration _blockedRetryInterval = Duration(milliseconds: 500);
+
+  /// Whether [size] more bytes may go out now: within the congestion window
+  /// (RFC 9002 section 7), within the peer's limit for this stream and within
+  /// its connection-level limit (RFC 9000 section 4.1). A fragment goes out
+  /// whole or not at all; nothing is sent past a limit.
+  bool _hasSendCredit(UDPSocket socket, int size) =>
+      inflight + size <= cwnd &&
+      bytesWritten + size <= _remoteReceiveWindow &&
+      socket.getAvailableConnectionSendWindow() >= size;
+
   Future<void> _sendFragment(Uint8List fragment) async {
     final socket = _socket;
     if (socket == null) {
@@ -502,44 +486,26 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
       // Continue with send attempt
     }
 
-    // Wait for send window
-    final completer = Completer<void>();
-    Timer? timeoutTimer;
-
-    void checkAndSend() {
-      final connWindowAvailable = socket.getAvailableConnectionSendWindow();
-      // bytesWritten is this stream's cumulative sent total, which is what the
-      // peer's advertised offset bounds. Comparing `inflight` here instead
-      // stopped binding as soon as the offset outgrew one window's worth of
-      // outstanding bytes, leaving cwnd as the only limit — and `inflight` is
-      // the connection-level counter, so it was the wrong quantity for a
-      // per-stream limit regardless.
-      if (inflight < cwnd &&
-          bytesWritten + fragment.length <= _remoteReceiveWindow &&
-          connWindowAvailable > 0) {
-        if (!completer.isCompleted) {
-          completer.complete();
-        }
-      } else {
-        if (_drain == null || _drain!.isCompleted) {
-          _drain = Completer<void>();
-        }
-        Timer(Duration(milliseconds: 50), checkAndSend);
+    // Wait for send credit. The socket wakes writers when an ACK, MAX_DATA or
+    // WINDOW_UPDATE arrives or when it closes; the limits are re-checked each
+    // time. This used to poll every 50 ms and, after 30 s, send regardless,
+    // past both the congestion window and the peer's limit. There is no such
+    // escape: a path that never answers is ended by the socket's idle timeout,
+    // which closes it and wakes the writer.
+    while (!socket.closing && !_hasSendCredit(socket, fragment.length)) {
+      final windowBlocked = bytesWritten + fragment.length > _remoteReceiveWindow ||
+          socket.getAvailableConnectionSendWindow() < fragment.length;
+      if (!windowBlocked) {
+        await socket.sendCreditChanged;
+        continue;
       }
-    }
-
-    timeoutTimer = Timer(Duration(seconds: packetTimeoutTolerance), () {
-      if (!completer.isCompleted) {
-        completer.complete();
-      }
-    });
-
-    checkAndSend();
-
-    try {
-      await completer.future;
-    } finally {
-      timeoutTimer?.cancel();
+      // Blocked on the peer's limit: tell it, and look again after a while in
+      // case its re-advertisement is lost too.
+      _sendBlocked(socket, fragment.length);
+      await Future.any<void>([
+        socket.sendCreditChanged,
+        Future<void>.delayed(_blockedRetryInterval),
+      ]);
     }
 
     // Wait for pacer
@@ -605,6 +571,25 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
         trackForRetransmit: false,
       );
     }
+  }
+
+  /// Tells the peer this writer is out of credit on whichever limit binds:
+  /// the stream's (STREAM_DATA_BLOCKED with the limit we hold) or the
+  /// connection's (DATA_BLOCKED). Both peers answer by re-advertising.
+  void _sendBlocked(UDPSocket socket, int size) {
+    if (remoteId == null || socket.closing) return;
+    final frames = <Frame>[];
+    if (bytesWritten + size > _remoteReceiveWindow) {
+      frames.add(StreamDataBlockedFrame(
+        streamId: id,
+        maxStreamData: _remoteReceiveWindow,
+      ));
+    }
+    if (socket.getAvailableConnectionSendWindow() < size) {
+      frames.add(DataBlockedFrame(maxData: socket.remoteConnectionMaxData));
+    }
+    if (frames.isEmpty) return;
+    socket.sendStreamPacket(remoteId!, id, frames, trackForRetransmit: false);
   }
 
   /// Sets the receive window *size* and re-advertises.
@@ -732,9 +717,6 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
       }
       _socket?.unregisterStream(id);
 
-      await _remoteConnectionWindowUpdateSubscription?.cancel();
-      _remoteConnectionWindowUpdateSubscription = null;
-
       emit('close');
     } catch (e) {
       emit('error', e);
@@ -802,8 +784,6 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
     stream.remotePort = port;
     stream.remoteFamily = UDX.getAddressFamily(host);
     socket.registerStream(stream);
-    stream._remoteConnectionWindowUpdateSubscription?.cancel();
-    stream._remoteConnectionWindowUpdateSubscription = stream._socket!.on('remoteConnectionWindowUpdate').listen(stream._handleRemoteConnectionWindowUpdate);
     stream._connected = true;
     stream.connectedAt = DateTime.now();
 
@@ -862,8 +842,6 @@ class UDXStream with UDXEventEmitter implements StreamSink<Uint8List> {
     stream.remotePort = port;
     stream.remoteFamily = UDX.getAddressFamily(host);
     socket.registerStream(stream);
-    stream._remoteConnectionWindowUpdateSubscription?.cancel();
-    stream._remoteConnectionWindowUpdateSubscription = stream._socket!.on('remoteConnectionWindowUpdate').listen(stream._handleRemoteConnectionWindowUpdate);
     stream._connected = true;
     stream.connectedAt = DateTime.now();
 

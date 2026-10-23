@@ -78,6 +78,18 @@ class MockUDXMultiplexer extends _i1.Mock implements _i4.UDXMultiplexer {
       ) as Map<String, _i3.UDPSocket>);
 
   @override
+  _i6.Future<Object?> get done => (super.noSuchMethod(
+        Invocation.getter(#done),
+        returnValue: _i6.Future<Object?>.value(),
+      ) as _i6.Future<Object?>);
+
+  @override
+  bool get lost => (super.noSuchMethod(
+        Invocation.getter(#lost),
+        returnValue: false,
+      ) as bool);
+
+  @override
   _i6.Stream<_i3.UDPSocket> get connections => (super.noSuchMethod(
         Invocation.getter(#connections),
         returnValue: _i6.Stream<_i3.UDPSocket>.empty(),
@@ -166,7 +178,7 @@ class MockUDXMultiplexer extends _i1.Mock implements _i4.UDXMultiplexer {
               #localCid: localCid,
               #remoteCid: remoteCid,
               #isServer: isServer,
-            #shared: shared,
+              #shared: shared,
             },
           ),
         ),

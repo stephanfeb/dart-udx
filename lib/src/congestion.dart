@@ -5,15 +5,24 @@ import 'cid.dart';
 import 'packet.dart';
 import 'pacing.dart';
 import 'metrics_observer.dart';
-import 'logging.dart';
 
-/// Implements QUIC-style congestion control for UDX streams, based on RFC 9002.
+/// QUIC-style congestion control for a UDX connection, after RFC 9002, with
+/// CUBIC congestion avoidance.
+///
+/// It is told about every send ([onPacketSent]), about every ACK frame once
+/// ([onPacketAcked], with everything the frame newly acknowledged together) and
+/// about detected loss ([onPacketLost]). There is no cumulative-ack point and
+/// no duplicate-ACK counting: QUIC has neither. A retransmission goes out under
+/// a fresh sequence number, so the original number is never acknowledged, and
+/// anything that waited for it to be would wait forever. That was how this
+/// controller used to work, and after the first loss on a connection it never
+/// sampled the RTT or grew the window again.
 class CongestionController {
   final PacketManager packetManager;
-  
+
   /// Metrics observer for this controller (optional).
   UdxMetricsObserver? metricsObserver;
-  
+
   /// Connection ID for metrics reporting.
   ConnectionId? connectionId;
 
@@ -22,8 +31,7 @@ class CongestionController {
   static const int maxAckDelay = 25; // milliseconds - per RFC 9002
   static final int initialCwnd =
       max(10 * maxDatagramSize, 14720); // 10 * max_datagram_size or 14720 bytes
-  static const int minCwnd =
-      2 * maxDatagramSize; // 2 * max_datagram_size
+  static const int minCwnd = 2 * maxDatagramSize; // 2 * max_datagram_size
   static const int kPersistentCongestionThreshold = 3;
 
   // CUBIC Constants
@@ -39,7 +47,6 @@ class CongestionController {
 
   /// The start time of the current congestion avoidance epoch.
   DateTime? _epochStart;
-
 
   /// The current congestion window size in bytes.
   int get cwnd => _cwnd;
@@ -62,6 +69,11 @@ class CongestionController {
   Duration get minRtt => _minRtt;
   Duration _minRtt = const Duration(seconds: 1); // Initialize high
 
+  /// Whether an RTT sample has been taken yet. Until then the estimates above
+  /// are the initial defaults, and the first sample replaces them outright
+  /// (RFC 9002 section 5.3).
+  bool _hasRttSample = false;
+
   /// The latest RTT sample.
   Duration _latestRtt = Duration.zero;
 
@@ -72,29 +84,17 @@ class CongestionController {
   int get inflight => _inflight;
   int _inflight = 0;
 
-  /// The number of duplicate acknowledgments.
-  int _dupAcks = 0;
-
-  /// Stores the 'largest_acked' value from the ACK frame that triggered the current dupAck count.
-  int _lastAckedForDupCount = -1;
-
-  /// Tracks the highest 'largest_acked' value received from a non-duplicate ACK frame.
-  int _highestProcessedCumulativeAck = -1;
-
-  /// Flag indicating if the controller is in a fast recovery phase.
+  /// Whether the controller is in a recovery period.
   bool get isInRecoveryForTest => _inRecovery;
   bool _inRecovery = false;
-  
+
   /// Flag to track if we've emitted the initial CWND value
   bool _initialCwndEmitted = false;
 
-  /// When in recovery, this is the packet number of the last packet sent
-  /// that marks the end of the "recovery block". We exit recovery once a
-  /// packet sent after this one is acknowledged.
+  /// The last packet sent when the current recovery period began. Recovery
+  /// ends once a packet sent after it is acknowledged (RFC 9002 section
+  /// 7.3.2); retransmissions take fresh sequences, so that packet exists.
   int _recoveryEndPacketNumber = -1;
-  
-  /// Stores the sequence number of the packet that was presumed lost and triggered recovery.
-  int _lostPacketInRecovery = -1;
 
   /// The Probe Timeout (PTO) duration.
   Duration get pto {
@@ -116,9 +116,6 @@ class CongestionController {
   /// Callback for when a probe packet should be sent.
   void Function()? onProbe;
 
-  /// Callback for fast retransmit.
-  void Function(int sequence)? onFastRetransmit;
-
   /// The packet pacer.
   final PacingController pacingController;
 
@@ -130,26 +127,21 @@ class CongestionController {
 
   /// Called when a packet is sent.
   void onPacketSent(int bytes) {
-    // //print('[CongestionController] onPacketSent: bytes=$bytes, inflight_before=$_inflight');
     _inflight += bytes;
-    // //print('[CongestionController] onPacketSent: inflight_after=$_inflight');
     _armPtoTimer();
   }
 
-  /// Called when a packet is acknowledged.
-  /// [bytes] is the size of the acknowledged packet.
-  /// [sentTime] is the time the acknowledged packet was sent.
-  /// [ackDelay] is the delay the receiver waited before sending the ACK.
-  /// [isNewCumulativeAck] true if the ACK frame advanced the highest cumulative ACK point.
-  /// [currentFrameLargestAcked] the 'largest_acked' value from the current ACK frame.
-  void onPacketAcked(int bytes, DateTime sentTime, Duration ackDelay, bool isNewCumulativeAck, int currentFrameLargestAcked) {
-    // Debug logging
-    // print('[CongestionController.onPacketAcked] bytes=$bytes, isNewCumulativeAck=$isNewCumulativeAck, largestAcked=$currentFrameLargestAcked');
-    // DIAGNOSTIC LOGGING START
-    // //print('[CC onPacketAcked] INPUTS: bytes=$bytes, sentTime=$sentTime, ackDelay=$ackDelay, isNewCumulativeAck=$isNewCumulativeAck, currentFrameLargestAcked=$currentFrameLargestAcked');
-    // //print('[CC onPacketAcked] PRE-STATE: _inRecovery=$_inRecovery, _highestProcessedCumulativeAck=$_highestProcessedCumulativeAck, _dupAcks=$_dupAcks, _lastAckedForDupCount=$_lastAckedForDupCount, _cwnd=$_cwnd, _ssthresh=$_ssthresh, _inflight=$_inflight');
-    // DIAGNOSTIC LOGGING END
-
+  /// Called once per ACK frame with everything it newly acknowledged.
+  ///
+  /// [bytes] is the sum of the newly acknowledged packets' sizes: they leave
+  /// flight and, outside recovery, grow the window (RFC 9002 section 7.3.1,
+  /// the window grows by the bytes acked). [largestNewlyAcked] says whether
+  /// the frame's largest acknowledged packet is among them; if so [sentTime],
+  /// that packet's last send, and [ackDelay], what the receiver reports it
+  /// waited, give the RTT sample (section 5.1). [largestAcked] is the frame's
+  /// largest acknowledged sequence, which ends recovery once it is past the
+  /// packet that was last sent when recovery began (section 7.3.2).
+  void onPacketAcked(int bytes, DateTime? sentTime, Duration ackDelay, bool largestNewlyAcked, int largestAcked) {
     // Emit initial CWND on first ack so metrics UI shows the starting value
     if (!_initialCwndEmitted && connectionId != null) {
       _initialCwndEmitted = true;
@@ -159,128 +151,75 @@ class CongestionController {
     _inflight -= bytes;
     if (_inflight < 0) _inflight = 0;
 
-    bool cwndChanged = false;
-    int oldCwnd = _cwnd;
-    bool ssthreshChanged = false;
-    int oldSsthresh = _ssthresh;
-    bool dupAcksChanged = false;
-    int oldDupAcks = _dupAcks;
-    bool inRecoveryChanged = false;
-    bool oldInRecovery = _inRecovery;
-
-
-    if (isNewCumulativeAck) {
-      // RTT should only be updated when the cumulative ACK point advances.
+    if (largestNewlyAcked && sentTime != null) {
       _updateRtt(sentTime, ackDelay);
-
-      _highestProcessedCumulativeAck = currentFrameLargestAcked;
-      if (_dupAcks != 0) {
-        _dupAcks = 0; // Reset dupAcks as cumulative ACK advanced.
-        dupAcksChanged = true;
-      }
-      _lastAckedForDupCount = -1; // Reset since it's a new cumulative ack
-
-      if (_inRecovery) {
-        // Exit recovery if the acknowledged packet was sent after the recovery period started.
-        if (currentFrameLargestAcked > _recoveryEndPacketNumber) {
-          _inRecovery = false;
-          inRecoveryChanged = true;
-          // //print('[CC] Exiting recovery. CWND remains at ssthresh: $_cwnd');
-        }
-      }
-      
-      if (!_inRecovery) {
-        // Congestion control algorithm
-        if (_cwnd < _ssthresh) {
-          // Slow start
-          _cwnd += bytes;
-          cwndChanged = true;
-        } else {
-          // CUBIC Congestion avoidance
-          _cubicUpdate(bytes);
-          cwndChanged = true;
-        }
-      }
-    } else {
-      // This packet was SACKed by an ACK frame that did NOT advance the cumulative point.
-      // Or it's an older ACK.
-      // Do not reset _dupAcks here. Do not grow _cwnd if in recovery.
-      // If not in recovery, SACKs for new data can still contribute to CWND growth
-      // if we are not in congestion avoidance due to dupAcks.
-      // However, RFC 9002 is more conservative: "During recovery, the congestion window
-      // does not increase in response to ACKs." (Section 7.3.3)
-      // So, if _inRecovery is true, no CWND increase.
-      // If _inRecovery is false, but this is part of a duplicate ACK frame (isNewCumulativeAck = false),
-      // it implies we might be getting SACKs while also counting dupAcks.
-      // The primary CWND growth is tied to isNewCumulativeAck = true.
-      // For SACKs on a duplicate cumulative ACK, we mainly care about RTT and inflight.
     }
 
-    // Disarm PTO timer on successful ACK processing for this packet.
-    // //print('[CongestionController] onPacketAcked: Disarming PTO timer.');
+    if (_inRecovery && largestAcked > _recoveryEndPacketNumber) {
+      _inRecovery = false;
+    }
+
+    if (!_inRecovery && bytes > 0) {
+      if (_cwnd < _ssthresh) {
+        // Slow start
+        final oldCwnd = _cwnd;
+        _cwnd += bytes;
+        if (connectionId != null) {
+          metricsObserver?.onCongestionWindowUpdate(connectionId!, oldCwnd, _cwnd, 'slow_start');
+        }
+      } else {
+        // CUBIC congestion avoidance
+        _cubicUpdate(bytes);
+      }
+    }
+
+    // An ACK is proof the path answers: the PTO starts over.
     _ptoTimer?.cancel();
     _ptoTimer = null;
-    
-    // Reset PTO retry count on successful ACK - connection is working
     _ptoRetryCount = 0;
-
-    // If there are still packets in flight, re-arm the timer.
     if (_inflight > 0) {
-      // //print('[CongestionController] onPacketAcked: Re-arming PTO timer, inflight=$_inflight');
       _armPtoTimer();
     }
-
-    // No CWND modification here if !isNewCumulativeAck, as per above logic.
-    // DIAGNOSTIC LOGGING START
-    // //print('[CC onPacketAcked] POST-STATE: _inRecovery=$_inRecovery (changed: $inRecoveryChanged, old: $oldInRecovery), _highestProcessedCumulativeAck=$_highestProcessedCumulativeAck, _dupAcks=$_dupAcks (changed: $dupAcksChanged, old: $oldDupAcks), _lastAckedForDupCount=$_lastAckedForDupCount, _cwnd=$_cwnd (changed: $cwndChanged, old: $oldCwnd), _ssthresh=$_ssthresh (changed: $ssthreshChanged, old: $oldSsthresh), _inflight=$_inflight');
-    // DIAGNOSTIC LOGGING END
   }
 
-  /// Updates RTT estimates based on a new sample.
+  /// Updates the RTT estimates from a new sample (RFC 9002 sections 5.1-5.3).
+  ///
+  /// The first sample replaces the initial defaults. Later samples are
+  /// adjusted for the receiver's reported ACK delay (capped at max_ack_delay),
+  /// but only when the sample is at least min_rtt + ack_delay: a delay that
+  /// would take the sample below the minimum ever seen is not credible, and
+  /// min_rtt itself is always taken from the unadjusted sample.
   void _updateRtt(DateTime sentTime, Duration ackDelay) {
-    final now = DateTime.now();
-    
-    // Cap ack_delay per RFC 9002 Section 5.3
-    // The ack_delay should not exceed max_ack_delay transport parameter
-    final cappedAckDelay = Duration(
-      milliseconds: min(ackDelay.inMilliseconds, maxAckDelay)
-    );
-    
-    // Adjust for ack_delay as per RFC 9002
-    _latestRtt = now.difference(sentTime);
-    if (_latestRtt > cappedAckDelay) {
-      _latestRtt -= cappedAckDelay;
-    }
-    
-    // Debug logging for RTT updates
-    // UdxLogging.debug('CongestionController._updateRtt: RTT=${_latestRtt.inMilliseconds}ms, connectionId=${connectionId?.toString().substring(0, 8) ?? "null"}, hasObserver=${metricsObserver != null}');
+    final latest = DateTime.now().difference(sentTime);
+    if (latest < Duration.zero) return; // the clock stepped; no sample
 
-    // Update min_rtt
-    if (_latestRtt < _minRtt) {
-      _minRtt = _latestRtt;
+    if (!_hasRttSample) {
+      _hasRttSample = true;
+      _latestRtt = latest;
+      _minRtt = latest;
+      _smoothedRtt = latest;
+      _rttVar = Duration(microseconds: latest.inMicroseconds ~/ 2);
       pacingController.updateRate(_cwnd, _minRtt);
-    }
-
-    // Based on RFC 9002, Section 5.1
-    if (_smoothedRtt == const Duration(milliseconds: 100)) { // First sample
-      _smoothedRtt = _latestRtt;
-      _rttVar = Duration(microseconds: _latestRtt.inMicroseconds ~/ 2);
     } else {
-      final rttVarSample = (_smoothedRtt.inMicroseconds - _latestRtt.inMicroseconds).abs();
+      if (latest < _minRtt) {
+        _minRtt = latest;
+        pacingController.updateRate(_cwnd, _minRtt);
+      }
+      final cappedAckDelay = Duration(milliseconds: min(ackDelay.inMilliseconds, maxAckDelay));
+      var adjusted = latest;
+      if (latest >= _minRtt + cappedAckDelay) {
+        adjusted = latest - cappedAckDelay;
+      }
+      _latestRtt = adjusted;
+
+      final rttVarSample = (_smoothedRtt.inMicroseconds - adjusted.inMicroseconds).abs();
       const alpha = 1 / 8; // 0.125
       const beta = 1 / 4; // 0.25
-
       _smoothedRtt = Duration(
-          microseconds:
-              ((1 - alpha) * _smoothedRtt.inMicroseconds + alpha * _latestRtt.inMicroseconds)
-                  .round());
-      _rttVar = Duration(
-          microseconds:
-              ((1 - beta) * _rttVar.inMicroseconds + beta * rttVarSample)
-                  .round());
+          microseconds: ((1 - alpha) * _smoothedRtt.inMicroseconds + alpha * adjusted.inMicroseconds).round());
+      _rttVar = Duration(microseconds: ((1 - beta) * _rttVar.inMicroseconds + beta * rttVarSample).round());
     }
-    
-    // Notify observer of RTT sample
+
     if (connectionId != null) {
       metricsObserver?.onRttSample(connectionId!, _latestRtt, _smoothedRtt, _rttVar);
     }
@@ -328,7 +267,6 @@ class CongestionController {
     }
   }
 
-
   /// Sets the smoothed RTT for testing purposes.
   void setSmoothedRtt(Duration rtt) {
     _smoothedRtt = rtt;
@@ -361,113 +299,23 @@ class CongestionController {
     if (_ssthresh < minCwnd) {
       _ssthresh = minCwnd;
     }
-    
+
     // Pre-calculate K
     final wMaxInMss = _wMax / maxDatagramSize;
     final diff = wMaxInMss * (1 - betaCubic) / c;
-    _k = pow(diff, 1/3).toDouble();
-
+    _k = pow(diff, 1 / 3).toDouble();
 
     final oldCwnd = _cwnd;
     _cwnd = _ssthresh; // Reduce the window
-    _dupAcks = 0;
     pacingController.updateRate(_cwnd, _minRtt);
-    
+
     if (connectionId != null) {
       metricsObserver?.onCongestionWindowUpdate(connectionId!, oldCwnd, _cwnd, 'loss_detected');
     }
   }
 
-  /// Called by UDXStream when an ACK frame is received that does not advance the _highestProcessedCumulativeAck.
-  /// [frameLargestAcked] is the 'largest_acked' value from this duplicate ACK frame.
-  void processDuplicateAck(int frameLargestAcked) {
-    // DIAGNOSTIC LOGGING START
-    // //print('[CC processDuplicateAck] INPUT: frameLargestAcked=$frameLargestAcked');
-    // //print('[CC processDuplicateAck] PRE-STATE: _lastAckedForDupCount=$_lastAckedForDupCount, _dupAcks=$_dupAcks, _inRecovery=$_inRecovery, _lostPacketInRecovery=$_lostPacketInRecovery');
-    // DIAGNOSTIC LOGGING END
-    
-    int oldDupAcks = _dupAcks;
-    bool dupAcksIncremented = false;
-
-    if (frameLargestAcked == _lastAckedForDupCount) {
-      _dupAcks++;
-      dupAcksIncremented = true;
-    } else {
-      // This is the first time we've seen 'frameLargestAcked' as the duplicate frontier.
-      _dupAcks = 1;
-      _lastAckedForDupCount = frameLargestAcked;
-      dupAcksIncremented = true; // Technically it was set to 1, but it's a change.
-    }
-    // //print('[CC] processDuplicateAck: frameLargestAcked=$frameLargestAcked, _lastAckedForDupCount=$_lastAckedForDupCount, _dupAcks=$_dupAcks, _inRecovery=$_inRecovery');
-
-    if (_dupAcks >= 3) {
-      // If not already in recovery, or if this dup ack signals a loss beyond the current recovery target
-      if (!_inRecovery || (_inRecovery && _lastAckedForDupCount < _lostPacketInRecovery -1) ) { // The condition for _lostPacketInRecovery seems off, should be _lastAckedForDupCount + 1 == _lostPacketInRecovery for same loss, or < for earlier.
-                                                                                                // For now, keeping original logic but logging it.
-        // DIAGNOSTIC LOGGING START
-        // //print('[CC processDuplicateAck] Condition for entering recovery met: !_inRecovery ($_inRecovery) || (_inRecovery ($_inRecovery) && _lastAckedForDupCount ($_lastAckedForDupCount) < _lostPacketInRecovery -1 ($_lostPacketInRecovery))');
-        // DIAGNOSTIC LOGGING END
-        
-        bool enteredRecoveryThisCall = false;
-        if (!_inRecovery) {
-          _inRecovery = true;
-          enteredRecoveryThisCall = true;
-        }
-        _lostPacketInRecovery = _lastAckedForDupCount + 1; // Packet presumed lost
-        // DIAGNOSTIC LOGGING START
-        // //print('[CC processDuplicateAck] Set _lostPacketInRecovery=$_lostPacketInRecovery');
-        // DIAGNOSTIC LOGGING END
-        
-        // Trigger fast retransmit only once per loss event (when _dupAcks hits 3 for this _lostPacketInRecovery)
-        // Or if a new, earlier loss is detected by subsequent dupacks.
-        if (_dupAcks == 3 && enteredRecoveryThisCall) { // Trigger if this is the transition to >=3 AND we just entered recovery for this loss
-            // DIAGNOSTIC LOGGING START
-            // //print('[CC processDuplicateAck] Fast Retransmit TRIGGERED for: $_lostPacketInRecovery (because _dupAcks == 3 and enteredRecoveryThisCall)');
-            // DIAGNOSTIC LOGGING END
-             onFastRetransmit?.call(_lostPacketInRecovery);
-        } else if (_dupAcks >= 3 && _inRecovery && (_lastAckedForDupCount + 1) < _lostPacketInRecovery) {
-            // This case handles if we are already in recovery for packet X, but now we get 3 dupacks for packet Y (where Y < X)
-            // This implies an earlier packet was also lost.
-            // DIAGNOSTIC LOGGING START
-            // //print('[CC processDuplicateAck] Fast Retransmit TRIGGERED for earlier packet: $_lostPacketInRecovery (because _dupAcks >= 3, in recovery, and new loss is earlier)');
-            // DIAGNOSTIC LOGGING END
-            onFastRetransmit?.call(_lostPacketInRecovery); // Retransmit the newly identified earlier lost packet
-        }
-
-
-        // Reduce congestion window only if not already in a recovery period.
-        if (!_inRecovery) {
-          _inRecovery = true;
-          _recoveryEndPacketNumber = packetManager.lastSentPacketNumber;
-
-          int oldSsthresh = _ssthresh;
-          _ssthresh = max(_cwnd ~/ 2, minCwnd); // ssthresh is half of cwnd, min 2*MSS
-          // DIAGNOSTIC LOGGING START
-          // //print('[CC processDuplicateAck] Ssthresh updated: old=$oldSsthresh, new=$_ssthresh');
-          // DIAGNOSTIC LOGGING END
-          
-          int oldCwnd = _cwnd;
-          _cwnd = _ssthresh; // Enter congestion avoidance phase of recovery
-          pacingController.updateRate(_cwnd, _minRtt);
-          // DIAGNOSTIC LOGGING START
-          // //print('[CC processDuplicateAck] CWND updated: old=$oldCwnd, new=$_cwnd (set to ssthresh)');
-          // DIAGNOSTIC LOGGING END
-          // //print('[CC] Entered recovery. Ssthresh: $_ssthresh, CWND: $_cwnd');
-        }
-      } else {
-        // DIAGNOSTIC LOGGING START
-        // //print('[CC processDuplicateAck] _dupAcks >= 3 but NOT entering/re-entering recovery. _inRecovery=$_inRecovery, _lastAckedForDupCount=$_lastAckedForDupCount, _lostPacketInRecovery=$_lostPacketInRecovery');
-        // DIAGNOSTIC LOGGING END
-      }
-    }
-    // DIAGNOSTIC LOGGING START
-    // //print('[CC processDuplicateAck] POST-STATE: _lastAckedForDupCount=$_lastAckedForDupCount, _dupAcks=$_dupAcks (old: $oldDupAcks, incremented: $dupAcksIncremented), _inRecovery=$_inRecovery, _lostPacketInRecovery=$_lostPacketInRecovery');
-    // DIAGNOSTIC LOGGING END
-  }
-
   /// Arms the PTO timer.
   void _armPtoTimer() {
-    // //print('[CongestionController] _armPtoTimer: Arming PTO timer with duration: $pto');
     _ptoTimer?.cancel();
     _ptoTimer = Timer(pto, _onPtoTimeout);
   }
@@ -475,22 +323,16 @@ class CongestionController {
   /// Called when the PTO timer expires.
   void _onPtoTimeout() {
     _ptoRetryCount++;
-    //print('[CongestionController] _onPtoTimeout: PTO timer expired (retry $_ptoRetryCount/$maxPtoRetries). Calling onProbe.');
-    
+
     // Only send probe if we haven't exceeded max retries
     if (_ptoRetryCount <= maxPtoRetries) {
       onProbe?.call();
-      
+
       // Double the PTO for the next probe if this one doesn't elicit an ACK.
       final nextPto = pto * 2;
-      // //print('[CongestionController] _onPtoTimeout: Re-arming PTO timer with doubled duration: $nextPto');
       _ptoTimer = Timer(nextPto, _onPtoTimeout);
     } else {
-      // Exceeded max retries - log but don't escalate to connection failure
-      // The PTO system will continue to function, just with reduced aggressiveness
-      //print('[CongestionController] _onPtoTimeout: Exceeded max PTO retries ($_ptoRetryCount), reducing probe frequency');
-      
-      // Reset retry count and use a longer timeout for next attempt
+      // Exceeded max retries: keep probing, less often.
       _ptoRetryCount = 0;
       final backoffPto = pto * 4; // Use 4x PTO as backoff
       _ptoTimer = Timer(backoffPto, _onPtoTimeout);
@@ -499,7 +341,6 @@ class CongestionController {
 
   /// Destroys the congestion controller and cancels all timers.
   void destroy() {
-    // //print('[CongestionController] destroy: Cancelling PTO timer.');
     _ptoTimer?.cancel();
     _ptoTimer = null;
     pacingController.dispose();
@@ -526,8 +367,7 @@ class CongestionController {
 
     // 3. The duration between the send times of these two packets exceeds the
     //    persistent congestion duration.
-    final persistentCongestionDuration =
-        (pto * kPersistentCongestionThreshold);
+    final persistentCongestionDuration = (pto * kPersistentCongestionThreshold);
     final lostPeriod = DateTime.now().difference(oldestLost.sentTime!);
 
     if (lostPeriod < persistentCongestionDuration) {
@@ -536,9 +376,8 @@ class CongestionController {
 
     // 4. None of the packets sent between the send times of these two packets
     //    are acknowledged.
-    final sentBetween = packetManager.sentPackets.where((p) =>
-        p.sequence > oldestLost.sequence &&
-        p.sequence < newestLost.sequence);
+    final sentBetween = packetManager.sentPackets
+        .where((p) => p.sequence > oldestLost.sequence && p.sequence < newestLost.sequence);
 
     if (sentBetween.any((p) => p.isAcked)) {
       return;
@@ -552,21 +391,21 @@ class CongestionController {
   }
 
   /// Processes ECN (Explicit Congestion Notification) feedback from ACK frames.
-  /// 
+  ///
   /// ECN allows routers to signal congestion before packet loss occurs,
   /// enabling more responsive congestion control. This is a placeholder for
   /// future OS-level ECN integration.
-  /// 
+  ///
   /// Per RFC 9000 Section 13.4:
   /// - ECT(0), ECT(1): ECN Capable Transport markings
   /// - CE: Congestion Experienced marking
-  /// 
+  ///
   /// An increase in CE count indicates congestion, which should trigger
   /// congestion response similar to packet loss.
   void processEcnFeedback(int ect0, int ect1, int ce) {
     // TODO: Implement ECN-based congestion control once OS integration is available
     // For now, this is a no-op placeholder
-    // 
+    //
     // When implemented, logic should:
     // 1. Track previous CE count
     // 2. If CE count increases, treat as congestion signal

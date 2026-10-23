@@ -251,6 +251,12 @@ class MockUDPSocket extends _i1.Mock implements _i10.UDPSocket {
       );
 
   @override
+  bool get isServer => (super.noSuchMethod(
+        Invocation.getter(#isServer),
+        returnValue: false,
+      ) as bool);
+
+  @override
   set metricsObserver(_i11.UdxMetricsObserver? _metricsObserver) =>
       super.noSuchMethod(
         Invocation.setter(
@@ -263,6 +269,18 @@ class MockUDPSocket extends _i1.Mock implements _i10.UDPSocket {
   @override
   _i12.Future<void> get handshakeComplete => (super.noSuchMethod(
         Invocation.getter(#handshakeComplete),
+        returnValue: _i12.Future<void>.value(),
+      ) as _i12.Future<void>);
+
+  @override
+  bool get isHandshakeCompleted => (super.noSuchMethod(
+        Invocation.getter(#isHandshakeCompleted),
+        returnValue: false,
+      ) as bool);
+
+  @override
+  _i12.Future<void> get sendCreditChanged => (super.noSuchMethod(
+        Invocation.getter(#sendCreditChanged),
         returnValue: _i12.Future<void>.value(),
       ) as _i12.Future<void>);
 
@@ -301,6 +319,21 @@ class MockUDPSocket extends _i1.Mock implements _i10.UDPSocket {
           Invocation.getter(#packetManager),
         ),
       ) as _i8.PacketManager);
+
+  @override
+  int get remoteConnectionMaxData => (super.noSuchMethod(
+        Invocation.getter(#remoteConnectionMaxData),
+        returnValue: 0,
+      ) as int);
+
+  @override
+  void notifySendCredit() => super.noSuchMethod(
+        Invocation.method(
+          #notifySendCredit,
+          [],
+        ),
+        returnValueForMissingStub: null,
+      );
 
   @override
   List<_i2.UDXStream> getStreamBuffer() => (super.noSuchMethod(
@@ -432,6 +465,15 @@ class MockUDPSocket extends _i1.Mock implements _i10.UDPSocket {
         returnValue: _i12.Future<void>.value(),
         returnValueForMissingStub: _i12.Future<void>.value(),
       ) as _i12.Future<void>);
+
+  @override
+  int allocateIncomingStreamId(int? requested) => (super.noSuchMethod(
+        Invocation.method(
+          #allocateIncomingStreamId,
+          [requested],
+        ),
+        returnValue: 0,
+      ) as int);
 
   @override
   void registerStream(_i2.UDXStream? stream) => super.noSuchMethod(
@@ -699,16 +741,6 @@ class MockCongestionController extends _i1.Mock
       );
 
   @override
-  set onFastRetransmit(void Function(int)? _onFastRetransmit) =>
-      super.noSuchMethod(
-        Invocation.setter(
-          #onFastRetransmit,
-          _onFastRetransmit,
-        ),
-        returnValueForMissingStub: null,
-      );
-
-  @override
   _i9.PacingController get pacingController => (super.noSuchMethod(
         Invocation.getter(#pacingController),
         returnValue: _FakePacingController_7(
@@ -800,8 +832,8 @@ class MockCongestionController extends _i1.Mock
     int? bytes,
     DateTime? sentTime,
     Duration? ackDelay,
-    bool? isNewCumulativeAck,
-    int? currentFrameLargestAcked,
+    bool? largestNewlyAcked,
+    int? largestAcked,
   ) =>
       super.noSuchMethod(
         Invocation.method(
@@ -810,8 +842,8 @@ class MockCongestionController extends _i1.Mock
             bytes,
             sentTime,
             ackDelay,
-            isNewCumulativeAck,
-            currentFrameLargestAcked,
+            largestNewlyAcked,
+            largestAcked,
           ],
         ),
         returnValueForMissingStub: null,
@@ -847,15 +879,6 @@ class MockCongestionController extends _i1.Mock
             bytes,
             lostPackets,
           ],
-        ),
-        returnValueForMissingStub: null,
-      );
-
-  @override
-  void processDuplicateAck(int? frameLargestAcked) => super.noSuchMethod(
-        Invocation.method(
-          #processDuplicateAck,
-          [frameLargestAcked],
         ),
         returnValueForMissingStub: null,
       );
@@ -1018,13 +1041,14 @@ class MockPacketManager extends _i1.Mock implements _i8.PacketManager {
       );
 
   @override
-  List<int> handleAckFrame(_i8.AckFrame? frame) => (super.noSuchMethod(
+  List<_i8.UDXPacket> handleAckFrame(_i8.AckFrame? frame) =>
+      (super.noSuchMethod(
         Invocation.method(
           #handleAckFrame,
           [frame],
         ),
-        returnValue: <int>[],
-      ) as List<int>);
+        returnValue: <_i8.UDXPacket>[],
+      ) as List<_i8.UDXPacket>);
 
   @override
   void handleData(_i8.UDXPacket? packet) => super.noSuchMethod(
@@ -1061,6 +1085,13 @@ class MockPacketManager extends _i1.Mock implements _i8.PacketManager {
         ),
         returnValueForMissingStub: null,
       );
+
+  @override
+  int? retransmit(_i8.UDXPacket? packet) =>
+      (super.noSuchMethod(Invocation.method(
+        #retransmit,
+        [packet],
+      )) as int?);
 
   @override
   void retransmitPacket(int? sequence) => super.noSuchMethod(

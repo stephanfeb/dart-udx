@@ -210,6 +210,12 @@ class MockUDPSocket extends _i1.Mock implements _i8.UDPSocket {
       ) as bool);
 
   @override
+  _i10.Future<void> get sendCreditChanged => (super.noSuchMethod(
+        Invocation.getter(#sendCreditChanged),
+        returnValue: _i10.Future<void>.value(),
+      ) as _i10.Future<void>);
+
+  @override
   bool get closing => (super.noSuchMethod(
         Invocation.getter(#closing),
         returnValue: false,
@@ -244,6 +250,21 @@ class MockUDPSocket extends _i1.Mock implements _i8.UDPSocket {
           Invocation.getter(#packetManager),
         ),
       ) as _i7.PacketManager);
+
+  @override
+  int get remoteConnectionMaxData => (super.noSuchMethod(
+        Invocation.getter(#remoteConnectionMaxData),
+        returnValue: 0,
+      ) as int);
+
+  @override
+  void notifySendCredit() => super.noSuchMethod(
+        Invocation.method(
+          #notifySendCredit,
+          [],
+        ),
+        returnValueForMissingStub: null,
+      );
 
   @override
   List<_i11.UDXStream> getStreamBuffer() => (super.noSuchMethod(
