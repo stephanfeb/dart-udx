@@ -193,19 +193,9 @@ class UDPSocket with UDXEventEmitter {
       }
     };
 
-    _packetManager.onSendProbe = (packet) {
-      if (!_closing) {
-        try {
-          send(packet.toBytes());
-        } catch (e) {
-          // Ignore send errors for probes
-        }
-      }
-    };
-
-    _congestionController.onProbe = () {
-      _packetManager.sendProbe(cids.remoteCid, cids.localCid, 0, 0);
-    };
+    // The PTO probe re-sends the oldest unacknowledged packet under a fresh
+    // sequence, through onRetransmit above.
+    _congestionController.onProbe = _packetManager.sendProbe;
 
     // For client-initiated connections, address is validated by default
     // For server-side connections (receiving SYN), address must be validated
@@ -1033,67 +1023,55 @@ class UDPSocket with UDXEventEmitter {
 
   // --- Connection Liveness Check ---
 
-  /// Send a PING frame and wait for ACK to verify connection liveness.
-  /// Returns true if ACK received within timeout, false otherwise.
-  /// 
-  /// This is a lightweight, non-intrusive way to check if the connection
-  /// is still alive. The PING frame is just 1 byte and elicits an ACK response.
+  /// Sends a PING under a fresh sequence and waits for its acknowledgement:
+  /// true if the peer answered within [timeout]. Both peers acknowledge a
+  /// numbered PING at once. The packet is tracked until acknowledged or the
+  /// wait ends, so its ACK is matched (and gives an RTT sample); it is never
+  /// retransmitted. A later packet's acknowledgement also answers, since it
+  /// proves the same thing.
+  ///
+  /// The PING used to be sent untracked, so on a connection with nothing
+  /// else in flight its ACK matched nothing and this always timed out.
   Future<bool> ping({Duration timeout = const Duration(seconds: 5)}) async {
     if (_closing || closing) return false;
-    
-    // Send a packet containing just a PING frame
+
     final pingSequence = _packetManager.nextSequence;
     final packet = UDXPacket(
       destinationCid: cids.remoteCid,
       sourceCid: cids.localCid,
       destinationStreamId: 0, // Connection-level packet
-      sourceStreamId: 0,       // Connection-level packet
+      sourceStreamId: 0, // Connection-level packet
       sequence: pingSequence,
       frames: [PingFrame()],
     );
-    
+
     final completer = Completer<bool>();
     Timer? timeoutTimer;
     StreamSubscription? ackSubscription;
-    
-    // Listen for ACK of our ping packet
+
+    void finish(bool answered) {
+      if (completer.isCompleted) return;
+      timeoutTimer?.cancel();
+      ackSubscription?.cancel();
+      _packetManager.forget(pingSequence);
+      completer.complete(answered);
+    }
+
     ackSubscription = on('ack').listen((event) {
-      // Check if this ACK acknowledges our ping packet
-      if (event.data is Map) {
-        final data = event.data as Map;
-        if (data['largestAcked'] != null) {
-          final largestAcked = data['largestAcked'] as int;
-          if (largestAcked >= pingSequence) {
-            // Our ping was acknowledged
-            if (!completer.isCompleted) {
-              timeoutTimer?.cancel();
-              ackSubscription?.cancel();
-              completer.complete(true);
-            }
-          }
-        }
+      final data = event.data;
+      if (data is Map && data['largestAcked'] is int && (data['largestAcked'] as int) >= pingSequence) {
+        finish(true);
       }
     });
-    
-    // Set up timeout
-    timeoutTimer = Timer(timeout, () {
-      if (!completer.isCompleted) {
-        ackSubscription?.cancel();
-        completer.complete(false);
-      }
-    });
-    
-    // Send the ping packet
+    timeoutTimer = Timer(timeout, () => finish(false));
+
+    _packetManager.trackUntilAcked(packet);
     try {
       send(packet.toBytes());
     } catch (e) {
-      timeoutTimer.cancel();
-      ackSubscription.cancel();
-      if (!completer.isCompleted) {
-        completer.complete(false);
-      }
+      finish(false);
     }
-    
+
     return completer.future;
   }
 

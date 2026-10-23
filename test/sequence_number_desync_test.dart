@@ -118,42 +118,45 @@ void main() {
             reason: 'ACK should not have consumed sequence 3');
       });
 
-      test(
-          'sendProbe uses lastSentPacketNumber instead of consuming new sequence',
-          () async {
+      test('a PTO probe re-sends the oldest unacknowledged packet under a fresh sequence', () async {
+        // A probe used to be a PING under lastSentPacketNumber, the sequence
+        // of a data packet still in flight; its ACK could acknowledge data the
+        // peer never got. See test/pto_probe_test.dart for the whole failure.
         final pm = PacketManager();
+        pm.congestionController = CongestionController(packetManager: pm);
+        addTearDown(pm.destroy);
+        final sent = <UDXPacket>[];
+        pm.onRetransmit = sent.add;
 
-        // Send some "data" packets first
-        pm.lastSentPacketNumber = pm.nextSequence; // seq 0
-        pm.lastSentPacketNumber = pm.nextSequence; // seq 1
-        pm.lastSentPacketNumber = pm.nextSequence; // seq 2
+        UDXPacket data(int seq) => UDXPacket(
+              destinationCid: ConnectionId.random(),
+              sourceCid: ConnectionId.random(),
+              destinationStreamId: 1,
+              sourceStreamId: 2,
+              sequence: seq,
+              frames: [StreamFrame(data: Uint8List(10), offset: seq * 10)],
+            );
+        final first = data(pm.nextSequence); // 0
+        final second = data(pm.nextSequence); // 1
+        pm.sendPacket(first);
+        pm.sendPacket(second);
 
-        // Record current state
-        final seqBeforeProbe = pm.lastSentPacketNumber;
-        expect(seqBeforeProbe, equals(2));
+        expect(pm.sendProbe(), isTrue);
+        expect(sent, [same(first)], reason: 'the oldest unacknowledged packet is the probe');
+        expect(first.sequence, equals(2), reason: 'under a fresh sequence, never the last data packet\'s');
+        expect(first.frames.first, isA<StreamFrame>(), reason: 'it carries the data, not a PING');
+        expect(pm.getSentPacketsTestHook().keys, unorderedEquals([1, 2]));
 
-        // Create dummy CIDs for the probe
-        final destCid = ConnectionId.random();
-        final srcCid = ConnectionId.random();
+        // The next probe takes the next-oldest packet (a PTO may send two).
+        expect(pm.sendProbe(), isTrue);
+        expect(sent, [same(first), same(second)]);
+        expect(second.sequence, equals(3));
 
-        // Capture the probe packet
-        UDXPacket? capturedProbe;
-        pm.onSendProbe = (packet) {
-          capturedProbe = packet;
-        };
-
-        // Send a probe
-        pm.sendProbe(destCid, srcCid, 100, 200);
-
-        // Verify probe used lastSentPacketNumber, not a new sequence
-        expect(capturedProbe, isNotNull);
-        expect(capturedProbe!.sequence, equals(2),
-            reason: 'Probe should reuse lastSentPacketNumber (2), not consume new sequence');
-
-        // Verify next data packet gets sequence 3 (not 4)
-        final nextDataSeq = pm.nextSequence;
-        expect(nextDataSeq, equals(3),
-            reason: 'Probe should not have consumed sequence 3');
+        // Everything was re-sent within the last RTO: a probe collapses into
+        // those resends and sends nothing, consuming nothing.
+        expect(pm.sendProbe(), isFalse);
+        expect(sent.length, 2);
+        expect(pm.nextSequence, equals(4));
       });
     });
 

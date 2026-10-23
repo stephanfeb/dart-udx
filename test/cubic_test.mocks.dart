@@ -3,9 +3,8 @@
 // Do not manually edit this file.
 
 // ignore_for_file: no_leading_underscores_for_library_prefixes
-import 'dart:async' as _i5;
+import 'dart:async' as _i4;
 
-import 'package:dart_udx/src/cid.dart' as _i4;
 import 'package:dart_udx/src/congestion.dart' as _i2;
 import 'package:dart_udx/src/packet.dart' as _i3;
 import 'package:mockito/mockito.dart' as _i1;
@@ -116,16 +115,6 @@ class MockPacketManager extends _i1.Mock implements _i3.PacketManager {
       );
 
   @override
-  set onSendProbe(void Function(_i3.UDXPacket)? _onSendProbe) =>
-      super.noSuchMethod(
-        Invocation.setter(
-          #onSendProbe,
-          _onSendProbe,
-        ),
-        returnValueForMissingStub: null,
-      );
-
-  @override
   set onPacketPermanentlyLost(
           void Function(_i3.UDXPacket)? _onPacketPermanentlyLost) =>
       super.noSuchMethod(
@@ -190,21 +179,28 @@ class MockPacketManager extends _i1.Mock implements _i3.PacketManager {
       )) as _i3.UDXPacket?);
 
   @override
-  void sendProbe(
-    _i4.ConnectionId? destCid,
-    _i4.ConnectionId? srcCid,
-    int? destId,
-    int? srcId,
-  ) =>
-      super.noSuchMethod(
+  bool sendProbe() => (super.noSuchMethod(
         Invocation.method(
           #sendProbe,
-          [
-            destCid,
-            srcCid,
-            destId,
-            srcId,
-          ],
+          [],
+        ),
+        returnValue: false,
+      ) as bool);
+
+  @override
+  void trackUntilAcked(_i3.UDXPacket? packet) => super.noSuchMethod(
+        Invocation.method(
+          #trackUntilAcked,
+          [packet],
+        ),
+        returnValueForMissingStub: null,
+      );
+
+  @override
+  void forget(int? sequence) => super.noSuchMethod(
+        Invocation.method(
+          #forget,
+          [sequence],
         ),
         returnValueForMissingStub: null,
       );
@@ -244,11 +240,11 @@ class MockPacketManager extends _i1.Mock implements _i3.PacketManager {
       ) as Map<int, _i3.UDXPacket>);
 
   @override
-  Map<int, _i5.Timer> getRetransmitTimersTestHook() => (super.noSuchMethod(
+  Map<int, _i4.Timer> getRetransmitTimersTestHook() => (super.noSuchMethod(
         Invocation.method(
           #getRetransmitTimersTestHook,
           [],
         ),
-        returnValue: <int, _i5.Timer>{},
-      ) as Map<int, _i5.Timer>);
+        returnValue: <int, _i4.Timer>{},
+      ) as Map<int, _i4.Timer>);
 }

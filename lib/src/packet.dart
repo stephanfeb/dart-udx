@@ -1269,9 +1269,6 @@ class PacketManager {
   /// Provides sequence number and loss type ('timeout' or 'fast_retransmit').
   void Function(int sequence, String lossType)? onPacketLossEvent;
 
-  /// Callback to be invoked when a probe packet needs to be sent.
-  void Function(UDXPacket packet)? onSendProbe;
-
   /// Callback for when a packet is considered permanently lost after max retries.
   void Function(UDXPacket packet)? onPacketPermanentlyLost;
 
@@ -1348,7 +1345,9 @@ class PacketManager {
     _receivedPackets[packet.sequence] = packet;
   }
 
-  /// Gets the next packet to retransmit
+  /// The oldest unacknowledged packet: the one that has waited longest since
+  /// it last went out. A re-key moves a packet to the end of the map, so the
+  /// first entry is the longest unsent.
   UDXPacket? getNextRetransmit() {
     if (_sentPackets.isEmpty) return null;
     return _sentPackets.values.first;
@@ -1359,24 +1358,48 @@ class PacketManager {
     return _sentPackets[sequence];
   }
 
-  /// Sends a probe packet to elicit an ACK.
-  /// The probe packet contains a PING frame.
-  void sendProbe(ConnectionId destCid, ConnectionId srcCid, int destId, int srcId) {
-    // FIX: Probe packets should NOT consume new sequence numbers.
-    // Like ACKs, they are not registered for retransmission, and if lost,
-    // the receiver's _nextExpectedSeq gets stuck forever. Use the last
-    // sent sequence number (or 0 if none sent yet) to avoid sequence gaps.
-    final probeSeq = lastSentPacketNumber >= 0 ? lastSentPacketNumber : 0;
-    
-    final probePacket = UDXPacket(
-      destinationCid: destCid,
-      sourceCid: srcCid,
-      destinationStreamId: destId,
-      sourceStreamId: srcId,
-      sequence: probeSeq,
-      frames: [PingFrame()],
-    );
-    onSendProbe?.call(probePacket);
+  /// Sends a probe when the PTO fires: the oldest unacknowledged packet,
+  /// re-sent under a fresh sequence (RFC 9002 section 6.2.4: a probe carries
+  /// data when there is data to carry). Returns whether anything went out.
+  ///
+  /// This used to send a PING under [lastSentPacketNumber], the sequence of a
+  /// data packet still in flight. Both peers acknowledge a numbered PING, so
+  /// when that data packet had been lost and the PING arrived, its ACK marked
+  /// the data acknowledged: the bytes were never re-sent and the stream hung
+  /// at that offset. The PTO and the packet's own RTO timer fire together,
+  /// which put the PING under the resend's fresh sequence just as the resend
+  /// went out, so one lost resend was enough. The reasoning behind the reuse
+  /// (a sequence gap would stall the receiver) predates reassembly on byte
+  /// offsets and no longer holds.
+  ///
+  /// Nothing is sent when the oldest packet was re-sent within the last RTO
+  /// ([retransmit] collapses the two), or when nothing is tracked.
+  bool sendProbe() {
+    final oldest = getNextRetransmit();
+    if (oldest == null) return false;
+    final newSeq = retransmit(oldest);
+    if (newSeq == null) return false;
+    onPacketRetransmitEvent?.call(newSeq, oldest.retransmitCount, Duration(milliseconds: retransmitTimeout));
+    onRetransmit?.call(oldest);
+    return true;
+  }
+
+  /// Tracks a packet the caller sends itself, so that [handleAckFrame] returns
+  /// it when acknowledged, without ever retransmitting it: a PING sent to
+  /// test liveness (UDPSocket.ping). The caller forgets it ([forget]) when it
+  /// stops waiting, so a lost ACK leaves nothing behind.
+  void trackUntilAcked(UDXPacket packet) {
+    final now = DateTime.now();
+    packet.sentTime = now;
+    packet.lastSentTime = now;
+    lastSentPacketNumber = packet.sequence;
+    _sentPackets[packet.sequence] = packet;
+  }
+
+  /// Stops tracking [sequence], if it is still tracked.
+  void forget(int sequence) {
+    _sentPackets.remove(sequence);
+    _retransmitTimers.remove(sequence)?.cancel();
   }
 
   /// The floor and ceiling on the wait between retransmission attempts. The
