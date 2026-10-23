@@ -1,6 +1,7 @@
 import 'dart:async';
-import 'dart:math';
 import 'package:meta/meta.dart';
+
+import 'clock.dart';
 
 /// A controller to manage packet pacing.
 ///
@@ -11,10 +12,14 @@ import 'package:meta/meta.dart';
 class PacingController {
   PacingController({
     this.pacingGain = 2.88, // Standard pacing gain from QUIC
-  }) {
+    Clock? clock,
+  }) : clock = clock ?? const SystemClock() {
     _pacingRateBytesPerSec = double.infinity;
-    _nextSendTime = DateTime.now();
+    _nextSendTime = this.clock.now();
   }
+
+  /// The clock send times are measured on; see [Clock].
+  final Clock clock;
 
   /// The gain factor used to calculate the pacing rate.
   final double pacingGain;
@@ -22,8 +27,8 @@ class PacingController {
   /// The target sending rate in bytes per second.
   late double _pacingRateBytesPerSec;
 
-  /// The earliest time the next packet can be sent.
-  late DateTime _nextSendTime;
+  /// The earliest instant the next packet can be sent.
+  late Duration _nextSendTime;
 
   /// A timer to handle delayed sends.
   Timer? _timer;
@@ -45,11 +50,11 @@ class PacingController {
   /// Returns a `Future` that completes when the pacer determines it's
   /// acceptable to send the next packet.
   Future<void> waitUntilReady() async {
-    final now = DateTime.now();
-    if (now.isBefore(_nextSendTime)) {
-      final delay = _nextSendTime.difference(now);
+    final now = clock.now();
+    if (now < _nextSendTime) {
+      final delay = _nextSendTime - now;
       final completer = Completer<void>();
-      _timer = Timer(delay, () {
+      _timer = clock.timer(delay, () {
         if (!completer.isCompleted) {
           completer.complete();
         }
@@ -66,8 +71,8 @@ class PacingController {
     if (_pacingRateBytesPerSec.isFinite) {
       final interval =
           Duration(microseconds: (packetSize / _pacingRateBytesPerSec * Duration.microsecondsPerSecond).round());
-      final now = DateTime.now();
-      _nextSendTime = (now.isAfter(_nextSendTime) ? now : _nextSendTime).add(interval);
+      final now = clock.now();
+      _nextSendTime = (now > _nextSendTime ? now : _nextSendTime) + interval;
     }
   }
 
@@ -80,5 +85,5 @@ class PacingController {
   double get pacingRateBytesPerSec => _pacingRateBytesPerSec;
 
   @visibleForTesting
-  DateTime get nextSendTime => _nextSendTime;
+  Duration get nextSendTime => _nextSendTime;
 }

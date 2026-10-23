@@ -1,5 +1,6 @@
 import 'dart:typed_data';
 import 'package:dart_udx/src/cid.dart';
+import 'package:dart_udx/src/clock.dart';
 import 'package:dart_udx/src/congestion.dart';
 import 'package:dart_udx/src/packet.dart';
 import 'package:test/test.dart';
@@ -19,7 +20,7 @@ void main() {
     });
 
     test('the first sample sets every estimate, unadjusted (RFC 9002 section 5.3)', () {
-      final sentTime = DateTime.now().subtract(const Duration(milliseconds: 150));
+      final sentTime = const SystemClock().now() - (const Duration(milliseconds: 150));
       const ackDelay = Duration(milliseconds: 20);
 
       controller.onPacketAcked(1000, sentTime, ackDelay, true, 0);
@@ -34,40 +35,40 @@ void main() {
     });
 
     test('later samples subtract the reported ACK delay, capped at max_ack_delay', () {
-      controller.onPacketAcked(1000, DateTime.now().subtract(const Duration(milliseconds: 100)), Duration.zero, true, 0);
+      controller.onPacketAcked(1000, const SystemClock().now() - (const Duration(milliseconds: 100)), Duration.zero, true, 0);
 
-      controller.onPacketAcked(1000, DateTime.now().subtract(const Duration(milliseconds: 150)),
+      controller.onPacketAcked(1000, const SystemClock().now() - (const Duration(milliseconds: 150)),
           const Duration(milliseconds: 20), true, 1);
       expect(controller.latestRttForTest.inMilliseconds, closeTo(130, 5)); // 150 - 20
 
-      controller.onPacketAcked(1000, DateTime.now().subtract(const Duration(milliseconds: 200)),
+      controller.onPacketAcked(1000, const SystemClock().now() - (const Duration(milliseconds: 200)),
           const Duration(milliseconds: 80), true, 2);
       expect(controller.latestRttForTest.inMilliseconds, closeTo(175, 5)); // 200 - 25, not 200 - 80
     });
 
     test('an ACK delay that would take the sample below min_rtt is not applied', () {
-      controller.onPacketAcked(1000, DateTime.now().subtract(const Duration(milliseconds: 100)), Duration.zero, true, 0);
+      controller.onPacketAcked(1000, const SystemClock().now() - (const Duration(milliseconds: 100)), Duration.zero, true, 0);
 
       // 105 ms measured with 20 ms of reported delay would be 85 ms, below the
       // 100 ms minimum ever seen; the delay is not credible and is ignored.
-      controller.onPacketAcked(1000, DateTime.now().subtract(const Duration(milliseconds: 105)),
+      controller.onPacketAcked(1000, const SystemClock().now() - (const Duration(milliseconds: 105)),
           const Duration(milliseconds: 20), true, 1);
       expect(controller.latestRttForTest.inMilliseconds, closeTo(105, 5));
     });
 
     test('updates smoothed RTT and RTT variance over time', () {
       // First sample
-      controller.onPacketAcked(1000, DateTime.now().subtract(const Duration(milliseconds: 100)), Duration.zero, true, 0);
+      controller.onPacketAcked(1000, const SystemClock().now() - (const Duration(milliseconds: 100)), Duration.zero, true, 0);
       final initialRtt = controller.smoothedRtt;
 
       // Second, faster sample
-      controller.onPacketAcked(1000, DateTime.now().subtract(const Duration(milliseconds: 50)), Duration.zero, true, 1);
+      controller.onPacketAcked(1000, const SystemClock().now() - (const Duration(milliseconds: 50)), Duration.zero, true, 1);
       final secondRtt = controller.smoothedRtt;
 
       expect(secondRtt.inMicroseconds, lessThan(initialRtt.inMicroseconds));
 
       // Third, slower sample
-      controller.onPacketAcked(1000, DateTime.now().subtract(const Duration(milliseconds: 200)), Duration.zero, true, 2);
+      controller.onPacketAcked(1000, const SystemClock().now() - (const Duration(milliseconds: 200)), Duration.zero, true, 2);
       final thirdRtt = controller.smoothedRtt;
 
       expect(thirdRtt.inMicroseconds, greaterThan(secondRtt.inMicroseconds));
@@ -75,12 +76,12 @@ void main() {
 
     test('does not update RTT for non-cumulative ACKs (SACKs)', () {
       // Establish an initial RTT
-      final sentTimeInitial = DateTime.now().subtract(const Duration(milliseconds: 200));
+      final sentTimeInitial = const SystemClock().now() - (const Duration(milliseconds: 200));
       controller.onPacketAcked(1000, sentTimeInitial, Duration.zero, true, 0);
       final initialRtt = controller.smoothedRtt;
 
       // Simulate a SACK for a packet that doesn't advance the cumulative ACK point
-      final sentTimeSack = DateTime.now().subtract(const Duration(milliseconds: 50));
+      final sentTimeSack = const SystemClock().now() - (const Duration(milliseconds: 50));
       controller.onPacketAcked(1000, sentTimeSack, Duration.zero, false, 0); // isNewCumulativeAck is false
       final rttAfterSack = controller.smoothedRtt;
 
@@ -89,7 +90,7 @@ void main() {
     });
 
     test('bases RTT on retransmission time, not original send time', () async {
-      final originalSentTime = DateTime.now().subtract(const Duration(seconds: 2));
+      final originalSentTime = const SystemClock().now() - (const Duration(seconds: 2));
       final packet = UDXPacket(
         destinationCid: ConnectionId.random(),
         sourceCid: ConnectionId.random(),
@@ -106,7 +107,7 @@ void main() {
         retransmittedPacket = p;
         // Simulate the retransmission happening after a delay
         // In the bug, the sentTime is NOT updated here.
-        // A correct implementation WOULD update it: p.sentTime = DateTime.now();
+        // A correct implementation WOULD update it: p.sentTime = const SystemClock().now();
       };
 
       // Manually trigger the retransmission logic from _scheduleRetransmission

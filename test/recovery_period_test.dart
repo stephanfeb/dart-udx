@@ -1,4 +1,5 @@
 import 'package:dart_udx/src/cid.dart';
+import 'package:dart_udx/src/clock.dart';
 import 'package:dart_udx/src/congestion.dart';
 import 'package:dart_udx/src/packet.dart';
 import 'package:test/test.dart';
@@ -50,7 +51,7 @@ void main() {
       controller.onPacketSent(1500);
       
       // Acknowledging packet 5 should exit recovery.
-      controller.onPacketAcked(1500, DateTime.now(), Duration.zero, true, 5);
+      controller.onPacketAcked(1500, const SystemClock().now(), Duration.zero, true, 5);
       expect(controller.isInRecoveryForTest, isFalse, reason: 'Controller should exit recovery after a new packet is acknowledged.');
 
       // 4. Third loss event, after recovery has ended.

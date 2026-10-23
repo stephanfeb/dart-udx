@@ -55,7 +55,7 @@ void main() {
 
       // Expected interval: 1472 / 423936 = ~3.47ms
       final expectedInterval = Duration(microseconds: 3472);
-      final actualInterval = nextSendTime.difference(initialSendTime);
+      final actualInterval = nextSendTime - initialSendTime;
 
       expect(actualInterval.inMicroseconds, closeTo(expectedInterval.inMicroseconds, 50));
     });
@@ -64,5 +64,5 @@ void main() {
 
 extension PacingControllerTest on PacingController {
   double getPacingRateForTest() => pacingRateBytesPerSec;
-  DateTime getNextSendTimeForTest() => nextSendTime;
+  Duration getNextSendTimeForTest() => nextSendTime;
 }

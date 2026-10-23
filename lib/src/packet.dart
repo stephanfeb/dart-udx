@@ -5,6 +5,7 @@ import 'package:crypto/crypto.dart';
 import 'package:collection/collection.dart';
 
 import 'cid.dart';
+import 'clock.dart';
 import 'congestion.dart';
 import 'version.dart';
 
@@ -1048,12 +1049,13 @@ class UDXPacket {
   /// The ORIGINAL send time, set once and not moved by a retransmission — its
   /// only reader, persistent-congestion detection, measures how long the packet
   /// has gone undelivered. Per-retransmission timing lives in [lastRetransmit].
-  DateTime? sentTime;
+  Duration? sentTime;
 
   /// When the packet last went on the wire: its first send, then each
   /// retransmission. The RTT is sampled from here (RFC 9002 section 5.1): a
   /// resend carries a fresh sequence, so its ACK names this send and no other.
-  DateTime? lastSentTime;
+  /// Instants are on the [Clock] the connection runs on.
+  Duration? lastSentTime;
 
   /// Whether the packet has been acknowledged
   bool isAcked = false;
@@ -1062,7 +1064,7 @@ class UDXPacket {
   /// Used to space attempts and to collapse a near-simultaneous RTO timer and
   /// fast-retransmit into a single re-send.
   int retransmitCount = 0;
-  DateTime? lastRetransmit;
+  Duration? lastRetransmit;
 
   /// The current UDX protocol version.
   ///
@@ -1216,6 +1218,9 @@ class PacketManager {
   /// The congestion control algorithm
   late CongestionController congestionController;
 
+  /// The clock send times and the retransmission timers run on; see [Clock].
+  final Clock clock;
+
   /// The next sequence number to use
   int get nextSequence => _nextSequence++;
   int _nextSequence = 0;
@@ -1252,7 +1257,8 @@ class PacketManager {
   final Map<int, Timer> _retransmitTimers = {};
 
   /// Creates a new packet manager
-  PacketManager({CongestionController? congestionController}) {
+  PacketManager({CongestionController? congestionController, Clock? clock})
+      : clock = clock ?? const SystemClock() {
     if (congestionController != null) {
       this.congestionController = congestionController;
     }
@@ -1274,7 +1280,7 @@ class PacketManager {
 
   /// Sends a packet
   void sendPacket(UDXPacket packet) {
-    final now = DateTime.now();
+    final now = clock.now();
     packet.sentTime = now;
     packet.lastSentTime = now;
     lastSentPacketNumber = packet.sequence;
@@ -1389,7 +1395,7 @@ class PacketManager {
   /// test liveness (UDPSocket.ping). The caller forgets it ([forget]) when it
   /// stops waiting, so a lost ACK leaves nothing behind.
   void trackUntilAcked(UDXPacket packet) {
-    final now = DateTime.now();
+    final now = clock.now();
     packet.sentTime = now;
     packet.lastSentTime = now;
     lastSentPacketNumber = packet.sequence;
@@ -1455,10 +1461,10 @@ class PacketManager {
       return null;
     }
 
-    final now = DateTime.now();
+    final now = clock.now();
     if (packet.retransmitCount > 0 &&
         packet.lastRetransmit != null &&
-        now.difference(packet.lastRetransmit!).inMilliseconds < retransmitTimeout) {
+        (now - packet.lastRetransmit!).inMilliseconds < retransmitTimeout) {
       return null;
     }
 
@@ -1482,7 +1488,7 @@ class PacketManager {
     _sentPackets[newSeq] = packet;
 
     final backoff = _retransmitBackoffMs(packet.retransmitCount);
-    _retransmitTimers[newSeq] = Timer(
+    _retransmitTimers[newSeq] = clock.timer(
       Duration(milliseconds: backoff),
       () => _onRetransmitTimer(packet),
     );
@@ -1520,7 +1526,7 @@ class PacketManager {
   /// later timer is armed by [retransmit] as it re-keys the packet, so there is
   /// exactly one live timer per unacked packet, following it across renumberings.
   void _scheduleRetransmission(UDXPacket packet) {
-    _retransmitTimers[packet.sequence] = Timer(
+    _retransmitTimers[packet.sequence] = clock.timer(
       Duration(milliseconds: retransmitTimeout),
       () => _onRetransmitTimer(packet),
     );

@@ -7,6 +7,7 @@ library;
 import 'dart:typed_data';
 
 import 'package:dart_udx/src/cid.dart';
+import 'package:dart_udx/src/clock.dart';
 import 'package:dart_udx/src/congestion.dart';
 import 'package:dart_udx/src/packet.dart';
 import 'package:test/test.dart';
@@ -47,12 +48,12 @@ void main() {
     expect(acked, [same(p0)]);
     expect(p0.sequence, resent);
     expect(p0.dataBytes, 1000);
-    expect(p0.lastSentTime!.isAfter(p0.sentTime!) || p0.lastSentTime == p0.sentTime, isTrue,
+    expect(p0.lastSentTime! >= p0.sentTime!, isTrue,
         reason: 'the resend moved lastSentTime; sentTime is still the first send');
   });
 
   test('the RTT is sampled only when the largest acknowledged packet is newly acknowledged', () {
-    final t = DateTime.now().subtract(const Duration(milliseconds: 80));
+    final t = const SystemClock().now() - (const Duration(milliseconds: 80));
     cc.onPacketSent(1000);
     cc.onPacketAcked(1000, t, Duration.zero, true, 0);
     final sampled = cc.smoothedRtt;
@@ -61,7 +62,7 @@ void main() {
     // A frame whose largest was already acknowledged (a repeat, or ranges
     // filling in older packets) gives no sample.
     cc.onPacketSent(1000);
-    cc.onPacketAcked(1000, DateTime.now().subtract(const Duration(seconds: 3)), Duration.zero, false, 0);
+    cc.onPacketAcked(1000, const SystemClock().now() - (const Duration(seconds: 3)), Duration.zero, false, 0);
     expect(cc.smoothedRtt, sampled);
   });
 
@@ -69,7 +70,7 @@ void main() {
     final before = cc.cwnd;
     cc.onPacketSent(3000);
     // Three packets acknowledged together, the frame's largest being new.
-    cc.onPacketAcked(3000, DateTime.now(), Duration.zero, true, 7);
+    cc.onPacketAcked(3000, const SystemClock().now(), Duration.zero, true, 7);
     expect(cc.cwnd, before + 3000, reason: 'slow start adds every acknowledged byte');
     expect(cc.inflight, 0);
   });
@@ -86,10 +87,10 @@ void main() {
 
     // The lost packet is resent under sequence 5. Its ACK, the largest being
     // past 4, ends recovery, and the window may grow again on the next ACK.
-    cc.onPacketAcked(1000, DateTime.now(), Duration.zero, true, 5);
+    cc.onPacketAcked(1000, const SystemClock().now(), Duration.zero, true, 5);
     expect(cc.isInRecoveryForTest, isFalse);
     cc.onPacketSent(1000);
-    cc.onPacketAcked(1000, DateTime.now(), Duration.zero, true, 6);
+    cc.onPacketAcked(1000, const SystemClock().now(), Duration.zero, true, 6);
     expect(cc.cwnd, greaterThan(reduced));
   });
 
@@ -104,10 +105,10 @@ void main() {
     final resent = pm.retransmit(p1)!;
     expect(resent, 3);
 
-    cc.onPacketAcked(2000, DateTime.now().subtract(const Duration(milliseconds: 40)), Duration.zero, true, 2); // 0 and 2
+    cc.onPacketAcked(2000, const SystemClock().now() - (const Duration(milliseconds: 40)), Duration.zero, true, 2); // 0 and 2
     final rttAfterFirst = cc.smoothedRtt;
     final cwndAfterFirst = cc.cwnd;
-    cc.onPacketAcked(1000, DateTime.now().subtract(const Duration(milliseconds: 60)), Duration.zero, true, 3); // the resend
+    cc.onPacketAcked(1000, const SystemClock().now() - (const Duration(milliseconds: 60)), Duration.zero, true, 3); // the resend
     expect(cc.smoothedRtt, isNot(rttAfterFirst), reason: 'the resend gave an RTT sample');
     expect(cc.cwnd, cwndAfterFirst + 1000, reason: 'and grew the window');
     expect(cc.inflight, 0);

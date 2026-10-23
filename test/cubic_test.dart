@@ -2,6 +2,7 @@ import 'package:test/test.dart';
 import 'package:mockito/mockito.dart';
 import 'package:mockito/annotations.dart';
 import 'package:dart_udx/src/cid.dart';
+import 'package:dart_udx/src/clock.dart';
 import 'package:dart_udx/src/congestion.dart';
 import 'package:dart_udx/src/packet.dart';
 
@@ -26,7 +27,7 @@ void main() {
 
     test('should increase cwnd exponentially in slow start', () {
       final initialCwnd = controller.cwnd;
-      controller.onPacketAcked(1472, DateTime.now(), Duration.zero, true, 1);
+      controller.onPacketAcked(1472, const SystemClock().now(), Duration.zero, true, 1);
       expect(controller.cwnd, initialCwnd + 1472);
     });
 
@@ -53,14 +54,14 @@ void main() {
       final postLossCwnd = controller.cwnd;
       
       // Exit recovery
-      controller.onPacketAcked(1472, DateTime.now(), Duration.zero, true, 101);
+      controller.onPacketAcked(1472, const SystemClock().now(), Duration.zero, true, 101);
       expect(controller.isInRecoveryForTest, isFalse);
 
       // Wait for some time to pass for the cubic function to have an effect
       await Future.delayed(const Duration(milliseconds: 100));
 
       // Acknowledge a packet to trigger CUBIC growth
-      controller.onPacketAcked(1472, DateTime.now(), Duration.zero, true, 102);
+      controller.onPacketAcked(1472, const SystemClock().now(), Duration.zero, true, 102);
       
       // Expect the window to have grown
       expect(controller.cwnd, greaterThan(postLossCwnd));
@@ -72,7 +73,7 @@ void main() {
       controller.onPacketLost(1472, [UDXPacket(destinationCid: ConnectionId.random(), sourceCid: ConnectionId.random(), sequence: 1, frames: [], destinationStreamId: 1, sourceStreamId: 1)]);
       
       // Exit recovery
-      controller.onPacketAcked(1472, DateTime.now(), Duration.zero, true, 101);
+      controller.onPacketAcked(1472, const SystemClock().now(), Duration.zero, true, 101);
 
       // Manually set a low wMax to force CUBIC's target to be low
       // This is a bit of a hack for testing, but it demonstrates the principle.
@@ -84,7 +85,7 @@ void main() {
       
       // Let's simulate an ACK and see how it grows
       final cwndBefore = controller.cwnd;
-      controller.onPacketAcked(1472, DateTime.now(), Duration.zero, true, 102);
+      controller.onPacketAcked(1472, const SystemClock().now(), Duration.zero, true, 102);
       final cwndAfter = controller.cwnd;
 
       // The growth should be at least the standard linear increase

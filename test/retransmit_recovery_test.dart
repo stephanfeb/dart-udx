@@ -10,6 +10,7 @@ library;
 import 'dart:typed_data';
 
 import 'package:dart_udx/src/cid.dart';
+import 'package:dart_udx/src/clock.dart';
 import 'package:dart_udx/src/congestion.dart';
 import 'package:dart_udx/src/packet.dart';
 import 'package:test/test.dart';
@@ -103,7 +104,7 @@ void main() {
       // Far past the old maxRetries=10 give-up point. Bypass the per-RTO
       // throttle by backdating each attempt.
       for (var i = 0; i < 25; i++) {
-        packet.lastRetransmit = DateTime.now().subtract(const Duration(seconds: 10));
+        packet.lastRetransmit = const SystemClock().now() - (const Duration(seconds: 10));
         final newSeq = pm.retransmit(packet);
         expect(newSeq, isNotNull, reason: 'attempt $i must still retransmit');
         expect(pm.getSentPacketsTestHook()[packet.sequence], same(packet),

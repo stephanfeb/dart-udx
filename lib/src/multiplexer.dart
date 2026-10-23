@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:dart_udx/src/cid.dart';
+import 'package:dart_udx/src/clock.dart';
 import 'package:dart_udx/src/packet.dart';
 import 'package:dart_udx/src/logging.dart';
 import 'package:dart_udx/src/socket.dart';
@@ -17,7 +18,9 @@ import 'metrics_observer.dart';
 /// packets to the appropriate `UDPSocket` instance based on their destination
 /// Connection ID (CID).
 class UDXMultiplexer {
-  UDXMultiplexer(this.socket, {this.metricsObserver}) : _port = socket.port {
+  UDXMultiplexer(this.socket, {this.metricsObserver, Clock? clock})
+      : clock = clock ?? const SystemClock(),
+        _port = socket.port {
     socket.readEventsEnabled = true;
     socket.writeEventsEnabled = false; // We'll enable when needed
     _listen();
@@ -44,6 +47,9 @@ class UDXMultiplexer {
   
   /// Optional metrics observer to be passed to all created sockets
   final UdxMetricsObserver? metricsObserver;
+
+  /// The clock every connection on this multiplexer runs on; see [Clock].
+  final Clock clock;
 
   final _connectionsController = StreamController<UDPSocket>.broadcast();
 
@@ -260,6 +266,7 @@ class UDXMultiplexer {
       cids: ConnectionCids(effectiveLocalCid, effectiveRemoteCid),
       metricsObserver: metricsObserver,
       isServer: isServer,
+      clock: clock,
     );
     socketsByCid[effectiveLocalCid] = newSocket;
     // Only a shared dial is reused by address; a connection the peer opened

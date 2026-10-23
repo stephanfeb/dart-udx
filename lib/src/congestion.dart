@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:math';
 
 import 'cid.dart';
+import 'clock.dart';
 import 'packet.dart';
 import 'pacing.dart';
 import 'metrics_observer.dart';
@@ -19,6 +20,9 @@ import 'metrics_observer.dart';
 /// sampled the RTT or grew the window again.
 class CongestionController {
   final PacketManager packetManager;
+
+  /// The clock timing runs on; see [Clock].
+  final Clock clock;
 
   /// Metrics observer for this controller (optional).
   UdxMetricsObserver? metricsObserver;
@@ -45,8 +49,8 @@ class CongestionController {
   /// The time period for the window to grow back to W_max.
   double _k = 0;
 
-  /// The start time of the current congestion avoidance epoch.
-  DateTime? _epochStart;
+  /// The start of the current congestion avoidance epoch.
+  Duration? _epochStart;
 
   /// The current congestion window size in bytes.
   int get cwnd => _cwnd;
@@ -122,7 +126,9 @@ class CongestionController {
   CongestionController({
     required this.packetManager,
     int? initialCwnd,
-  })  : pacingController = PacingController(),
+    Clock? clock,
+  })  : clock = clock ?? const SystemClock(),
+        pacingController = PacingController(clock: clock ?? const SystemClock()),
         _cwnd = initialCwnd ?? CongestionController.initialCwnd;
 
   /// Called when a packet is sent.
@@ -141,7 +147,7 @@ class CongestionController {
   /// waited, give the RTT sample (section 5.1). [largestAcked] is the frame's
   /// largest acknowledged sequence, which ends recovery once it is past the
   /// packet that was last sent when recovery began (section 7.3.2).
-  void onPacketAcked(int bytes, DateTime? sentTime, Duration ackDelay, bool largestNewlyAcked, int largestAcked) {
+  void onPacketAcked(int bytes, Duration? sentTime, Duration ackDelay, bool largestNewlyAcked, int largestAcked) {
     // Emit initial CWND on first ack so metrics UI shows the starting value
     if (!_initialCwndEmitted && connectionId != null) {
       _initialCwndEmitted = true;
@@ -189,9 +195,9 @@ class CongestionController {
   /// but only when the sample is at least min_rtt + ack_delay: a delay that
   /// would take the sample below the minimum ever seen is not credible, and
   /// min_rtt itself is always taken from the unadjusted sample.
-  void _updateRtt(DateTime sentTime, Duration ackDelay) {
-    final latest = DateTime.now().difference(sentTime);
-    if (latest < Duration.zero) return; // the clock stepped; no sample
+  void _updateRtt(Duration sentTime, Duration ackDelay) {
+    final latest = clock.now() - sentTime;
+    if (latest < Duration.zero) return; // not a sample
 
     if (!_hasRttSample) {
       _hasRttSample = true;
@@ -228,8 +234,8 @@ class CongestionController {
   /// Performs the CUBIC window increase calculation.
   void _cubicUpdate(int bytes) {
     // Initialize epoch start if this is the first time entering congestion avoidance
-    _epochStart ??= DateTime.now();
-    final t = DateTime.now().difference(_epochStart!).inMilliseconds / 1000.0; // Time in seconds
+    _epochStart ??= clock.now();
+    final t = (clock.now() - _epochStart!).inMilliseconds / 1000.0; // Time in seconds
 
     // Calculate target CWND using the CUBIC function
     final wCubic = (c * pow(t - _k, 3) + (_wMax / maxDatagramSize)).toDouble();
@@ -289,7 +295,7 @@ class CongestionController {
       return;
     }
 
-    _epochStart = DateTime.now(); // Start of a new recovery epoch
+    _epochStart = clock.now(); // Start of a new recovery epoch
     _inRecovery = true;
     _recoveryEndPacketNumber = packetManager.lastSentPacketNumber;
 
@@ -317,7 +323,7 @@ class CongestionController {
   /// Arms the PTO timer.
   void _armPtoTimer() {
     _ptoTimer?.cancel();
-    _ptoTimer = Timer(pto, _onPtoTimeout);
+    _ptoTimer = clock.timer(pto, _onPtoTimeout);
   }
 
   /// Called when the PTO timer expires.
@@ -330,12 +336,12 @@ class CongestionController {
 
       // Double the PTO for the next probe if this one doesn't elicit an ACK.
       final nextPto = pto * 2;
-      _ptoTimer = Timer(nextPto, _onPtoTimeout);
+      _ptoTimer = clock.timer(nextPto, _onPtoTimeout);
     } else {
       // Exceeded max retries: keep probing, less often.
       _ptoRetryCount = 0;
       final backoffPto = pto * 4; // Use 4x PTO as backoff
-      _ptoTimer = Timer(backoffPto, _onPtoTimeout);
+      _ptoTimer = clock.timer(backoffPto, _onPtoTimeout);
     }
   }
 
@@ -368,7 +374,7 @@ class CongestionController {
     // 3. The duration between the send times of these two packets exceeds the
     //    persistent congestion duration.
     final persistentCongestionDuration = (pto * kPersistentCongestionThreshold);
-    final lostPeriod = DateTime.now().difference(oldestLost.sentTime!);
+    final lostPeriod = clock.now() - oldestLost.sentTime!;
 
     if (lostPeriod < persistentCongestionDuration) {
       return;

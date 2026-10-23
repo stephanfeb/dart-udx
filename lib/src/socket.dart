@@ -5,6 +5,7 @@ import 'package:collection/collection.dart';
 import 'package:meta/meta.dart';
 
 import 'cid.dart';
+import 'clock.dart';
 import 'udx.dart';
 import 'events.dart';
 import 'stream.dart';
@@ -52,7 +53,10 @@ class UDPSocket with UDXEventEmitter {
 
   final Completer<void> _handshakeCompleter = Completer<void>();
   bool _handshakeCompleted = false;
-  DateTime? _handshakeStartTime;
+  Duration? _handshakeStartTime;
+
+  /// The clock all of this connection's timing runs on; see [Clock].
+  final Clock clock;
 
   /// A future that completes when the handshake is successful.
   Future<void> get handshakeComplete => _handshakeCompleter.future;
@@ -94,7 +98,7 @@ class UDPSocket with UDXEventEmitter {
   /// the frame's ackDelay reports, so the sender's RTT sample is honest).
   int _ackPending = 0;
   Timer? _ackTimer;
-  DateTime? _largestArrival;
+  Duration? _largestArrival;
 
   /// Acknowledgement policy (RFC 9000 section 13.2), as go-udx's: at once
   /// when a packet is out of order or opens or closes a stream or carries a
@@ -170,7 +174,7 @@ class UDPSocket with UDXEventEmitter {
   /// received datagram; a self-rearming watchdog closes the connection once it
   /// has been silent longer than [_idleTimeout]. This is the backstop that ends
   /// a dead path now that retransmission never gives up on its own.
-  DateTime _lastActivity = DateTime.now();
+  late Duration _lastActivity;
   Timer? _idleTimer;
 
   /// How often the watchdog wakes to test for silence — a poll granularity, not
@@ -186,15 +190,16 @@ class UDPSocket with UDXEventEmitter {
     required this.cids,
     this.metricsObserver,
     this.isServer = false,
-  }) {
+    Clock? clock,
+  }) : clock = clock ?? const SystemClock() {
     _localConnectionMaxData = defaultInitialConnectionWindow;
     _remoteConnectionMaxData = defaultInitialConnectionWindow;
     _localMaxStreams = defaultMaxStreams;
     _pmtudController = PathMtuDiscoveryController();
 
     // Initialize connection-level packet management
-    _packetManager = PacketManager();
-    _congestionController = CongestionController(packetManager: _packetManager);
+    _packetManager = PacketManager(clock: this.clock);
+    _congestionController = CongestionController(packetManager: _packetManager, clock: this.clock);
     _packetManager.congestionController = _congestionController;
 
     // Set up retransmission callback
@@ -217,14 +222,14 @@ class UDPSocket with UDXEventEmitter {
     _addressValidated = !isServer;
     
     // Notify observer that handshake is starting
-    _handshakeStartTime = DateTime.now();
+    _handshakeStartTime = this.clock.now();
     metricsObserver?.onHandshakeStart(
       cids.localCid,
       cids.remoteCid,
       '${remoteAddress.address}:$remotePort',
     );
 
-    _lastActivity = DateTime.now();
+    _lastActivity = this.clock.now();
     _armIdleCheck();
   }
 
@@ -240,12 +245,12 @@ class UDPSocket with UDXEventEmitter {
 
   void _armIdleCheck() {
     if (_closing) return;
-    _idleTimer = Timer(_idleCheckInterval, _onIdleCheck);
+    _idleTimer = clock.timer(_idleCheckInterval, _onIdleCheck);
   }
 
   void _onIdleCheck() {
     if (_closing) return;
-    if (DateTime.now().difference(_lastActivity) >= _idleTimeout) {
+    if (clock.now() - _lastActivity >= _idleTimeout) {
       // Silent close (RFC 9000 section 10.1): no CONNECTION_CLOSE — there may be
       // nothing left on the path to hear it. Blocked readers and writers are
       // still woken through the stream resets.
@@ -288,7 +293,7 @@ class UDPSocket with UDXEventEmitter {
   Future<void> handleIncomingDatagram(Uint8List data, InternetAddress fromAddress, int fromPort) async {
     // Any datagram is proof the path is alive; restart the idle clock (RFC 9000
     // section 10.1: the timer resets on receiving and processing a packet).
-    _lastActivity = DateTime.now();
+    _lastActivity = clock.now();
 
     // Track received bytes for anti-amplification
     if (!_addressValidated) {
@@ -330,7 +335,7 @@ class UDPSocket with UDXEventEmitter {
         
         // Notify observer of successful handshake
         if (_handshakeStartTime != null) {
-          final duration = DateTime.now().difference(_handshakeStartTime!);
+          final duration = clock.now() - _handshakeStartTime!;
           metricsObserver?.onHandshakeComplete(cids.localCid, duration, true, null);
         }
         
@@ -615,7 +620,7 @@ class UDPSocket with UDXEventEmitter {
   /// timer. Every packet used to be acknowledged on arrival, one datagram
   /// sent for every datagram received.
   void _noteReceived(UDXPacket packet) {
-    final now = DateTime.now();
+    final now = clock.now();
     var edge = false;
     for (final f in packet.frames) {
       if (f is StreamFrame && (f.isSyn || f.isFin)) {
@@ -643,7 +648,7 @@ class UDPSocket with UDXEventEmitter {
       var delay = _congestionController.smoothedRtt ~/ 4;
       if (delay < minAckDelay) delay = minAckDelay;
       if (delay > maxAckDelay) delay = maxAckDelay;
-      _ackTimer = Timer(delay, () {
+      _ackTimer = clock.timer(delay, () {
         _ackTimer = null;
         if (_ackPending > 0) _sendConnectionAck();
       });
@@ -661,7 +666,7 @@ class UDPSocket with UDXEventEmitter {
     var ackDelayMs = 0;
     final arrival = _largestArrival;
     if (arrival != null) {
-      ackDelayMs = DateTime.now().difference(arrival).inMilliseconds.clamp(0, 65535);
+      ackDelayMs = (clock.now() - arrival).inMilliseconds.clamp(0, 65535);
     }
     final ackFrame = _recvd.frame(ackDelayMs);
     if (UdxLogging.info) {
@@ -1023,7 +1028,7 @@ class UDPSocket with UDXEventEmitter {
 
     // Start a timer. If we don't get a valid response, abort the validation.
     _pathChallengeTimer?.cancel();
-    _pathChallengeTimer = Timer(const Duration(seconds: 5), () {
+    _pathChallengeTimer = clock.timer(const Duration(seconds: 5), () {
       // Notify observer of failed path migration
       metricsObserver?.onPathMigrationComplete(cids.localCid, false);
       
@@ -1125,7 +1130,7 @@ class UDPSocket with UDXEventEmitter {
         finish(true);
       }
     });
-    timeoutTimer = Timer(timeout, () => finish(false));
+    timeoutTimer = clock.timer(timeout, () => finish(false));
 
     _packetManager.trackUntilAcked(packet);
     try {
@@ -1149,7 +1154,7 @@ class UDPSocket with UDXEventEmitter {
     
     send(probePacket.toBytes());
 
-    final timer = Timer(const Duration(seconds: 3), () {
+    final timer = clock.timer(const Duration(seconds: 3), () {
       _handleProbeLoss(sequence);
     });
 

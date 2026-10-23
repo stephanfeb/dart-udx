@@ -6,6 +6,7 @@ export 'src/stream.dart';
 export 'src/packet.dart';
 export 'src/cid.dart';
 export 'src/congestion.dart';
+export 'src/clock.dart';
 export 'src/multiplexer.dart';
 export 'src/events.dart';
 export 'src/metrics_observer.dart';

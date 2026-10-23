@@ -1,5 +1,6 @@
 import 'package:test/test.dart';
 import 'package:dart_udx/src/congestion.dart';
+import 'package:dart_udx/src/clock.dart';
 import 'package:dart_udx/src/packet.dart';
 
 void main() {
@@ -22,7 +23,7 @@ void main() {
     test('resets to a reduced window on packet loss', () {
       // Simulate some network activity
       controller.onPacketSent(10000);
-      controller.onPacketAcked(10000, DateTime.now(), Duration.zero, true, 1);
+      controller.onPacketAcked(10000, const SystemClock().now(), Duration.zero, true, 1);
       
       // Ensure cwnd has grown
       expect(controller.cwnd, greaterThan(CongestionController.initialCwnd));

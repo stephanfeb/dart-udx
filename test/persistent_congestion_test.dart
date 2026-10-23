@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 
 import 'package:dart_udx/src/cid.dart';
+import 'package:dart_udx/src/clock.dart';
 import 'package:dart_udx/src/congestion.dart';
 import 'package:dart_udx/src/packet.dart';
 import 'package:test/test.dart';
@@ -20,7 +21,7 @@ void main() {
       // 1. Get an RTT sample
       controller.onPacketSent(1000);
       await Future.delayed(const Duration(milliseconds: 100));
-      controller.onPacketAcked(1000, DateTime.now().subtract(const Duration(milliseconds: 100)), Duration.zero, true, 0);
+      controller.onPacketAcked(1000, const SystemClock().now() - (const Duration(milliseconds: 100)), Duration.zero, true, 0);
       expect(controller.smoothedRtt, isNot(equals(const Duration(milliseconds: 100)))); // Ensure RTT has been updated
 
       // 2. Send a burst of packets that will be lost
@@ -41,7 +42,7 @@ void main() {
       final ackPacket = UDXPacket(destinationCid: ConnectionId.random(), sourceCid: ConnectionId.random(), destinationStreamId: 1, sourceStreamId: 2, sequence: 6, frames: []);
       packetManager.sendPacket(ackPacket);
       controller.onPacketSent(0);
-      controller.onPacketAcked(0, DateTime.now(), Duration.zero, true, 6);
+      controller.onPacketAcked(0, const SystemClock().now(), Duration.zero, true, 6);
 
       // 5. Manually trigger onPacketLost for the lost packets
       controller.onPacketLost(500, lostPackets);
