@@ -4,6 +4,7 @@ library;
 
 import 'package:dart_udx/src/clock.dart';
 import 'package:dart_udx/src/congestion.dart';
+import 'package:dart_udx/src/constants.dart';
 import 'package:dart_udx/src/packet.dart';
 import 'package:test/test.dart';
 
@@ -60,6 +61,32 @@ void main() {
     cc.onPacketAcked(600, clock.now() - const Duration(milliseconds: 20), Duration.zero, true, 1);
     clock.advance(const Duration(minutes: 1));
     expect(probes, 1, reason: 'nothing in flight: no PTO');
+  });
+
+  test('before the first sample the estimates are the RFC initial ones: a PTO of about a second', () {
+    expect(cc.smoothedRtt, initialRtt);
+    expect(cc.rttVar, initialRttVar);
+    expect(cc.minRtt, isNull);
+    expect(cc.pto, initialRtt + initialRttVar * 4 + const Duration(milliseconds: CongestionController.maxAckDelay));
+    expect(cc.pto, const Duration(milliseconds: 1024));
+
+    // The first sample replaces all of it.
+    cc.onPacketSent(1200);
+    clock.advance(const Duration(milliseconds: 20));
+    cc.onPacketAcked(1200, clock.now() - const Duration(milliseconds: 20), const Duration(milliseconds: 40), true, 0);
+    expect(cc.smoothedRtt, const Duration(milliseconds: 20));
+    expect(cc.minRtt, const Duration(milliseconds: 20));
+    expect(cc.rttVar, const Duration(milliseconds: 10));
+  });
+
+  test('the PTO has no floor beyond the granularity and no cap', () {
+    cc.setSmoothedRtt(const Duration(milliseconds: 20));
+    cc.setRttVar(const Duration(milliseconds: 2));
+    expect(cc.pto, const Duration(milliseconds: 20 + 8 + CongestionController.maxAckDelay), reason: '53 ms, not 200');
+
+    cc.setSmoothedRtt(const Duration(seconds: 8));
+    cc.setRttVar(const Duration(seconds: 1));
+    expect(cc.pto, const Duration(seconds: 12, milliseconds: CongestionController.maxAckDelay));
   });
 
   test('the PTO includes max_ack_delay, so a delayed ACK alone does not fire it', () {

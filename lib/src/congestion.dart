@@ -3,6 +3,7 @@ import 'dart:math';
 
 import 'cid.dart';
 import 'clock.dart';
+import 'constants.dart';
 import 'packet.dart';
 import 'pacing.dart';
 import 'metrics_observer.dart';
@@ -64,17 +65,17 @@ class CongestionController {
   static const int noSsthresh = 1 << 62;
 
   // RTT Estimation based on RFC 9002, Section 5
-  /// The smoothed round-trip time.
+  /// The smoothed round-trip time; [initialRtt] before the first sample.
   Duration get smoothedRtt => _smoothedRtt;
-  Duration _smoothedRtt = const Duration(milliseconds: 100); // Initial default
+  Duration _smoothedRtt = initialRtt;
 
-  /// The RTT variation.
+  /// The RTT variation; [initialRttVar] before the first sample.
   Duration get rttVar => _rttVar;
-  Duration _rttVar = const Duration(milliseconds: 50);
+  Duration _rttVar = initialRttVar;
 
-  /// The minimum RTT observed so far.
-  Duration get minRtt => _minRtt;
-  Duration _minRtt = const Duration(seconds: 1); // Initialize high
+  /// The minimum RTT observed so far; null before the first sample.
+  Duration? get minRtt => _minRtt;
+  Duration? _minRtt;
 
   /// Whether an RTT sample has been taken yet. Until then the estimates above
   /// are the initial defaults, and the first sample replaces them outright
@@ -104,20 +105,18 @@ class CongestionController {
   int _recoveryEndPacketNumber = -1;
 
   /// The base probe timeout (RFC 9002 section 6.2.1): smoothed_rtt +
-  /// max(4 * rttvar, kGranularity) + max_ack_delay, within [minPto, maxPto].
-  /// The peer delays its ACKs by up to max_ack_delay, so a PTO without that
-  /// term fires on a delayed ACK alone.
+  /// max(4 * rttvar, kGranularity) + max_ack_delay. The peer delays its ACKs
+  /// by up to max_ack_delay, so a PTO without that term fires on a delayed
+  /// ACK alone. There is no floor beyond the granularity and no cap: on a
+  /// 30 ms path a loss costs about 60 ms, not the 200 ms floor that used to
+  /// stand in for the missing max_ack_delay term, and a slow path's PTO is
+  /// bounded by the backoff and the idle timeout, not by a constant. Before
+  /// the first sample it is about a second ([initialRtt]).
   Duration get pto {
     var v = _rttVar * 4;
     if (v < PacketManager.lossTimerGranularity) v = PacketManager.lossTimerGranularity;
-    var pto = _smoothedRtt + v + const Duration(milliseconds: maxAckDelay);
-    if (pto < minPto) pto = minPto;
-    if (pto > maxPto) pto = maxPto;
-    return pto;
+    return _smoothedRtt + v + const Duration(milliseconds: maxAckDelay);
   }
-
-  static const Duration minPto = Duration(milliseconds: 200);
-  static const Duration maxPto = Duration(seconds: 5);
 
   /// One PTO timer per connection (RFC 9002 section 6.2), armed from the
   /// last ack-eliciting send and backing off by [ptoCount] until an ACK
@@ -261,12 +260,12 @@ class CongestionController {
       _smoothedRtt = latest;
       _rttVar = Duration(microseconds: latest.inMicroseconds ~/ 2);
     } else {
-      if (latest < _minRtt) {
+      if (latest < _minRtt!) {
         _minRtt = latest;
       }
       final cappedAckDelay = Duration(milliseconds: min(ackDelay.inMilliseconds, maxAckDelay));
       var adjusted = latest;
-      if (latest >= _minRtt + cappedAckDelay) {
+      if (latest >= _minRtt! + cappedAckDelay) {
         adjusted = latest - cappedAckDelay;
       }
       _latestRtt = adjusted;

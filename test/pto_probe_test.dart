@@ -76,6 +76,7 @@ class _CuttablePath {
       if (d == null) return;
       _client = d;
       sent++;
+      if (sent == cutAt) dropping = true;
       if (dropping) return;
       outside.send(d.data, server.address, server.port);
     });
@@ -100,6 +101,9 @@ class _CuttablePath {
   Datagram? _client;
   bool dropping = false;
   int sent = 0;
+
+  /// When set, the path starts dropping at the [cutAt]-th datagram, once.
+  int? cutAt;
 
   void close() {
     inside.close();
@@ -178,28 +182,31 @@ void main() {
       if (received >= total && !all.isCompleted) all.complete();
     });
 
-    // Cut the path as soon as the first bytes are out, so a window is in
-    // flight when it goes dark.
+    // Cut the path once the first datagrams of the write are out, so a
+    // window is in flight when it goes dark.
     final writing = clientStream.add(payload);
-    await Future<void>.delayed(const Duration(milliseconds: 20));
-    path.dropping = true;
+    path.cutAt = path.sent + 8;
     await Future<void>.delayed(const Duration(milliseconds: 200)); // the window is full
     final atStart = path.sent;
+    final base = socket.congestionController.pto; // nothing is sampled in the gap: the base throughout
     const gap = Duration(seconds: 3);
     await Future<void>.delayed(gap);
     final during = path.sent - atStart;
     path.dropping = false;
 
-    // On loopback the PTO sits at its floor; expirations in the gap are at
-    // 1, 3, 7, ... PTOs: three in three seconds, two probes each. The old
-    // per-packet timers re-sent the whole window every two seconds.
+    // Expirations in the gap are at 1, 3, 7, 15, ... PTOs, two probes each:
+    // on loopback the PTO is about max_ack_delay, 25 ms, so seven in three
+    // seconds. The old per-packet timers re-sent the whole window every two
+    // seconds.
     var expirations = 0;
-    for (var at = CongestionController.minPto; at < gap; at = at * 2 + CongestionController.minPto) {
+    for (var at = base; at < gap; at = at * 2 + base) {
       expirations++;
     }
     final limit = PacketManager.ptoProbes * expirations + 2;
     expect(during, lessThanOrEqualTo(limit),
         reason: '$during datagrams went into a $gap gap; at most $limit ($expirations PTOs x ${PacketManager.ptoProbes} probes)');
+    expect(during, greaterThanOrEqualTo(PacketManager.ptoProbes),
+        reason: "$during datagrams went into a $gap gap; at least one PTO's probes");
 
     await writing.timeout(const Duration(seconds: 30));
     await all.future.timeout(const Duration(seconds: 30));

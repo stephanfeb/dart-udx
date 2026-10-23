@@ -51,8 +51,12 @@ const int errorConnectionTimeout = 0x06;
 // Timeouts
 // =============================================================================
 
-/// Initial RTT estimate (RFC 9002 recommends 333ms)
+/// The smoothed RTT before the first sample (RFC 9002 section 6.2.2), with
+/// [initialRttVar] its variation: the first PTO is about a second. The
+/// estimate used to start at 100 ms, so on a slow path the first probe went
+/// out before the handshake could answer.
 const Duration initialRtt = Duration(milliseconds: 333);
+const Duration initialRttVar = Duration(microseconds: 166500);
 
 /// Maximum idle timeout before closing connection
 const Duration maxIdleTimeout = Duration(seconds: 30);

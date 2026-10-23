@@ -42,7 +42,9 @@ void main() {
   });
 
   /// Sends [n] packets one PTO apart, none acknowledged, then one more that
-  /// is acknowledged, and returns what that ACK declares lost.
+  /// is acknowledged after a round trip, and returns what that ACK declares
+  /// lost. (Acknowledged at once it would be a zero RTT sample, which moves
+  /// the PTO the span is measured against.)
   List<UDXPacket> sendAcrossPtos(int n) {
     for (var i = 0; i < n; i++) {
       pm.sendPacket(_dataPacket(pm.nextSequence));
@@ -52,6 +54,7 @@ void main() {
     final last = _dataPacket(pm.nextSequence);
     pm.sendPacket(last);
     cc.onPacketSent(1000);
+    clock.advance(const Duration(milliseconds: 50));
     pm.handleAckFrame(AckFrame(largestAcked: last.sequence, ackDelay: 0, firstAckRangeLength: 1));
     cc.onPacketAcked(1000, last.lastSentTime, Duration.zero, true, last.sequence);
     return pm.detectLostPackets();
