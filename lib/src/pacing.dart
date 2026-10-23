@@ -1,85 +1,119 @@
 import 'dart:async';
+
 import 'package:meta/meta.dart';
 
 import 'clock.dart';
+import 'constants.dart';
 
-/// A controller to manage packet pacing.
+/// Spreads a connection's sends over the round trip instead of letting a
+/// window's worth go out at once (RFC 9002 section 7.7).
 ///
-/// Packet pacing smooths out the sending of packets to prevent bursts,
-/// which can cause network congestion and packet loss. It works by calculating
-/// a pacing rate based on the congestion window (cwnd) and the minimum
-/// round-trip time (minRtt).
+/// The rate is gain * cwnd / smoothed_rtt, the gain [pacingGainSlowStart] in
+/// slow start and [pacingGain] after it, as most QUIC stacks pace. The
+/// congestion controller recomputes it on every change to the window or the
+/// RTT estimate ([updateRate]). It used to be computed from min_rtt, and only
+/// when min_rtt fell or the window contracted.
+///
+/// Sends draw on a budget that refills at the rate and holds at most a burst:
+/// [burstPackets] datagrams, or what [minPacingDelay] of the rate is worth,
+/// whichever is more. A sender need not sleep between every two packets, and
+/// a timer that can only wait whole milliseconds still reaches the rate. The
+/// budget may go negative: a batch that overshoots it is paid for by the wait
+/// after it. Until the controller has an RTT sample the rate is unlimited and
+/// the initial window is the burst.
 class PacingController {
-  PacingController({
-    this.pacingGain = 2.88, // Standard pacing gain from QUIC
-    Clock? clock,
-  }) : clock = clock ?? const SystemClock() {
-    _pacingRateBytesPerSec = double.infinity;
-    _nextSendTime = this.clock.now();
-  }
+  PacingController({Clock? clock}) : clock = clock ?? const SystemClock();
+
+  /// The gain over cwnd / srtt in congestion avoidance (RFC 9002 section 7.7
+  /// suggests about 1.25).
+  static const double pacingGain = 1.25;
+
+  /// The gain in slow start, where the window doubles each round trip, so
+  /// that pacing does not hold the window's growth back.
+  static const double pacingGainSlowStart = 2.0;
+
+  /// How many datagrams may go out at once without waiting on the pacer.
+  static const int burstPackets = 10;
+
+  /// The shortest wait the pacer asks for. Dart sets timers in whole
+  /// milliseconds and the event loop adds jitter, so the burst covers at
+  /// least this much of the rate and a wait that overshoots by that little
+  /// costs no throughput.
+  static const Duration minPacingDelay = Duration(milliseconds: 2);
 
   /// The clock send times are measured on; see [Clock].
   final Clock clock;
 
-  /// The gain factor used to calculate the pacing rate.
-  final double pacingGain;
+  /// Bytes per second; infinite is unpaced.
+  double _rate = double.infinity;
 
-  /// The target sending rate in bytes per second.
-  late double _pacingRateBytesPerSec;
+  /// What the budget held after the last send.
+  double _budgetAtLastSend = 0;
+  Duration? _lastSendTime;
 
-  /// The earliest instant the next packet can be sent.
-  late Duration _nextSendTime;
-
-  /// A timer to handle delayed sends.
   Timer? _timer;
 
-  /// Updates the pacing rate based on the current network conditions.
-  ///
-  /// This should be called whenever the congestion window or minRtt changes.
-  void updateRate(int cwnd, Duration minRtt) {
-    if (minRtt == Duration.zero) {
-      _pacingRateBytesPerSec = double.infinity;
+  /// Sets the rate from the congestion window and the smoothed RTT: gain *
+  /// cwnd / srtt, the gain depending on whether the window is in slow start.
+  /// A zero srtt (loopback, or a test clock that does not move) means
+  /// unpaced.
+  void updateRate(int cwnd, Duration srtt, {required bool slowStart}) {
+    if (srtt <= Duration.zero) {
+      _rate = double.infinity;
       return;
     }
-    final minRttInSeconds = minRtt.inMicroseconds / Duration.microsecondsPerSecond;
-    _pacingRateBytesPerSec = (pacingGain * cwnd) / minRttInSeconds;
+    final gain = slowStart ? pacingGainSlowStart : pacingGain;
+    _rate = gain * cwnd / (srtt.inMicroseconds / Duration.microsecondsPerSecond);
   }
 
-  /// How long until the next packet may be sent: zero when it may go now.
+  /// The most the budget holds.
+  double get _maxBurst {
+    var burst = (burstPackets * maxDatagramSize).toDouble();
+    if (_rate.isFinite) {
+      final byDelay = _rate * minPacingDelay.inMicroseconds / Duration.microsecondsPerSecond;
+      if (byDelay > burst) burst = byDelay;
+    }
+    return burst;
+  }
+
+  /// What may be sent at [now] without waiting; the rate is finite.
+  double _budget(Duration now) {
+    final last = _lastSendTime;
+    if (last == null) return _maxBurst;
+    final b = _budgetAtLastSend + _rate * (now - last).inMicroseconds / Duration.microsecondsPerSecond;
+    final max = _maxBurst;
+    return b > max ? max : b;
+  }
+
+  /// How long until the next packet may be sent: zero when the budget holds
+  /// a full datagram, otherwise the time it takes to, and at least
+  /// [minPacingDelay].
   Duration timeUntilSend() {
-    final now = clock.now();
-    return now < _nextSendTime ? _nextSendTime - now : Duration.zero;
+    if (!_rate.isFinite) return Duration.zero;
+    final short = maxDatagramSize - _budget(clock.now());
+    if (short <= 0) return Duration.zero;
+    var wait = Duration(microseconds: (short / _rate * Duration.microsecondsPerSecond).ceil());
+    if (wait < minPacingDelay) wait = minPacingDelay;
+    return wait;
   }
 
-  /// Waits until it is time to send the next packet.
-  ///
-  /// Returns a `Future` that completes when the pacer determines it's
-  /// acceptable to send the next packet.
-  Future<void> waitUntilReady() async {
-    final now = clock.now();
-    if (now < _nextSendTime) {
-      final delay = _nextSendTime - now;
-      final completer = Completer<void>();
-      _timer = clock.timer(delay, () {
-        if (!completer.isCompleted) {
-          completer.complete();
-        }
-      });
-      return completer.future;
-    }
+  /// Completes when the next packet may be sent.
+  Future<void> waitUntilReady() {
+    final wait = timeUntilSend();
+    if (wait == Duration.zero) return Future.value();
+    // Dart sets timers in whole milliseconds: round up, or a timer set for
+    // less than a millisecond fires at once.
+    final completer = Completer<void>();
+    _timer = clock.timer(Duration(milliseconds: (wait.inMicroseconds + 999) ~/ 1000), completer.complete);
+    return completer.future;
   }
 
-  /// Informs the pacer that a packet has been sent.
-  ///
-  /// This should be called immediately after a packet is sent to update the
-  /// next send time.
+  /// Draws a sent packet from the budget.
   void onPacketSent(int packetSize) {
-    if (_pacingRateBytesPerSec.isFinite) {
-      final interval =
-          Duration(microseconds: (packetSize / _pacingRateBytesPerSec * Duration.microsecondsPerSecond).round());
-      final now = clock.now();
-      _nextSendTime = (now > _nextSendTime ? now : _nextSendTime) + interval;
-    }
+    if (!_rate.isFinite) return;
+    final now = clock.now();
+    _budgetAtLastSend = _budget(now) - packetSize;
+    _lastSendTime = now;
   }
 
   /// Cancels any pending timer.
@@ -87,9 +121,11 @@ class PacingController {
     _timer?.cancel();
   }
 
-  @visibleForTesting
-  double get pacingRateBytesPerSec => _pacingRateBytesPerSec;
+  /// The pacing rate in bytes per second; infinite when unpaced.
+  double get pacingRateBytesPerSec => _rate;
 
+  /// How many bytes may be sent now without waiting (negative after an
+  /// overshoot), or infinite when unpaced.
   @visibleForTesting
-  Duration get nextSendTime => _nextSendTime;
+  double get budget => _rate.isFinite ? _budget(clock.now()) : _rate;
 }

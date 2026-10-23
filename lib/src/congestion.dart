@@ -56,9 +56,12 @@ class CongestionController {
   int get cwnd => _cwnd;
   late int _cwnd;
 
-  /// The slow start threshold.
+  /// The slow start threshold. Slow start runs until the first loss (RFC
+  /// 9002 section 7.3.1). This was 65535, so slow start ended at 64 KB, 44
+  /// packets, and the window crawled up from there at CUBIC's pace.
   int get ssthresh => _ssthresh;
-  int _ssthresh = 65535; // A high initial value
+  int _ssthresh = noSsthresh;
+  static const int noSsthresh = 1 << 62;
 
   // RTT Estimation based on RFC 9002, Section 5
   /// The smoothed round-trip time.
@@ -204,6 +207,15 @@ class CongestionController {
     if (_inflight > 0) {
       _armPtoTimer();
     }
+    _updatePacingRate();
+  }
+
+  /// Tells the pacer the window and RTT it paces by, once an RTT sample
+  /// exists; before one the pacer is unlimited and the initial window is the
+  /// burst. Called after every change to either.
+  void _updatePacingRate() {
+    if (!_hasRttSample) return;
+    pacingController.updateRate(_cwnd, _smoothedRtt, slowStart: _cwnd < _ssthresh);
   }
 
   /// Whether any RTT sample has been taken; persistent congestion is only
@@ -225,7 +237,7 @@ class CongestionController {
     _inRecovery = false;
     _recoveryEndPacketNumber = -1;
     _epochStart = null;
-    pacingController.updateRate(_cwnd, _minRtt);
+    _updatePacingRate();
     if (connectionId != null) {
       metricsObserver?.onCongestionWindowUpdate(connectionId!, oldCwnd, _cwnd, 'persistent_congestion');
     }
@@ -248,11 +260,9 @@ class CongestionController {
       _minRtt = latest;
       _smoothedRtt = latest;
       _rttVar = Duration(microseconds: latest.inMicroseconds ~/ 2);
-      pacingController.updateRate(_cwnd, _minRtt);
     } else {
       if (latest < _minRtt) {
         _minRtt = latest;
-        pacingController.updateRate(_cwnd, _minRtt);
       }
       final cappedAckDelay = Duration(milliseconds: min(ackDelay.inMilliseconds, maxAckDelay));
       var adjusted = latest;
@@ -358,7 +368,7 @@ class CongestionController {
 
     final oldCwnd = _cwnd;
     _cwnd = _ssthresh; // Reduce the window
-    pacingController.updateRate(_cwnd, _minRtt);
+    _updatePacingRate();
 
     if (connectionId != null) {
       metricsObserver?.onCongestionWindowUpdate(connectionId!, oldCwnd, _cwnd, 'loss_detected');

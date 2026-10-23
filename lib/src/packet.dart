@@ -1370,7 +1370,9 @@ class PacketManager {
   /// re-sent under fresh sequences (RFC 9002 section 6.2.4: a probe carries
   /// data when there is data to carry). They are not declared lost (an ACK
   /// will say), their bytes stay in flight, and neither the window nor the
-  /// pacer is consulted: a probe is allowed out when nothing else is. Returns
+  /// pacer is consulted: a probe is allowed out when nothing else is (RFC
+  /// 9002 section 7.7 exempts probes from pacing), though it is drawn from
+  /// the pacing budget so that what follows it is paced as if it had been. Returns
   /// whether anything went out.
   ///
   /// This used to send a PING under [lastSentPacketNumber], the sequence of
@@ -1385,6 +1387,9 @@ class PacketManager {
       sent = true;
       onPacketRetransmitEvent?.call(newSeq, oldest.retransmitCount, congestionController.pto);
       onRetransmit?.call(oldest);
+      // Drawn from the pacing budget, so what follows the probe is paced as
+      // if it had been (section 7.7 exempts the probe itself).
+      congestionController.pacingController.onPacketSent(oldest.toBytes().length);
     }
     return sent;
   }

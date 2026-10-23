@@ -22,7 +22,7 @@ void main() {
 
     test('should start in slow start', () {
       expect(controller.cwnd, CongestionController.initialCwnd);
-      expect(controller.ssthresh, 65535);
+      expect(controller.ssthresh, CongestionController.noSsthresh, reason: 'slow start until the first loss');
     });
 
     test('should increase cwnd exponentially in slow start', () {

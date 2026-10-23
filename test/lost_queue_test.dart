@@ -40,7 +40,7 @@ void main() {
       send: (bytes) => sent.add(UDXPacket.fromBytes(bytes)),
     );
     // Unlimited pacing unless a test says otherwise.
-    cc.pacingController.updateRate(cc.cwnd, Duration.zero);
+    cc.pacingController.updateRate(cc.cwnd, Duration.zero, slowStart: true);
   });
 
   tearDown(() {
@@ -83,13 +83,20 @@ void main() {
   });
 
   test('waits for the pacer and resumes on its timer', () {
-    cc.pacingController.updateRate(10000, const Duration(seconds: 1)); // 28.8 KB/s: ~36 ms per packet
+    // 12.5 KB/s: 1000-byte packets 80 ms apart once the burst is spent.
+    cc.pacingController.updateRate(10000, const Duration(seconds: 1), slowStart: false);
+    for (var i = 0; i < 15; i++) {
+      cc.pacingController.onPacketSent(1000); // the burst is spent, and 280 bytes more
+    }
     queue.add(lostPackets(2));
-    expect(sent.length, 1, reason: 'the first goes at once, the second waits for the pacer');
-    expect(queue.length, 1);
+    expect(sent, isEmpty, reason: 'the budget is overdrawn');
+    expect(queue.length, 2);
     expect(clock.pendingTimers, greaterThan(0));
 
-    clock.advance(const Duration(milliseconds: 50));
+    clock.advance(const Duration(milliseconds: 150)); // 1875 bytes of budget: one packet
+    expect(sent.length, 1);
+    expect(queue.length, 1);
+    clock.advance(const Duration(milliseconds: 100));
     expect(sent.length, 2);
     expect(queue.length, 0);
   });
